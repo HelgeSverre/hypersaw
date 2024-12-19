@@ -213,13 +213,15 @@ impl Timeline {
 
         // Handle single clicks for selection
         if response.clicked() {
-            return match clip {
+            println!("Clicked clip");
+
+            match clip {
                 Clip::Midi { id, .. } | Clip::Audio { id, .. } => {
                     let command = DawCommand::SelectClip {
                         clip_id: id.clone(),
                     };
 
-                    Some(command)
+                    return Some(command);
                 }
             };
         }

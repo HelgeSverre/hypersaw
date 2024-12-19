@@ -1,6 +1,7 @@
 // src/core/commands.rs
 use super::*;
 use std::path::PathBuf;
+use egui::debug_text::print;
 use uuid::Uuid;
 
 pub trait Command {
@@ -64,6 +65,8 @@ impl Command for DawCommand {
             }
 
             DawCommand::SelectClip { clip_id } => {
+                print!("Selected clip: {}", clip_id);
+                state.status.info(format!("Selected clip: {}", clip_id));
                 state.selected_clip = Some(clip_id.clone());
                 Ok(())
             }
