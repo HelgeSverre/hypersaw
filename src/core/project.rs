@@ -80,26 +80,43 @@ impl Project {
         fs::create_dir_all(&samples_dir)?;
         fs::create_dir_all(&midi_dir)?;
 
+        println!("After creating folders at: {}", path.display());
+
         // Copy all referenced files to project directory and update paths
         let mut project = self.clone();
+        println!("Saving tracks...");
         for track in &mut project.tracks {
+            println!("Saving track: {}", track.name);
+
             match &mut track.track_type {
                 TrackType::DrumRack { samples } => {
                     for pad in samples {
+                        println!("Drum rack sample path: {:?}", pad.sample_path);
                         let new_path = copy_to_project_dir(&pad.sample_path, &samples_dir)?;
                         pad.sample_path = new_path;
                     }
                 }
-                _ => {}
+
+                TrackType::Midi { .. } => {
+                    println!("MIDI track detected");
+                }
+
+                TrackType::Audio => {
+                    println!("Audio track detected");
+                }
             }
 
+            println!("Saving clips...");
             for clip in &mut track.clips {
+
                 match clip {
                     Clip::Audio { file_path, .. } => {
+                        println!("Audio clip file path: {:?}", file_path);
                         let new_path = copy_to_project_dir(file_path, &samples_dir)?;
                         *file_path = new_path;
                     }
                     Clip::Midi { file_path, .. } => {
+                        println!("MIDI clip file path: {:?}", file_path);
                         let new_path = copy_to_project_dir(file_path, &midi_dir)?;
                         *file_path = new_path;
                     }
@@ -108,46 +125,59 @@ impl Project {
         }
 
         // Save project file
+        println!("Finalizing save...");
         let project_file = path.join(format!("{}.supersaw", self.name));
-        let json = serde_json::to_string_pretty(&project)?;
-        fs::write(project_file, json)?;
+        println!("Saving project to: {}", project_file.display());
 
+        let json = serde_json::to_string_pretty(&project)
+            .map_err(|e| format!("Failed to serialize project: {}", e))?;
+        fs::write(&project_file, json)
+            .map_err(|e| format!("Failed to write project file: {}", e))?;
+
+        println!("Project saved successfully.");
         Ok(())
     }
 
     pub fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
+        println!("Loading project from: {}", path.display());
         let content = fs::read_to_string(path)?;
-        let mut project: Project = serde_json::from_str(&content)?;
+        let mut project: Project = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to deserialize project: {}", e))?;
         project.project_path = Some(path.parent().unwrap().to_path_buf());
+        println!("Project loaded successfully.");
         Ok(project)
     }
 }
 
 // Helper function to copy a file to the project directory and return the relative path
 fn copy_to_project_dir(source_path: &Path, target_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    if !source_path.exists() {
+        return Err(format!("Source file does not exist: {:?}", source_path).into());
+    }
+
     let file_name = source_path
         .file_name()
-        .ok_or("Invalid source path")?
-        .to_str()
-        .ok_or("Invalid file name")?;
+        .ok_or_else(|| "Invalid source path: Missing file name")?;
 
     // Generate unique filename to avoid conflicts
     let unique_name = format!(
         "{}_{}.{}",
-        source_path.file_stem().unwrap().to_str().unwrap(),
+        source_path.file_stem().unwrap_or_default().to_string_lossy(),
         Uuid::new_v4().to_string().split('-').next().unwrap(),
-        source_path
-            .extension()
-            .unwrap_or_default()
-            .to_str()
-            .unwrap()
+        source_path.extension().unwrap_or_default().to_string_lossy()
     );
 
     let target_path = target_dir.join(unique_name);
-    fs::copy(source_path, &target_path)?;
+    println!("Copying file from {:?} to {:?}", source_path, target_path);
 
-    // Convert to relative path
-    Ok(PathBuf::from("samples").join(target_path.file_name().unwrap()))
+    fs::copy(source_path, &target_path).map_err(|e| {
+        format!(
+            "Failed to copy {:?} to {:?}: {}",
+            source_path, target_path, e
+        )
+    })?;
+
+    Ok(target_path)
 }
 
 // State management for the DAW

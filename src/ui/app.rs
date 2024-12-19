@@ -1,6 +1,7 @@
-use crate::core::{Clip, DawState, Track, TrackType};
+use crate::core::{Clip, DawState, Project, Track, TrackType};
 use crate::ui::Timeline;
 use eframe::egui;
+use egui::Shape::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -70,7 +71,7 @@ impl SupersawApp {
             name: "Test Track".to_string(),
             track_type: TrackType::Midi {
                 channel: 1,
-                device_name: String::new(),
+                device_name: String::from("test midi track"),
             },
             clips: vec![Clip::Midi {
                 id: Uuid::new_v4().to_string(),
@@ -184,6 +185,15 @@ impl eframe::App for SupersawApp {
                         self.file_dialog = Some(FileDialog::LoadProject);
                         ui.close_menu();
                     }
+                    ui.separator();
+                    if ui.button("Import MIDI...").clicked() {
+                        self.file_dialog = Some(FileDialog::ImportMidi);
+                        ui.close_menu();
+                    }
+                    if ui.button("Import Audio...").clicked() {
+                        self.file_dialog = Some(FileDialog::ImportAudio);
+                        ui.close_menu();
+                    }
                 });
 
                 ui.menu_button("Track", |ui| {
@@ -219,8 +229,45 @@ impl eframe::App for SupersawApp {
 
         // Handle file dialogs
         if let Some(dialog_type) = &self.file_dialog {
-            // TODO: Implement actual file dialog
-            // For now, just clear the dialog state
+            match dialog_type {
+                FileDialog::SaveProject => {
+                    // if let Some(FileDialog::SaveProject) = &self.file_dialog {
+                    //     if let Some(path) = rfd::FileDialog::new()
+                    //         .set_title("Save Project")
+                    //         .set_directory(std::env::current_dir().unwrap())
+                    //         .save_file()
+                    //     {
+                    //         if let Err(e) = self.state.project.save(&path) {
+                    //             eprintln!("Failed to save project: {}", path.display());
+                    //         }
+                    //     }
+                    //     self.file_dialog = None;
+                    // }
+
+                    // For now, just save to a fixed test location
+                    let path = std::env::current_dir().unwrap().join("projects");
+
+                    if let Err(e) = self.state.project.save(&path) {
+                        eprintln!("Failed to save project: {}", path.display());
+                        eprintln!("error: {}", e);
+                    }
+                }
+                FileDialog::LoadProject => {
+                    let project_dir = std::env::current_dir().unwrap().join("projects");
+                    let path = project_dir.as_path();
+
+                    match Project::load(path) {
+                        Ok(project) => {
+                            self.state.project = project;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to load project: {}", path.display());
+                            eprintln!("error: {}", e);
+                        }
+                    }
+                }
+                _ => {}
+            }
             self.file_dialog = None;
         }
     }

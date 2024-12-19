@@ -7,7 +7,6 @@ mod ui;
 use eframe::NativeOptions;
 
 fn main() -> eframe::Result<()> {
-    // Initialize native options
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false)
@@ -18,7 +17,6 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    // Initialize PortAudio
     let pa = match portaudio::PortAudio::new() {
         Ok(pa) => pa,
         Err(e) => {

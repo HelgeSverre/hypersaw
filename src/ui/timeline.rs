@@ -1,3 +1,6 @@
+#![allow(unused_variables)]
+#![allow(unused_imports)]
+
 use crate::core::*;
 use eframe::egui;
 use std::time::Duration;
