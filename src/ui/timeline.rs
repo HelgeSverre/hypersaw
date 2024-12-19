@@ -28,7 +28,7 @@ impl Default for Timeline {
 }
 
 impl Timeline {
-    pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) {
+    pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) -> Option<DawCommand> {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
 
         // Draw background
@@ -49,6 +49,18 @@ impl Timeline {
         let track_rect = rect.shrink2(egui::vec2(0.0, 20.0)); // Space for ruler
         self.draw_tracks(ui, track_rect, state);
 
+        // Handle zoom with Ctrl + Mouse wheel
+        if response.hovered() {
+            ui.input(|i| {
+                if i.modifiers.ctrl {
+                    let zoom_delta = i.smooth_scroll_delta.y * 0.001;
+                    self.pixels_per_second = (self.pixels_per_second * (1.0 + zoom_delta))
+                        .max(10.0) // Minimum zoom
+                        .min(500.0); // Maximum zoom
+                }
+            });
+        }
+
         // Draw playhead
 
         let playhead_x = rect.left() as f64 + state.current_time * self.pixels_per_second as f64
@@ -61,17 +73,7 @@ impl Timeline {
             (1.0, ui.visuals().text_color()),
         );
 
-        // Handle zoom with Ctrl + Mouse wheel
-        if response.hovered() {
-            ui.input(|i| {
-                if i.modifiers.ctrl {
-                    let zoom_delta = i.smooth_scroll_delta.y * 0.001;
-                    self.pixels_per_second = (self.pixels_per_second * (1.0 + zoom_delta))
-                        .max(10.0) // Minimum zoom
-                        .min(500.0); // Maximum zoom
-                }
-            });
-        }
+        None
     }
 
     fn draw_ruler(&self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -157,7 +159,13 @@ impl Timeline {
         }
     }
 
-    fn draw_clip(&self, ui: &mut egui::Ui, track_rect: egui::Rect, clip: &Clip, state: &DawState) {
+    fn draw_clip(
+        &self,
+        ui: &mut egui::Ui,
+        track_rect: egui::Rect,
+        clip: &Clip,
+        state: &DawState,
+    ) -> Option<DawCommand> {
         let (start_time, length) = match clip {
             Clip::Midi {
                 start_time, length, ..
@@ -178,37 +186,43 @@ impl Timeline {
         // Add interaction handling
         let response = ui.allocate_rect(clip_rect, egui::Sense::click_and_drag());
 
-        // In draw_clip in timeline.rs
-        // if response.double_clicked() {
-        //     // If it's a MIDI clip, switch to piano roll view
-        //     if let Clip::Midi { id, .. } = clip {
-        //         if let Some(track_id) = state
-        //             .project
-        //             .tracks
-        //             .iter()
-        //             .find(|t| {
-        //                 t.clips.iter().any(|c| match c {
-        //                     Clip::Midi { id: clip_id, .. } => clip_id == id,
-        //                     _ => false,
-        //                 })
-        //             })
-        //             .map(|t| t.id.clone())
-        //         {
-        //             state.selected_clip = Some(id.clone());
-        //             state.current_view = EditorView::PianoRoll {
-        //                 clip_id: id.clone(),
-        //                 track_id,
-        //                 scroll_position: 0.0,
-        //                 vertical_zoom: 1.0,
-        //             };
-        //         }
-        //     }
-        // }
+        if response.double_clicked() {
+            // If it's a MIDI clip, switch to piano roll view
+            if let Clip::Midi { id, .. } = clip {
+                if let Some(track_id) = state
+                    .project
+                    .tracks
+                    .iter()
+                    .find(|t| {
+                        t.clips.iter().any(|c| match c {
+                            Clip::Midi { id: clip_id, .. } => clip_id == id,
+                            _ => false,
+                        })
+                    })
+                    .map(|t| t.id.clone())
+                {
+                    let command = DawCommand::OpenPianoRoll {
+                        clip_id: id.clone(),
+                        track_id: track_id.to_string(),
+                    };
+
+                    return Some(command);
+                }
+            }
+        }
 
         // Handle single clicks for selection
-        // if response.clicked() {
-        //     state.selected_clip = Some(clip.get_id().to_string());
-        // }
+        if response.clicked() {
+            return match clip {
+                Clip::Midi { id, .. } | Clip::Audio { id, .. } => {
+                    let command = DawCommand::SelectClip {
+                        clip_id: id.clone(),
+                    };
+
+                    Some(command)
+                }
+            };
+        }
 
         // Draw clip background
         let clip_color = match clip {
@@ -263,55 +277,27 @@ impl Timeline {
             } => (*start_time as f32, *length as f32),
         };
 
-        let clip_left = track_rect.left() + start_time * self.pixels_per_second;
-        let clip_width = length * self.pixels_per_second;
+        if response.dragged() {
+            let new_start_time = (clip_left - track_rect.left()) / self.pixels_per_second;
+            let new_start_time = (new_start_time / self.grid_size).round() * self.grid_size;
 
-        let clip_rect = egui::Rect::from_min_size(
-            egui::pos2(clip_left, track_rect.top() + 2.0),
-            egui::vec2(clip_width, track_rect.height() - 4.0),
-        );
+            let command = DawCommand::MoveClip {
+                clip_id: match clip {
+                    Clip::Midi { id, .. } | Clip::Audio { id, .. } => id.clone(),
+                },
+                track_id: state
+                    .project
+                    .tracks
+                    .iter()
+                    .find(|t| t.clips.contains(clip))
+                    .map(|t| t.id.clone())
+                    .unwrap_or_default(),
+                new_start_time: new_start_time as f64,
+            };
 
-        // Draw clip background
-        let clip_color = match clip {
-            Clip::Midi { .. } => egui::Color32::from_rgb(64, 128, 255),
-            Clip::Audio { .. } => egui::Color32::from_rgb(128, 255, 64),
-        };
-
-        ui.painter().rect_filled(clip_rect, 4.0, clip_color);
-
-        // Draw clip border
-        let is_selected = match clip {
-            Clip::Midi { id, .. } | Clip::Audio { id, .. } => {
-                state.selected_clip == Some(id.clone())
-            }
-        };
-
-        if is_selected {
-            ui.painter().rect_stroke(
-                clip_rect,
-                4.0,
-                egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
-            );
+            return Some(command);
         }
 
-        // Draw clip name
-        let clip_name = match clip {
-            Clip::Midi { file_path, .. } => file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unnamed MIDI"),
-            Clip::Audio { file_path, .. } => file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unnamed Audio"),
-        };
-
-        ui.painter().text(
-            clip_rect.left_top() + egui::vec2(4.0, 4.0),
-            egui::Align2::LEFT_TOP,
-            clip_name,
-            egui::FontId::proportional(12.0),
-            ui.visuals().text_color(),
-        );
+        None
     }
 }

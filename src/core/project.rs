@@ -1,6 +1,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
+use crate::core::status::StatusManager;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
@@ -63,7 +64,7 @@ pub struct DrumPad {
     pub sample_path: PathBuf, // Relative to project directory
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum Clip {
     Midi {
@@ -217,6 +218,7 @@ pub struct DawState {
     pub selected_track: Option<String>,
     pub selected_clip: Option<String>,
     pub current_view: EditorView,
+    pub status: StatusManager,
 }
 
 impl DawState {
@@ -229,6 +231,7 @@ impl DawState {
             selected_track: None,
             selected_clip: None,
             current_view: EditorView::default(),
+            status: StatusManager::new(),
         }
     }
 }

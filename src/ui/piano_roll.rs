@@ -39,7 +39,7 @@ impl Default for PianoRoll {
 }
 
 impl PianoRoll {
-    pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) {
+    pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) -> Option<DawCommand> {
         if let EditorView::PianoRoll {
             clip_id, track_id, ..
         } = &state.current_view
@@ -92,6 +92,8 @@ impl PianoRoll {
                 });
             }
         }
+
+        None
     }
 
     fn draw_piano_keys(&self, ui: &mut egui::Ui, rect: egui::Rect) {

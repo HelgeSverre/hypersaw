@@ -1,4 +1,7 @@
-use crate::core::{Clip, DawState, EditorView, Project, Track, TrackType};
+use crate::core::{
+    Clip, CommandManager, DawState, EditorView, MessageType, Project, StatusMessage, Track,
+    TrackType,
+};
 use crate::ui::piano_roll::PianoRoll;
 use crate::ui::Timeline;
 use eframe::egui;
@@ -6,13 +9,16 @@ use egui::Key;
 use egui::Shape::Path;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use uuid::Uuid;
 
 pub struct SupersawApp {
     state: DawState,
+    command_manager: CommandManager,
     midi_output: Option<midir::MidiOutputConnection>,
     midi_ports: Vec<String>,
     file_dialog: Option<FileDialog>,
+    // keymap: HashMap<Key, KeyAction>,
     timeline: Timeline,
     piano_roll: PianoRoll,
 }
@@ -36,7 +42,7 @@ impl SupersawApp {
         keymap
     }
 
-    fn handle_key_action(&mut self, action: &KeyAction) {
+    fn handle_key_action(&mut self, action: KeyAction) {
         match action {
             KeyAction::LoadProject => {
                 self.file_dialog = Some(FileDialog::LoadProject);
@@ -78,6 +84,9 @@ impl SupersawApp {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Initialize keymap
+        let keymap = Self::initialize_keymap();
+
         // Set up MIDI output
         let midi_ports = Self::scan_midi_ports();
         let midi_out: Option<midir::MidiOutputConnection> = None;
@@ -90,7 +99,14 @@ impl SupersawApp {
             file_dialog: None,
             timeline: Timeline::default(),
             piano_roll: PianoRoll::default(),
+            command_manager: CommandManager::new(),
+            // keymap,
         };
+
+        app.state.status.set_message(
+            StatusMessage::new("Initialized successfully", MessageType::Success)
+                .with_duration(Duration::from_secs(1)),
+        );
 
         // Add test track
         let test_track = Track {
@@ -202,15 +218,12 @@ enum KeyAction {
 
 impl eframe::App for SupersawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keymap setup
-        let keymap = Self::initialize_keymap();
-
         // Check for key presses and modifiers
-        for (&key, action) in &keymap {
-            if ctx.input(|i| i.key_pressed(key) && (i.modifiers.ctrl || i.modifiers.command)) {
-                self.handle_key_action(action);
-            }
-        }
+        // for (&key, &action) in &self.keymap {
+        //     if ctx.input(|i| i.key_pressed(key) && (i.modifiers.ctrl || i.modifiers.command)) {
+        //         self.handle_key_action(action);
+        //     }
+        // }
 
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -255,6 +268,20 @@ impl eframe::App for SupersawApp {
             });
         });
 
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            self.state.status.update(); // Clear expired messages
+
+            if let Some(message) = self.state.status.get_message() {
+                let color = match message.message_type {
+                    MessageType::Info => ui.visuals().text_color(),
+                    MessageType::Success => egui::Color32::GREEN,
+                    MessageType::Warning => egui::Color32::YELLOW,
+                    MessageType::Error => egui::Color32::RED,
+                };
+                ui.colored_label(color, &message.text);
+            }
+        });
+
         egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
             self.draw_transport(ui);
         });
@@ -268,13 +295,24 @@ impl eframe::App for SupersawApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             match &self.state.current_view {
                 EditorView::Arrangement => {
-                    self.timeline.show(ui, &mut self.state);
+                    // Handle returned command from timeline
+                    if let Some(command) = self.timeline.show(ui, &mut self.state) {
+                        if let Err(e) = self.command_manager.execute(command, &mut self.state) {
+                            eprintln!("Command failed: {}", e);
+                            // Optionally set a status message
+                            self.state.status.error(format!("Command failed: {}", e));
+                        }
+                    }
                 }
                 EditorView::PianoRoll { .. } => {
-                    self.piano_roll.show(ui, &mut self.state);
+                    // Similarly handle piano roll commands when we implement them
+                    if let Some(command) = self.piano_roll.show(ui, &mut self.state) {
+                        if let Err(e) = self.command_manager.execute(command, &mut self.state) {
+                            eprintln!("Command failed: {}", e);
+                        }
+                    }
                 }
                 EditorView::SampleEditor { .. } => {
-                    // TODO: Implement sample editor
                     ui.label("Sample Editor (Not Implemented)");
                 }
             }
@@ -291,9 +329,16 @@ impl eframe::App for SupersawApp {
                         .join("projects")
                         .join(self.state.project.name.clone());
 
-                    if let Err(e) = self.state.project.save(&path) {
-                        eprintln!("Failed to save project: {}", path.display());
-                        eprintln!("error: {}", e);
+                    match self.state.project.save(&path) {
+                        Err(e) => {
+                            self.state.status.error("Failed to save project");
+                            eprintln!("Failed to save project: {}", path.display());
+                            eprintln!("error: {}", e);
+                        }
+                        Ok(..) => {
+                            self.state.status.success("Project saved successfully");
+                            println!("Project saved to: {}", path.display());
+                        }
                     }
 
                     self.file_dialog = None;
@@ -309,8 +354,12 @@ impl eframe::App for SupersawApp {
                         println!("Selected project file: {}", file_path.display());
 
                         match Project::load(&file_path) {
-                            Ok(project) => self.state.project = project,
+                            Ok(project) => {
+                                self.state.project = project;
+                                self.state.status.success("Project loaded successfully");
+                            }
                             Err(e) => {
+                                self.state.status.error("Failed to load project");
                                 eprintln!("Failed to load project: {}", file_path.display());
                                 eprintln!("Error: {}", e);
                             }
