@@ -7,6 +7,28 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+#[derive(Debug, Clone)]
+pub enum EditorView {
+    Arrangement,
+    PianoRoll {
+        clip_id: String,
+        track_id: String,
+        scroll_position: f32,
+        vertical_zoom: f32,
+    },
+    SampleEditor {
+        clip_id: String,
+        track_id: String,
+        zoom_level: f32,
+    },
+}
+
+impl Default for EditorView {
+    fn default() -> Self {
+        Self::Arrangement
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
@@ -108,7 +130,6 @@ impl Project {
 
             println!("Saving clips...");
             for clip in &mut track.clips {
-
                 match clip {
                     Clip::Audio { file_path, .. } => {
                         println!("Audio clip file path: {:?}", file_path);
@@ -162,9 +183,15 @@ fn copy_to_project_dir(source_path: &Path, target_dir: &Path) -> Result<PathBuf,
     // Generate unique filename to avoid conflicts
     let unique_name = format!(
         "{}_{}.{}",
-        source_path.file_stem().unwrap_or_default().to_string_lossy(),
+        source_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy(),
         Uuid::new_v4().to_string().split('-').next().unwrap(),
-        source_path.extension().unwrap_or_default().to_string_lossy()
+        source_path
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
     );
 
     let target_path = target_dir.join(unique_name);
@@ -189,6 +216,7 @@ pub struct DawState {
     pub current_time: f64,
     pub selected_track: Option<String>,
     pub selected_clip: Option<String>,
+    pub current_view: EditorView,
 }
 
 impl DawState {
@@ -200,6 +228,7 @@ impl DawState {
             current_time: 0.0,
             selected_track: None,
             selected_clip: None,
+            current_view: EditorView::default(),
         }
     }
 }

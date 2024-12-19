@@ -9,7 +9,7 @@ use eframe::NativeOptions;
 fn main() -> eframe::Result<()> {
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_decorations(false)
+            .with_decorations(true)
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([800.0, 600.0])
             .with_transparent(true)

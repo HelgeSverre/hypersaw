@@ -1,4 +1,5 @@
-use crate::core::{Clip, DawState, Project, Track, TrackType};
+use crate::core::{Clip, DawState, EditorView, Project, Track, TrackType};
+use crate::ui::piano_roll::PianoRoll;
 use crate::ui::Timeline;
 use eframe::egui;
 use egui::Shape::Path;
@@ -11,6 +12,7 @@ pub struct SupersawApp {
     midi_ports: Vec<String>,
     file_dialog: Option<FileDialog>,
     timeline: Timeline,
+    piano_roll: PianoRoll,
 }
 
 enum FileDialog {
@@ -63,6 +65,7 @@ impl SupersawApp {
             midi_ports: Self::scan_midi_ports(),
             file_dialog: None,
             timeline: Timeline::default(),
+            piano_roll: PianoRoll::default(),
         };
 
         // Add test track
@@ -224,69 +227,35 @@ impl eframe::App for SupersawApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.timeline.show(ui, &mut self.state);
+            match &self.state.current_view {
+                EditorView::Arrangement => {
+                    self.timeline.show(ui, &mut self.state);
+                }
+                EditorView::PianoRoll { .. } => {
+                    self.piano_roll.show(ui, &mut self.state);
+                }
+                EditorView::SampleEditor { .. } => {
+                    // TODO: Implement sample editor
+                    ui.label("Sample Editor (Not Implemented)");
+                }
+            }
         });
 
         // Handle file dialogs
         if let Some(dialog_type) = &self.file_dialog {
             match dialog_type {
                 FileDialog::SaveProject => {
-                    print!("Save project dialog");
+                    // For now, just save to a fixed test location
+                    let path = std::env::current_dir()
+                        .unwrap()
+                        .join("projects")
+                        .join(self.state.project.name.clone());
 
-                    egui::Window::new("Save Project")
-                        .collapsible(false)
-                        .resizable(false)
-                        .open(&mut true)
-                        .show(ctx, |ui| {
-                            let mut project_name = self.state.project.name.clone();
-
-                            ui.label("Enter project name:");
-                            if ui.text_edit_singleline(&mut project_name).lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                if !project_name.trim().is_empty() {
-                                    let save_path = std::env::current_dir()
-                                        .unwrap()
-                                        .join("projects")
-                                        .join(format!("{}.supersaw", project_name.trim()));
-
-                                    println!("Saving project to: {}", save_path.display());
-                                    self.state.project.name = project_name.clone(); // Update project name
-
-                                    if let Err(e) = self.state.project.save(&save_path) {
-                                        eprintln!(
-                                            "Failed to save project: {}",
-                                            save_path.display()
-                                        );
-                                        eprintln!("Error: {}", e);
-                                    } else {
-                                        println!("Project saved successfully.");
-                                    }
-
-                                    println!("Closing file dialog.");
-                                    self.file_dialog = None;
-                                } else {
-                                    println!("Project name cannot be empty.");
-                                    ui.label("Project name cannot be empty.");
-                                }
-
-                                print!("Project name: {}", project_name);
-                            }
-                        });
-
-
-                    print!("after save project dialog");
+                    if let Err(e) = self.state.project.save(&path) {
+                        eprintln!("Failed to save project: {}", path.display());
+                        eprintln!("error: {}", e);
+                    }
                 }
-
-                // FileDialog::SaveProject => {
-                //     // For now, just save to a fixed test location
-                //     let path = std::env::current_dir().unwrap().join("projects");
-                //
-                //     if let Err(e) = self.state.project.save(&path) {
-                //         eprintln!("Failed to save project: {}", path.display());
-                //         eprintln!("error: {}", e);
-                //     }
-                // }
                 FileDialog::LoadProject => {
                     // Use a file dialog to allow the user to select a project file
                     if let Some(file_path) = rfd::FileDialog::new()
@@ -304,13 +273,14 @@ impl eframe::App for SupersawApp {
                                 eprintln!("Error: {}", e);
                             }
                         }
+
+                        self.file_dialog = None;
                     } else {
                         println!("No project file selected.");
                     }
                 }
                 _ => {}
             }
-            self.file_dialog = None;
         }
     }
 }
