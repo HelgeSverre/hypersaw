@@ -2,7 +2,9 @@ use crate::core::{Clip, DawState, EditorView, Project, Track, TrackType};
 use crate::ui::piano_roll::PianoRoll;
 use crate::ui::Timeline;
 use eframe::egui;
+use egui::Key;
 use egui::Shape::Path;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -23,6 +25,28 @@ enum FileDialog {
 }
 
 impl SupersawApp {
+    fn initialize_keymap() -> HashMap<Key, KeyAction> {
+        use KeyAction::*;
+        let mut keymap = HashMap::new();
+
+        // Add key bindings
+        keymap.insert(Key::O, LoadProject);
+        keymap.insert(Key::S, SaveProject);
+
+        keymap
+    }
+
+    fn handle_key_action(&mut self, action: &KeyAction) {
+        match action {
+            KeyAction::LoadProject => {
+                self.file_dialog = Some(FileDialog::LoadProject);
+            }
+            KeyAction::SaveProject => {
+                self.file_dialog = Some(FileDialog::SaveProject);
+            }
+        }
+    }
+
     fn scan_midi_ports() -> Vec<String> {
         match midir::MidiOutput::new("Supersaw") {
             Ok(midi_out) => {
@@ -171,14 +195,21 @@ impl SupersawApp {
     }
 }
 
+enum KeyAction {
+    LoadProject,
+    SaveProject,
+}
+
 impl eframe::App for SupersawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Handle keyboard shortcuts
-        if ctx.input(|i| i.key_pressed(egui::Key::O) && (i.modifiers.ctrl || i.modifiers.command)) {
-            self.file_dialog = Some(FileDialog::LoadProject);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::S) && (i.modifiers.ctrl || i.modifiers.command)) {
-            self.file_dialog = Some(FileDialog::SaveProject);
+        // Keymap setup
+        let keymap = Self::initialize_keymap();
+
+        // Check for key presses and modifiers
+        for (&key, action) in &keymap {
+            if ctx.input(|i| i.key_pressed(key) && (i.modifiers.ctrl || i.modifiers.command)) {
+                self.handle_key_action(action);
+            }
         }
 
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -284,13 +315,15 @@ impl eframe::App for SupersawApp {
                                 eprintln!("Error: {}", e);
                             }
                         }
-
-                        self.file_dialog = None;
                     } else {
                         println!("No project file selected.");
                     }
+
+                    self.file_dialog = None;
                 }
-                _ => {}
+                _ => {
+                    self.file_dialog = None;
+                }
             }
         }
     }
