@@ -173,6 +173,14 @@ impl SupersawApp {
 
 impl eframe::App for SupersawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle keyboard shortcuts
+        if ctx.input(|i| i.key_pressed(egui::Key::O) && (i.modifiers.ctrl || i.modifiers.command)) {
+            self.file_dialog = Some(FileDialog::LoadProject);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::S) && (i.modifiers.ctrl || i.modifiers.command)) {
+            self.file_dialog = Some(FileDialog::SaveProject);
+        }
+
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -244,6 +252,7 @@ impl eframe::App for SupersawApp {
         // Handle file dialogs
         if let Some(dialog_type) = &self.file_dialog {
             match dialog_type {
+                // TODO: Implement dialog for naming the project
                 FileDialog::SaveProject => {
                     // For now, just save to a fixed test location
                     let path = std::env::current_dir()
@@ -255,6 +264,8 @@ impl eframe::App for SupersawApp {
                         eprintln!("Failed to save project: {}", path.display());
                         eprintln!("error: {}", e);
                     }
+
+                    self.file_dialog = None;
                 }
                 FileDialog::LoadProject => {
                     // Use a file dialog to allow the user to select a project file
