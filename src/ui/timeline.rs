@@ -146,8 +146,6 @@ impl Timeline {
         if response.hovered() {
             ui.input(|i| {
                 if i.modifiers.ctrl {
-                    println!("Scroll delta: {:?}", i.raw_scroll_delta);
-
                     let zoom_delta = i.raw_scroll_delta.y * 0.01;
                     self.pixels_per_second = (self.pixels_per_second * (1.0 + zoom_delta))
                         .max(10.0) // Minimum zoom
