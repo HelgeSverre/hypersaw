@@ -172,9 +172,6 @@ impl SupersawApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for track in &mut self.state.project.tracks {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut track.is_muted, "M");
-                    ui.checkbox(&mut track.is_soloed, "S");
-
                     let track_label = format!(
                         "{} ({})",
                         track.name,
@@ -194,6 +191,10 @@ impl SupersawApp {
                     {
                         self.state.selected_track = Some(track.id.clone());
                     }
+                    ui.add_space(18.0);
+
+                    ui.checkbox(&mut track.is_muted, "M");
+                    ui.checkbox(&mut track.is_soloed, "S");
                 });
             }
 
