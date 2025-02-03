@@ -141,18 +141,19 @@ impl SupersawApp {
     }
 
     fn draw_transport(&mut self, ui: &mut egui::Ui) {
+        // todo: make fixed with buttons
         ui.horizontal(|ui| {
+            ui.set_min_height(32.0);
+
             if ui
                 .button(if self.state.playing { "⏹" } else { "▶" })
                 .clicked()
             {
                 self.state.playing = !self.state.playing;
-                // TODO: Implement actual transport control
             }
 
-            if ui.button("⏺").clicked() {
+            if ui.button("rec").clicked() {
                 self.state.recording = !self.state.recording;
-                // TODO: Implement recording
             }
 
             ui.label(format!("BPM: {:.1}", self.state.project.bpm));
