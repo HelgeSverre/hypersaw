@@ -57,6 +57,10 @@ pub enum DawCommand {
         time: f64,
     },
 
+    StopPlayback,
+    StartPlayback,
+    PausePlayback,
+
     // Does nothing, used for testing and such
     NoOp,
 }
@@ -65,6 +69,13 @@ impl Command for DawCommand {
     fn execute(&self, state: &mut DawState) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             DawCommand::SeekTime { time } => {
+                if state.loop_enabled {
+                    // If we seeked outside of the loop, disable the loop
+                    if (*time < state.loop_start || *time > state.loop_end) {
+                        state.loop_enabled = false;
+                    }
+                }
+
                 state.current_time = *time;
                 Ok(())
             }
@@ -207,6 +218,23 @@ impl Command for DawCommand {
                 state.status.info(format!("BPM set to: {}", bpm));
                 Ok(())
             }
+            DawCommand::StopPlayback => {
+                state.playing = false;
+                state.current_time = 0.0;
+                Ok(())
+            }
+
+            DawCommand::StartPlayback => {
+                state.playing = true;
+
+                Ok(())
+            }
+
+            DawCommand::PausePlayback => {
+                state.playing = false;
+
+                Ok(())
+            }
         }
     }
 
@@ -232,6 +260,9 @@ impl Command for DawCommand {
             DawCommand::EnableMetronome { .. } => "Enable Metronome",
             DawCommand::DisableMetronome => "Disable Metronome",
             DawCommand::SetBpm { .. } => "Set BPM",
+            DawCommand::StopPlayback => "Stop Playback",
+            DawCommand::StartPlayback => "Start Playback",
+            DawCommand::PausePlayback => "Pause Playback",
         }
     }
 }

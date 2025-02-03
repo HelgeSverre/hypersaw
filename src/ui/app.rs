@@ -30,6 +30,16 @@ enum FileDialog {
 impl SupersawApp {
     fn handle_key_action(&mut self, action: KeyAction) {
         match action {
+            KeyAction::TogglePlay => {
+                self.command_manager.execute(
+                    if self.state.playing {
+                        DawCommand::PausePlayback
+                    } else {
+                        DawCommand::StartPlayback
+                    },
+                    &mut self.state,
+                );
+            }
             KeyAction::LoadProject => {
                 self.file_dialog = Some(FileDialog::LoadProject);
             }
@@ -255,6 +265,13 @@ impl SupersawApp {
             if ui.button("+ Add Track").clicked() {
                 self.show_add_track_menu();
             }
+
+            // List midi ports
+            ui.separator();
+            ui.label("MIDI Ports");
+            for port in &self.midi_ports {
+                ui.label(port);
+            }
         });
     }
 
@@ -276,6 +293,7 @@ impl SupersawApp {
 }
 
 enum KeyAction {
+    TogglePlay,
     LoadProject,
     SaveProject,
     Undo,
@@ -302,6 +320,14 @@ impl eframe::App for SupersawApp {
                 } else {
                     self.handle_key_action(KeyAction::Undo);
                 }
+            }
+
+            if i.key_pressed(Key::S) && (i.modifiers.ctrl || i.modifiers.command) {
+                self.handle_key_action(KeyAction::SaveProject);
+            }
+
+            if (i.key_pressed(Key::Space)) {
+                self.handle_key_action(KeyAction::TogglePlay);
             }
         });
 

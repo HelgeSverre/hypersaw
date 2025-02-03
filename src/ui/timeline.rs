@@ -84,35 +84,33 @@ impl Timeline {
     }
 
     fn handle_file_drops(&mut self, ui: &mut egui::Ui, state: &mut DawState) {
-        if let mut files = ui.input(|i| i.raw.dropped_files.clone()) {
-            if let Some(file) = files.pop() {
-                if let Some(path) = file.path {
-                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        let time = (pos.x + self.scroll_offset) / self.pixels_per_second;
-                        if let Some(track_id) = &state.selected_track {
-                            let extension = path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("")
-                                .to_lowercase();
-                            let is_midi = extension == "mid" || extension == "midi";
-                            let is_audio = extension == "wav" || extension == "mp3";
-                            if let Some(track) =
-                                state.project.tracks.iter().find(|t| &t.id == track_id)
-                            {
-                                let can_add = match &track.track_type {
-                                    TrackType::Midi { .. } => is_midi,
-                                    TrackType::Audio => is_audio,
-                                    _ => false,
-                                };
-                                if can_add {
-                                    self.command_collector.add_command(DawCommand::AddClip {
-                                        track_id: track_id.clone(),
-                                        start_time: time as f64,
-                                        length: 4.0,
-                                        file_path: path,
-                                    });
-                                }
+        let mut files = ui.input(|i| i.raw.dropped_files.clone());
+        if let Some(file) = files.pop() {
+            if let Some(path) = file.path {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let time = (pos.x + self.scroll_offset) / self.pixels_per_second;
+                    if let Some(track_id) = &state.selected_track {
+                        let extension = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let is_midi = extension == "mid" || extension == "midi";
+                        let is_audio = extension == "wav" || extension == "mp3";
+                        if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id)
+                        {
+                            let can_add = match &track.track_type {
+                                TrackType::Midi { .. } => is_midi,
+                                TrackType::Audio => is_audio,
+                                _ => false,
+                            };
+                            if can_add {
+                                self.command_collector.add_command(DawCommand::AddClip {
+                                    track_id: track_id.clone(),
+                                    start_time: time as f64,
+                                    length: 4.0,
+                                    file_path: path,
+                                });
                             }
                         }
                     }
@@ -216,9 +214,44 @@ impl Timeline {
         let ruler_rect =
             egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), ruler_height));
 
-        // Draw ruler background
-        ui.painter()
-            .rect_filled(ruler_rect, 0.0, ui.visuals().window_fill);
+        let response = ui.allocate_rect(ruler_rect, egui::Sense::click_and_drag());
+
+        const EDGE_SCROLL_MARGIN: f32 = 50.0; // Pixels from edge where scrolling starts
+        const EDGE_SCROLL_SPEED: f32 = 5.0;
+
+        if response.dragged() {
+            if let Some(pos) = response.hover_pos() {
+                // Handle edge scrolling
+                if pos.x < rect.left() + EDGE_SCROLL_MARGIN {
+                    self.scroll_offset = (self.scroll_offset - EDGE_SCROLL_SPEED).max(0.0);
+                } else if pos.x > rect.right() - EDGE_SCROLL_MARGIN {
+                    self.scroll_offset += EDGE_SCROLL_SPEED;
+                }
+
+                // Convert viewport position to time
+                let viewport_x = pos.x - rect.left();
+                let viewport_time = viewport_x / self.pixels_per_second;
+                let absolute_time = viewport_time + (self.scroll_offset / self.pixels_per_second);
+
+                self.command_collector.add_command(DawCommand::SeekTime {
+                    time: absolute_time.max(0.0) as f64,
+                });
+            }
+        } else if response.clicked() {
+            if let Some(pos) = response.hover_pos() {
+                let viewport_x = pos.x - rect.left();
+                let viewport_time = viewport_x / self.pixels_per_second;
+                let absolute_time = viewport_time + (self.scroll_offset / self.pixels_per_second);
+
+                self.command_collector.add_command(DawCommand::SeekTime {
+                    time: absolute_time.max(0.0) as f64,
+                });
+            }
+        }
+
+        if response.hovered() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+        }
 
         // Draw time markers
         let start_time = (self.scroll_offset / self.pixels_per_second).floor() as i32;
