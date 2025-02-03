@@ -1,7 +1,7 @@
 // src/core/commands.rs
 use super::*;
-use std::path::PathBuf;
 use egui::debug_text::print;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 pub trait Command {
@@ -197,5 +197,26 @@ impl Command for DawCommand {
             DawCommand::MoveClip { .. } => "Move Clip",
             DawCommand::ResizeClip { .. } => "Resize Clip",
         }
+    }
+}
+
+#[derive(Default)]
+pub struct CommandCollector {
+    commands: Vec<DawCommand>,
+}
+
+impl CommandCollector {
+    pub fn new() -> Self {
+        Self {
+            commands: Vec::new(),
+        }
+    }
+
+    pub fn add_command(&mut self, command: DawCommand) {
+        self.commands.push(command);
+    }
+
+    pub fn take_commands(&mut self) -> Vec<DawCommand> {
+        std::mem::take(&mut self.commands)
     }
 }
