@@ -53,6 +53,9 @@ pub enum DawCommand {
     SetBpm {
         bpm: f64,
     },
+    SeekTime {
+        time: f64,
+    },
 
     // Does nothing, used for testing and such
     NoOp,
@@ -61,6 +64,10 @@ pub enum DawCommand {
 impl Command for DawCommand {
     fn execute(&self, state: &mut DawState) -> Result<(), Box<dyn std::error::Error>> {
         match self {
+            DawCommand::SeekTime { time } => {
+                state.current_time = *time;
+                Ok(())
+            }
             DawCommand::OpenPianoRoll { clip_id, track_id } => {
                 state.selected_clip = Some(clip_id.clone());
                 state.current_view = EditorView::PianoRoll {
@@ -211,6 +218,7 @@ impl Command for DawCommand {
 
     fn name(&self) -> &'static str {
         match self {
+            DawCommand::SeekTime { .. } => "Seek Time",
             DawCommand::OpenPianoRoll { .. } => "Open Piano Roll",
             DawCommand::SelectClip { .. } => "Select Clip",
             DawCommand::SelectTrack { .. } => "Select Track",
