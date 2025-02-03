@@ -13,12 +13,19 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([800.0, 600.0])
             .with_transparent(true)
-            .with_title("Supersaw"),
+            .with_title("HyperSaw"),
         ..Default::default()
     };
 
     let pa = match portaudio::PortAudio::new() {
-        Ok(pa) => pa,
+        Ok(pa) => {
+            if let Err(e) = pa.default_output_device() {
+                eprintln!("Failed to get default output device: {}", e);
+                std::process::exit(1);
+            }
+            
+            pa
+        }
         Err(e) => {
             eprintln!("Failed to initialize PortAudio: {}", e);
             std::process::exit(1);
@@ -27,7 +34,7 @@ fn main() -> eframe::Result<()> {
 
     // Run the app
     eframe::run_native(
-        "Supersaw",
+        "HyperSaw",
         options,
         Box::new(|cc| Ok(Box::new(ui::SupersawApp::new(cc)))),
     )
