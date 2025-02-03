@@ -108,25 +108,34 @@ impl SupersawApp {
                 .with_duration(Duration::from_secs(1)),
         );
 
-        // Add test track
-        let test_track = Track {
-            id: Uuid::new_v4().to_string(),
-            name: "Test Track".to_string(),
-            track_type: TrackType::Midi {
-                channel: 1,
-                device_name: String::from("test midi track"),
-            },
-            clips: vec![Clip::Midi {
-                id: Uuid::new_v4().to_string(),
-                start_time: 0.0,
-                length: 4.0,
-                file_path: PathBuf::from("/Users/helge/code/hypersaw/data/moon-loves-the-sun.mid"),
-            }],
-            is_muted: false,
-            is_soloed: false,
-        };
+        let dummy_midis = [
+            "/Users/helge/code/hypersaw/data/moon-loves-the-sun.mid",
+            "/Users/helge/code/hypersaw/data/emotions.mid",
+            "/Users/helge/code/hypersaw/data/silentium.mid",
+            "/Users/helge/code/hypersaw/data/system-f-out-of-the-blue.mid",
+        ];
 
-        app.state.project.tracks.push(test_track);
+        // Add 4 test tracks
+        for (i, midi_file) in dummy_midis.iter().enumerate() {
+            let track = Track {
+                id: Uuid::new_v4().to_string(),
+                name: format!("Track {}", i + 1),
+                track_type: TrackType::Midi {
+                    channel: 1,
+                    device_name: String::from(midi_file.split('/').last().unwrap()),
+                },
+                clips: vec![Clip::Midi {
+                    id: Uuid::new_v4().to_string(),
+                    start_time: 0.0,
+                    length: 4.0,
+                    file_path: PathBuf::from(midi_file),
+                }],
+                is_muted: false,
+                is_soloed: false,
+            };
+
+            app.state.project.tracks.push(track);
+        }
 
         app
     }
