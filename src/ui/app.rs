@@ -205,7 +205,6 @@ impl SupersawApp {
     }
 
     fn show_add_track_menu(&mut self) {
-        // TODO: Implement track creation dialog
         let track_id = Uuid::new_v4().to_string();
         self.state.project.tracks.push(Track {
             id: track_id.clone(),
