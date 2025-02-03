@@ -5,9 +5,7 @@ use crate::core::{
 use crate::ui::piano_roll::PianoRoll;
 use crate::ui::Timeline;
 use eframe::egui;
-use egui::debug_text::print;
 use egui::Key;
-use egui::Shape::Path;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -67,7 +65,6 @@ impl SupersawApp {
             }
         }
     }
-
     fn scan_midi_ports() -> Vec<String> {
         match midir::MidiOutput::new("Supersaw") {
             Ok(midi_out) => {
@@ -115,7 +112,6 @@ impl SupersawApp {
             timeline: Timeline::default(),
             piano_roll: PianoRoll::default(),
             command_manager: CommandManager::new(),
-            // keymap,
         };
 
         app.state.status.set_message(
@@ -165,9 +161,18 @@ impl SupersawApp {
                 .clicked()
             {
                 self.state.playing = !self.state.playing;
+                // Reset last_update when starting playback
+                if self.state.playing {
+                    self.state.last_update = Some(std::time::Instant::now());
+                }
             }
 
-            if ui.button("rec").clicked() {
+            if ui.button("⏮").clicked() {
+                // Return to start
+                self.state.current_time = 0.0;
+            }
+
+            if ui.button("Rec").clicked() {
                 self.state.recording = !self.state.recording;
             }
 
@@ -179,7 +184,11 @@ impl SupersawApp {
                 self.state.project.bpm += 1.0;
             }
 
-            ui.label(format!("Time: {:.1}", self.state.current_time));
+            // Display formatted time
+            let minutes = (self.state.current_time / 60.0).floor();
+            let seconds = (self.state.current_time % 60.0).floor();
+            let frames = ((self.state.current_time % 1.0) * 30.0).floor(); // Assuming 30fps
+            ui.label(format!("{:02}:{:02}:{:02}", minutes, seconds, frames));
         });
     }
 
@@ -245,6 +254,12 @@ enum KeyAction {
 
 impl eframe::App for SupersawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.state.update_playhead();
+
+        // Request continuous repaints while playing
+        if self.state.playing {
+            ctx.request_repaint();
+        }
 
 
         // Keyboard shortcuts

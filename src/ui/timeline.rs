@@ -3,8 +3,6 @@
 
 use crate::core::*;
 use eframe::egui;
-use egui::debug_text::print;
-use std::time::Duration;
 
 pub struct Timeline {
     pixels_per_second: f32,
@@ -37,8 +35,15 @@ impl Timeline {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
 
         // Draw background
-        ui.painter()
-            .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            if self.snap_enabled {
+                ui.visuals().extreme_bg_color
+            } else {
+                ui.visuals().code_bg_color
+            },
+        );
 
         // Handle zooming everywhere in the timeline
         if ui.input(|i| i.modifiers.ctrl) {
@@ -67,7 +72,7 @@ impl Timeline {
             // Allow scrolling past the end for now
         }
 
-        // Handle deletion of selected clips
+        // Pressing DELETE on a selected clip.
         if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
             if let Some(clip_id) = &state.selected_clip {
                 // Find the track that contains this clip
@@ -151,14 +156,26 @@ impl Timeline {
             });
         }
 
-        // Draw playhead
-        let playhead = rect.left() as f64 + state.current_time * self.pixels_per_second as f64
-            - self.scroll_offset as f64;
+        let playhead_x = state.current_time * self.pixels_per_second as f64;
+        let visible_width = rect.width() as f64;
+        let visible_width_threshold = visible_width * 0.2;
 
+        let playhead_position = playhead_x - self.scroll_offset as f64;
+
+        if playhead_position > visible_width * 0.8 {
+            // Playhead is approaching right edge, scroll to keep it in view
+            self.scroll_offset = (playhead_x - visible_width_threshold) as f32;
+        } else if (playhead_position < visible_width_threshold) {
+            // Playhead is approaching left edge
+            self.scroll_offset = (playhead_x - visible_width_threshold).max(0.0) as f32;
+        }
+
+        // Draw playhead
+        let playhead_x = rect.left() as f64 + playhead_x - self.scroll_offset as f64;
         ui.painter().line_segment(
             [
-                egui::pos2(playhead as f32, rect.top()),
-                egui::pos2(playhead as f32, rect.bottom()),
+                egui::pos2(playhead_x as f32, rect.top()),
+                egui::pos2(playhead_x as f32, rect.bottom()),
             ],
             (1.0, ui.visuals().text_color()),
         );
@@ -295,10 +312,8 @@ impl Timeline {
 
                 // Snap to grid if enabled
                 let snapped_time = if self.snap_enabled {
-                    println!("Snapping to grid");
                     (new_start_time / self.grid_size).round() * self.grid_size
                 } else {
-                    println!("Not snapping to grid");
                     new_start_time
                 };
 
