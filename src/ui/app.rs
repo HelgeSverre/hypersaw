@@ -39,6 +39,8 @@ impl SupersawApp {
         // Add key bindings
         keymap.insert(Key::O, LoadProject);
         keymap.insert(Key::S, SaveProject);
+        keymap.insert(Key::Z, Undo);
+        keymap.insert(Key::R, Redo);
 
         keymap
     }
@@ -50,6 +52,18 @@ impl SupersawApp {
             }
             KeyAction::SaveProject => {
                 self.file_dialog = Some(FileDialog::SaveProject);
+            }
+            KeyAction::Undo => {
+                if let Err(e) = self.command_manager.undo(&mut self.state) {
+                    eprintln!("Undo failed: {}", e);
+                    self.state.status.error(format!("Undo failed: {}", e));
+                }
+            }
+            KeyAction::Redo => {
+                if let Err(e) = self.command_manager.redo(&mut self.state) {
+                    eprintln!("Redo failed: {}", e);
+                    self.state.status.error(format!("Redo failed: {}", e));
+                }
             }
         }
     }
@@ -225,16 +239,27 @@ impl SupersawApp {
 enum KeyAction {
     LoadProject,
     SaveProject,
+    Undo,
+    Redo,
 }
 
 impl eframe::App for SupersawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Check for key presses and modifiers
-        // for (&key, &action) in &self.keymap {
-        //     if ctx.input(|i| i.key_pressed(key) && (i.modifiers.ctrl || i.modifiers.command)) {
-        //         self.handle_key_action(action);
-        //     }
-        // }
+
+
+        // Keyboard shortcuts
+        // SAVE -  Ctrl + S
+        // REDO -  Shift + Ctrl + Z
+        // UNDO -  Ctrl + Z
+        ctx.input(|i| {
+            if i.key_pressed(Key::Z) && (i.modifiers.ctrl || i.modifiers.command) {
+                if i.modifiers.shift {
+                    self.handle_key_action(KeyAction::Redo);
+                } else {
+                    self.handle_key_action(KeyAction::Undo);
+                }
+            }
+        });
 
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {

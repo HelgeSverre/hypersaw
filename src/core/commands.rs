@@ -1,6 +1,5 @@
 // src/core/commands.rs
 use super::*;
-use egui::debug_text::print;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -48,6 +47,9 @@ pub enum DawCommand {
         clip_id: String,
         new_length: f64,
     },
+
+    // Does nothing, used for testing and such
+    NoOp,
 }
 
 impl Command for DawCommand {
@@ -176,6 +178,9 @@ impl Command for DawCommand {
                 }
                 Ok(())
             }
+
+            // Do nothing.
+            DawCommand::NoOp => Ok(()),
         }
     }
 
@@ -196,6 +201,7 @@ impl Command for DawCommand {
             DawCommand::DeleteClip { .. } => "Delete Clip",
             DawCommand::MoveClip { .. } => "Move Clip",
             DawCommand::ResizeClip { .. } => "Resize Clip",
+            DawCommand::NoOp => "NoOp",
         }
     }
 }

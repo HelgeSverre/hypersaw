@@ -1,7 +1,6 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
-use crate::core::status::StatusManager;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
@@ -206,32 +205,4 @@ fn copy_to_project_dir(source_path: &Path, target_dir: &Path) -> Result<PathBuf,
     })?;
 
     Ok(target_path)
-}
-
-// State management for the DAW
-#[derive(Debug)]
-pub struct DawState {
-    pub project: Project,
-    pub playing: bool,
-    pub recording: bool,
-    pub current_time: f64,
-    pub selected_track: Option<String>,
-    pub selected_clip: Option<String>,
-    pub current_view: EditorView,
-    pub status: StatusManager,
-}
-
-impl DawState {
-    pub fn new() -> Self {
-        Self {
-            project: Project::new("Untitled".to_string()),
-            playing: false,
-            recording: false,
-            current_time: 0.0,
-            selected_track: None,
-            selected_clip: None,
-            current_view: EditorView::default(),
-            status: StatusManager::new(),
-        }
-    }
 }

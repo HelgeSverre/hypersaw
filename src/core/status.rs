@@ -37,7 +37,7 @@ impl StatusMessage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StatusManager {
     current_message: Option<StatusMessage>,
 }
