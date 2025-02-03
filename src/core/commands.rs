@@ -48,6 +48,12 @@ pub enum DawCommand {
         new_length: f64,
     },
 
+    EnableMetronome,
+    DisableMetronome,
+    SetBpm {
+        bpm: f64,
+    },
+
     // Does nothing, used for testing and such
     NoOp,
 }
@@ -67,8 +73,6 @@ impl Command for DawCommand {
             }
 
             DawCommand::SelectClip { clip_id } => {
-                print!("Selected clip: {}", clip_id);
-                state.status.info(format!("Selected clip: {}", clip_id));
                 state.selected_clip = Some(clip_id.clone());
                 Ok(())
             }
@@ -181,6 +185,21 @@ impl Command for DawCommand {
 
             // Do nothing.
             DawCommand::NoOp => Ok(()),
+            DawCommand::EnableMetronome {} => {
+                state.metronome = true;
+                state.status.info("Metronome disabled".to_string());
+                Ok(())
+            }
+            DawCommand::DisableMetronome => {
+                state.metronome = false;
+                state.status.info("Metronome disabled".to_string());
+                Ok({})
+            }
+            DawCommand::SetBpm { bpm } => {
+                state.project.bpm = *bpm;
+                state.status.info(format!("BPM set to: {}", bpm));
+                Ok(())
+            }
         }
     }
 
@@ -202,6 +221,9 @@ impl Command for DawCommand {
             DawCommand::MoveClip { .. } => "Move Clip",
             DawCommand::ResizeClip { .. } => "Resize Clip",
             DawCommand::NoOp => "NoOp",
+            DawCommand::EnableMetronome { .. } => "Enable Metronome",
+            DawCommand::DisableMetronome => "Disable Metronome",
+            DawCommand::SetBpm { .. } => "Set BPM",
         }
     }
 }

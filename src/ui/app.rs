@@ -1,6 +1,6 @@
 use crate::core::{
-    Clip, CommandManager, DawState, EditorView, MessageType, Project, StatusMessage, Track,
-    TrackType,
+    Clip, CommandManager, DawCommand, DawState, EditorView, MessageType, Project, StatusMessage,
+    Track, TrackType,
 };
 use crate::ui::piano_roll::PianoRoll;
 use crate::ui::Timeline;
@@ -132,16 +132,15 @@ impl SupersawApp {
     }
 
     fn draw_transport(&mut self, ui: &mut egui::Ui) {
-        // todo: make fixed with buttons
         ui.horizontal(|ui| {
             ui.set_min_height(32.0);
 
+            // Play/Stop button
             if ui
                 .button(if self.state.playing { "⏹" } else { "▶" })
                 .clicked()
             {
                 self.state.playing = !self.state.playing;
-                // Reset last_update when starting playback
                 if self.state.playing {
                     self.state.last_update = Some(std::time::Instant::now());
                 }
@@ -152,23 +151,74 @@ impl SupersawApp {
                 self.state.current_time = 0.0;
             }
 
+            // Toggle metronome
+            if ui.button("M").clicked() {
+                if let Err(e) = self.command_manager.execute(
+                    if self.state.metronome {
+                        DawCommand::DisableMetronome
+                    } else {
+                        DawCommand::EnableMetronome
+                    },
+                    &mut self.state,
+                ) {
+                    self.state
+                        .status
+                        .error(format!("Failed to toggle metronome: {}", e));
+                }
+            }
+
             if ui.button("Rec").clicked() {
                 self.state.recording = !self.state.recording
             }
 
+            ui.separator();
+
             ui.label(format!("BPM: {:.1}", self.state.project.bpm));
 
-            if ui.button("−").clicked() {
-                self.state.project.bpm -= 1.0;
-            } else if ui.button("+").clicked() {
-                self.state.project.bpm += 1.0;
+            for (label, delta) in [("−", -1.0), ("+", 1.0)] {
+                if ui.button(label).clicked() {
+                    if let Err(e) = self.command_manager.execute(
+                        DawCommand::SetBpm {
+                            bpm: self.state.project.bpm + delta,
+                        },
+                        &mut self.state,
+                    ) {
+                        self.state.status.error(format!("Failed to set BPM: {}", e));
+                    }
+                }
             }
+            ui.separator();
 
             // Display formatted time
             let minutes = (self.state.current_time / 60.0).floor();
             let seconds = (self.state.current_time % 60.0).floor();
             let frames = ((self.state.current_time % 1.0) * 30.0).floor(); // Assuming 30fps
             ui.label(format!("{:02}:{:02}:{:02}", minutes, seconds, frames));
+
+            ui.separator();
+
+            let mut loop_enabled = self.state.loop_enabled;
+            if ui.toggle_value(&mut loop_enabled, "⟲").clicked() {
+                self.state.loop_enabled = loop_enabled;
+            }
+            if ui.button("Set Start").clicked() {
+                self.state.loop_start = self.state.current_time;
+            }
+            if ui.button("Set End").clicked() {
+                self.state.loop_end = self.state.current_time;
+            }
+
+            let loop_range = format!(
+                "{:.1}s - {:.1}s",
+                self.state.loop_start, self.state.loop_end
+            );
+            ui.label(loop_range);
+
+            ui.separator();
+
+            if ui.button("Arrangement").clicked() {
+                self.state.current_view = EditorView::Arrangement;
+            }
         });
     }
 

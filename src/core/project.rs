@@ -32,7 +32,7 @@ impl Default for EditorView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
-    pub bpm: f32,
+    pub bpm: f64,
     pub tracks: Vec<Track>,
     #[serde(skip)]
     pub project_path: Option<PathBuf>,
@@ -84,6 +84,22 @@ pub enum Clip {
 }
 
 impl Project {
+    pub fn ticks_per_second(&self) -> f64 {
+        (self.bpm / 60.0) * self.ppq as f64
+    }
+
+    pub fn beats_per_second(&self) -> f64 {
+        self.bpm / 60.0
+    }
+
+    pub fn ticks_to_seconds(&self, ticks: u32) -> f64 {
+        ticks as f64 / self.ticks_per_second()
+    }
+
+    pub fn seconds_to_ticks(&self, seconds: f64) -> u32 {
+        (seconds * self.ticks_per_second()) as u32
+    }
+
     pub fn new(name: String) -> Self {
         Self {
             name,

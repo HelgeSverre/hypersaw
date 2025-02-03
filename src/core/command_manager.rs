@@ -54,8 +54,6 @@ impl CommandManager {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let name = command.name();
 
-        println!("Executing command: {}", name);
-
         // Save current state before executing the command
         self.save_snapshot(state);
 
@@ -68,8 +66,6 @@ impl CommandManager {
         // Clear redo stack as we have a new command
         self.redo_stack.clear();
 
-        println!("Executing command: {} - DONE", name);
-
         Ok(())
     }
 
@@ -79,9 +75,6 @@ impl CommandManager {
             if let Some(snapshot) = self.state_snapshots.pop() {
                 *state = snapshot.state;
             }
-
-            // Log the undo action
-            println!("Undo: {}", command.name());
 
             self.redo_stack.push(command);
         }

@@ -8,7 +8,6 @@ pub struct Timeline {
     pixels_per_second: f32,
     scroll_offset: f32,
     grid_size: f32,
-    visible_time: f32,
     snap_enabled: bool,
     track_height: f32,
     drag_start: Option<(egui::Pos2, f32)>, // (pointer_pos, clip_start_time)
@@ -21,7 +20,6 @@ impl Default for Timeline {
             pixels_per_second: 100.0,
             scroll_offset: 0.0,
             grid_size: 1.0,
-            visible_time: 60.0,
             snap_enabled: true,
             track_height: 80.0,
             drag_start: None,
@@ -34,7 +32,21 @@ impl Timeline {
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) -> Vec<DawCommand> {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
 
-        // Draw background
+        self.draw_background(ui, rect);
+        self.handle_zooming(ui);
+        self.handle_scrolling(ui);
+        self.handle_file_drops(ui, state);
+        self.handle_delete_clip(ui, state);
+
+        self.draw_ruler(ui, rect);
+        self.draw_tracks(ui, rect.shrink2(egui::vec2(0.0, 20.0)), state);
+        self.handle_loop_region(ui, rect, state);
+        self.draw_playhead(ui, rect, state);
+
+        self.command_collector.take_commands()
+    }
+
+    fn draw_background(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         ui.painter().rect_filled(
             rect,
             0.0,
@@ -44,38 +56,74 @@ impl Timeline {
                 ui.visuals().code_bg_color
             },
         );
+    }
 
-        // Handle zooming everywhere in the timeline
+    fn handle_zooming(&mut self, ui: &mut egui::Ui) {
         if ui.input(|i| i.modifiers.ctrl) {
             ui.input(|i| {
                 let zoom_delta = i.raw_scroll_delta.y * 0.01;
-                // Calculate zoom center based on mouse position
                 if let Some(mouse_pos) = i.pointer.hover_pos() {
                     let time_at_mouse = (mouse_pos.x + self.scroll_offset) / self.pixels_per_second;
-
-                    // Apply zoom
-                    let old_pixels_per_second = self.pixels_per_second;
                     self.pixels_per_second = (self.pixels_per_second * (1.0 + zoom_delta))
                         .max(10.0)
                         .min(500.0);
-
-                    // Adjust scroll offset to keep the time under the mouse constant
                     let new_mouse_x = time_at_mouse * self.pixels_per_second;
                     self.scroll_offset = new_mouse_x - mouse_pos.x;
                 }
             });
         }
+    }
 
-        // Handle panning everywhere in the timeline
-        if response.dragged_by(egui::PointerButton::Middle) {
-            self.scroll_offset = (self.scroll_offset - response.drag_delta().x).max(0.0);
-            // Allow scrolling past the end for now
+    fn handle_scrolling(&mut self, ui: &mut egui::Ui) {
+        if ui.input(|i| i.modifiers.shift) {
+            ui.input(|i| {
+                let scroll_delta = i.raw_scroll_delta.y;
+                self.scroll_offset = (self.scroll_offset + scroll_delta).max(0.0);
+            });
         }
+    }
 
-        // Pressing DELETE on a selected clip.
+    fn handle_file_drops(&mut self, ui: &mut egui::Ui, state: &mut DawState) {
+        if let mut files = ui.input(|i| i.raw.dropped_files.clone()) {
+            if let Some(file) = files.pop() {
+                if let Some(path) = file.path {
+                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        let time = (pos.x + self.scroll_offset) / self.pixels_per_second;
+                        if let Some(track_id) = &state.selected_track {
+                            let extension = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_lowercase();
+                            let is_midi = extension == "mid" || extension == "midi";
+                            let is_audio = extension == "wav" || extension == "mp3";
+                            if let Some(track) =
+                                state.project.tracks.iter().find(|t| &t.id == track_id)
+                            {
+                                let can_add = match &track.track_type {
+                                    TrackType::Midi { .. } => is_midi,
+                                    TrackType::Audio => is_audio,
+                                    _ => false,
+                                };
+                                if can_add {
+                                    self.command_collector.add_command(DawCommand::AddClip {
+                                        track_id: track_id.clone(),
+                                        start_time: time as f64,
+                                        length: 4.0,
+                                        file_path: path,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_delete_clip(&mut self, ui: &mut egui::Ui, state: &mut DawState) {
         if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
             if let Some(clip_id) = &state.selected_clip {
-                // Find the track that contains this clip
                 for track in &state.project.tracks {
                     if let Some(clip) = track.clips.iter().find(|c| match c {
                         Clip::Midi { id, .. } | Clip::Audio { id, .. } => id == clip_id,
@@ -89,96 +137,78 @@ impl Timeline {
                 }
             }
         }
+    }
 
-        // Handle file drops for new clips
-        if let mut files = ui.input(|i| i.raw.dropped_files.clone()) {
-            if let Some(file) = files.pop() {
-                if let Some(path) = file.path {
-                    // Find the drop position and convert to timeline position
-                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        let time = (pos.x + self.scroll_offset) / self.pixels_per_second;
+    fn handle_loop_region(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &mut DawState) {
+        if state.loop_enabled {
+            let loop_start_x =
+                rect.left() + state.loop_start as f32 * self.pixels_per_second - self.scroll_offset;
+            let loop_end_x =
+                rect.left() + state.loop_end as f32 * self.pixels_per_second - self.scroll_offset;
 
-                        // If we have a selected track, add to that
-                        if let Some(track_id) = &state.selected_track {
-                            let extension = path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("")
-                                .to_lowercase();
+            let loop_rect = egui::Rect::from_min_max(
+                egui::pos2(loop_start_x, rect.top()),
+                egui::pos2(loop_end_x, rect.bottom()),
+            );
 
-                            // Determine if this is a MIDI or audio file
-                            let is_midi = extension == "mid" || extension == "midi";
-                            let is_audio = extension == "wav" || extension == "mp3";
+            ui.painter().rect_filled(
+                loop_rect,
+                0.0,
+                ui.visuals().selection.bg_fill.linear_multiply(0.2),
+            );
 
-                            // Only add if the file type matches the track type
-                            if let Some(track) =
-                                state.project.tracks.iter().find(|t| &t.id == track_id)
-                            {
-                                let can_add = match &track.track_type {
-                                    TrackType::Midi { .. } => is_midi,
-                                    TrackType::Audio => is_audio,
-                                    _ => false,
-                                };
+            let marker_height = 10.0;
+            let marker_width = 2.0;
 
-                                if can_add {
-                                    self.command_collector.add_command(DawCommand::AddClip {
-                                        track_id: track_id.clone(),
-                                        start_time: time as f64,
-                                        length: 4.0, // Default length, could be file length for audio
-                                        file_path: path,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(loop_start_x - marker_width / 2.0, rect.top()),
+                    egui::pos2(
+                        loop_start_x + marker_width / 2.0,
+                        rect.top() + marker_height,
+                    ),
+                ),
+                0.0,
+                ui.visuals().selection.stroke.color,
+            );
+
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(loop_end_x - marker_width / 2.0, rect.top()),
+                    egui::pos2(loop_end_x + marker_width / 2.0, rect.top() + marker_height),
+                ),
+                0.0,
+                ui.visuals().selection.stroke.color,
+            );
+
+            let start_handle = egui::Rect::from_min_max(
+                egui::pos2(loop_start_x - 5.0, rect.top()),
+                egui::pos2(loop_start_x + 5.0, rect.top() + marker_height),
+            );
+            let end_handle = egui::Rect::from_min_max(
+                egui::pos2(loop_end_x - 5.0, rect.top()),
+                egui::pos2(loop_end_x + 5.0, rect.top() + marker_height),
+            );
+
+            let start_response = ui.allocate_rect(start_handle, egui::Sense::drag());
+            let end_response = ui.allocate_rect(end_handle, egui::Sense::drag());
+
+            if start_response.dragged() {
+                let delta = start_response.drag_delta().x / self.pixels_per_second;
+                state.loop_start = (state.loop_start + delta as f64)
+                    .max(0.0)
+                    .min(state.loop_end - 0.1);
+            }
+
+            if end_response.dragged() {
+                let delta = end_response.drag_delta().x / self.pixels_per_second;
+                state.loop_end = (state.loop_end + delta as f64).max(state.loop_start + 0.1);
+            }
+
+            if start_response.hovered() || end_response.hovered() {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
             }
         }
-
-        // Draw time ruler
-        self.draw_ruler(ui, rect);
-
-        let track_rect = rect.shrink2(egui::vec2(0.0, 20.0));
-        // Draw tracks
-        self.draw_tracks(ui, track_rect, state);
-
-        // Handle zoom with Ctrl + Mouse wheel
-        if response.hovered() {
-            ui.input(|i| {
-                if i.modifiers.ctrl {
-                    let zoom_delta = i.raw_scroll_delta.y * 0.01;
-                    self.pixels_per_second = (self.pixels_per_second * (1.0 + zoom_delta))
-                        .max(10.0) // Minimum zoom
-                        .min(500.0); // Maximum zoom
-                }
-            });
-        }
-
-        let playhead_x = state.current_time * self.pixels_per_second as f64;
-        let visible_width = rect.width() as f64;
-        let visible_width_threshold = visible_width * 0.2;
-
-        let playhead_position = playhead_x - self.scroll_offset as f64;
-
-        if playhead_position > visible_width * 0.8 {
-            // Playhead is approaching right edge, scroll to keep it in view
-            self.scroll_offset = (playhead_x - visible_width_threshold) as f32;
-        } else if (playhead_position < visible_width_threshold) {
-            // Playhead is approaching left edge
-            self.scroll_offset = (playhead_x - visible_width_threshold).max(0.0) as f32;
-        }
-
-        // Draw playhead
-        let playhead_x = rect.left() as f64 + playhead_x - self.scroll_offset as f64;
-        ui.painter().line_segment(
-            [
-                egui::pos2(playhead_x as f32, rect.top()),
-                egui::pos2(playhead_x as f32, rect.bottom()),
-            ],
-            (1.0, ui.visuals().text_color()),
-        );
-
-        self.command_collector.take_commands()
     }
 
     fn draw_ruler(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -491,5 +521,28 @@ impl Timeline {
         if left_response.hovered() || right_response.hovered() {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
         }
+    }
+
+    fn draw_playhead(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
+        let playhead_x = state.current_time * self.pixels_per_second as f64;
+        let visible_width = rect.width() as f64;
+        let visible_width_threshold = visible_width * 0.2;
+
+        let playhead_position = playhead_x - self.scroll_offset as f64;
+
+        if playhead_position > visible_width * 0.8 {
+            self.scroll_offset = (playhead_x - visible_width_threshold) as f32;
+        } else if playhead_position < visible_width_threshold {
+            self.scroll_offset = (playhead_x - visible_width_threshold).max(0.0) as f32;
+        }
+
+        let playhead_x = rect.left() as f64 + playhead_x - self.scroll_offset as f64;
+        ui.painter().line_segment(
+            [
+                egui::pos2(playhead_x as f32, rect.top()),
+                egui::pos2(playhead_x as f32, rect.bottom()),
+            ],
+            (1.0, ui.visuals().text_color()),
+        );
     }
 }
