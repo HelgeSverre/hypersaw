@@ -5,6 +5,7 @@ use crate::core::{
 use crate::ui::piano_roll::PianoRoll;
 use crate::ui::Timeline;
 use eframe::egui;
+use egui::debug_text::print;
 use egui::Key;
 use egui::Shape::Path;
 use std::collections::HashMap;
@@ -277,7 +278,7 @@ impl eframe::App for SupersawApp {
             }
         });
 
-        egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
+        egui::TopBottomPanel::top("transport").show(ctx, |ui| {
             self.draw_transport(ui);
         });
 
@@ -287,29 +288,27 @@ impl eframe::App for SupersawApp {
                 self.draw_track_list(ui);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match &self.state.current_view {
-                EditorView::Arrangement => {
-                    // Handle returned command from timeline
-                    if let Some(command) = self.timeline.show(ui, &mut self.state) {
-                        if let Err(e) = self.command_manager.execute(command, &mut self.state) {
-                            eprintln!("Command failed: {}", e);
-                            // Optionally set a status message
-                            self.state.status.error(format!("Command failed: {}", e));
-                        }
+        egui::CentralPanel::default().show(ctx, |ui| match &self.state.current_view {
+            EditorView::Arrangement => {
+                let commands = self.timeline.show(ui, &mut self.state);
+                for command in commands {
+                    if let Err(e) = self.command_manager.execute(command, &mut self.state) {
+                        eprintln!("timeline: Command failed: {}", e);
+                        self.state.status.error(format!("Command failed: {}", e));
                     }
                 }
-                EditorView::PianoRoll { .. } => {
-                    // Similarly handle piano roll commands when we implement them
-                    if let Some(command) = self.piano_roll.show(ui, &mut self.state) {
-                        if let Err(e) = self.command_manager.execute(command, &mut self.state) {
-                            eprintln!("Command failed: {}", e);
-                        }
+            }
+            EditorView::PianoRoll { .. } => {
+                let commands = self.piano_roll.show(ui, &mut self.state);
+                for command in commands {
+                    if let Err(e) = self.command_manager.execute(command, &mut self.state) {
+                        eprintln!("piano_roll: Command failed: {}", e);
+                        self.state.status.error(format!("Command failed: {}", e));
                     }
                 }
-                EditorView::SampleEditor { .. } => {
-                    ui.label("Sample Editor (Not Implemented)");
-                }
+            }
+            EditorView::SampleEditor { .. } => {
+                ui.label("Sample Editor (Not Implemented)");
             }
         });
 

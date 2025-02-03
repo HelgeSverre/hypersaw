@@ -10,6 +10,7 @@ pub struct PianoRoll {
     scroll_y: f32,
     selected_notes: Vec<usize>,
     dragging: Option<DragOperation>,
+    command_collector: CommandCollector,
 }
 
 enum DragOperation {
@@ -28,18 +29,19 @@ impl Default for PianoRoll {
         Self {
             key_width: 80.0,
             key_height: 20.0,
-            grid_snap: 0.25, // 16th notes by default
-            zoom: 100.0,     // 100 pixels per beat
+            grid_snap: 0.25,
+            zoom: 100.0,
             scroll_x: 0.0,
             scroll_y: 0.0,
             selected_notes: Vec::new(),
             dragging: None,
+            command_collector: CommandCollector::new(),
         }
     }
 }
 
 impl PianoRoll {
-    pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) -> Option<DawCommand> {
+    pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) -> Vec<DawCommand> {
         if let EditorView::PianoRoll {
             clip_id, track_id, ..
         } = &state.current_view
@@ -93,7 +95,7 @@ impl PianoRoll {
             }
         }
 
-        None
+        self.command_collector.take_commands()
     }
 
     fn draw_piano_keys(&self, ui: &mut egui::Ui, rect: egui::Rect) {
