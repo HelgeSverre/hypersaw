@@ -34,10 +34,11 @@ impl DawState {
         if self.playing {
             if let Some(last_update) = self.last_update {
                 let delta = now.duration_since(last_update).as_secs_f64();
-                // Calculate time increment based on BPM
-                // At 60 BPM, 1 beat = 1 second
                 let seconds_per_beat = 60.0 / self.project.bpm as f64;
                 let beats_elapsed = delta / seconds_per_beat;
+                let ticks_elapsed = beats_elapsed * self.project.ppq as f64;
+                let ticks_per_second = self.project.bpm as f64 / 60.0 * self.project.ppq as f64;
+
                 self.current_time += delta;
             }
         }

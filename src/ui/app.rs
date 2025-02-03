@@ -6,7 +6,6 @@ use crate::ui::piano_roll::PianoRoll;
 use crate::ui::Timeline;
 use eframe::egui;
 use egui::Key;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
@@ -17,7 +16,6 @@ pub struct SupersawApp {
     midi_output: Option<midir::MidiOutputConnection>,
     midi_ports: Vec<String>,
     file_dialog: Option<FileDialog>,
-    // keymap: HashMap<Key, KeyAction>,
     timeline: Timeline,
     piano_roll: PianoRoll,
 }
@@ -30,19 +28,6 @@ enum FileDialog {
 }
 
 impl SupersawApp {
-    fn initialize_keymap() -> HashMap<Key, KeyAction> {
-        use KeyAction::*;
-        let mut keymap = HashMap::new();
-
-        // Add key bindings
-        keymap.insert(Key::O, LoadProject);
-        keymap.insert(Key::S, SaveProject);
-        keymap.insert(Key::Z, Undo);
-        keymap.insert(Key::R, Redo);
-
-        keymap
-    }
-
     fn handle_key_action(&mut self, action: KeyAction) {
         match action {
             KeyAction::LoadProject => {
@@ -67,13 +52,11 @@ impl SupersawApp {
     }
     fn scan_midi_ports() -> Vec<String> {
         match midir::MidiOutput::new("Supersaw") {
-            Ok(midi_out) => {
-                let ports = midi_out.ports();
-                ports
-                    .iter()
-                    .filter_map(|port| midi_out.port_name(port).ok())
-                    .collect()
-            }
+            Ok(midi_out) => midi_out
+                .ports()
+                .iter()
+                .filter_map(|port| midi_out.port_name(port).ok())
+                .collect(),
             Err(err) => {
                 eprintln!("Error creating MIDI output: {}", err);
                 Vec::new()
@@ -96,9 +79,6 @@ impl SupersawApp {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Initialize keymap
-        let keymap = Self::initialize_keymap();
-
         // Set up MIDI output
         let midi_ports = Self::scan_midi_ports();
         let midi_out: Option<midir::MidiOutputConnection> = None;
@@ -173,14 +153,14 @@ impl SupersawApp {
             }
 
             if ui.button("Rec").clicked() {
-                self.state.recording = !self.state.recording;
+                self.state.recording = !self.state.recording
             }
 
             ui.label(format!("BPM: {:.1}", self.state.project.bpm));
-            if ui.button("−").clicked() && self.state.project.bpm > 20.0 {
+
+            if ui.button("−").clicked() {
                 self.state.project.bpm -= 1.0;
-            }
-            if ui.button("+").clicked() && self.state.project.bpm < 300.0 {
+            } else if ui.button("+").clicked() {
                 self.state.project.bpm += 1.0;
             }
 
@@ -260,7 +240,6 @@ impl eframe::App for SupersawApp {
         if self.state.playing {
             ctx.request_repaint();
         }
-
 
         // Keyboard shortcuts
         // SAVE -  Ctrl + S
