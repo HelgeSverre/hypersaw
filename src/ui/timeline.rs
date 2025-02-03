@@ -214,6 +214,27 @@ impl Timeline {
         let ruler_rect =
             egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), ruler_height));
 
+        // Draw debug outline of ruler viewport
+        ui.painter()
+            .rect_stroke(ruler_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::RED));
+
+        // Draw scroll offset visualization
+        let scroll_marker = egui::pos2(
+            ruler_rect.left() + self.scroll_offset,
+            ruler_rect.center().y,
+        );
+        ui.painter()
+            .circle_filled(scroll_marker, 4.0, egui::Color32::GREEN);
+
+        // Add scroll offset text
+        ui.painter().text(
+            ruler_rect.right_top(),
+            egui::Align2::RIGHT_TOP,
+            format!("Scroll: {:.1}", self.scroll_offset),
+            egui::FontId::monospace(14.0),
+            egui::Color32::RED,
+        );
+
         let response = ui.allocate_rect(ruler_rect, egui::Sense::click_and_drag());
 
         const EDGE_SCROLL_MARGIN: f32 = 50.0; // Pixels from edge where scrolling starts

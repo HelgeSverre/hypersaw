@@ -42,15 +42,13 @@ impl DawState {
 
         if self.playing {
             if let Some(last_update) = self.last_update {
-                let elapsed = now.duration_since(last_update).as_secs_f64();
-                let seconds_per_beat = 60.0 / self.project.bpm;
-                let beats_elapsed = elapsed / seconds_per_beat;
-                let ticks_elapsed = beats_elapsed * self.project.ppq as f64;
-                let ticks_per_second = self.project.bpm / 60.0 * self.project.ppq as f64;
+                let delta_time = now.duration_since(last_update).as_secs_f64();
+                let ticks_elapsed = self.project.seconds_to_ticks(delta_time);
 
-                self.current_time += elapsed;
+                self.current_time += delta_time;
 
                 // Handle looping
+                // TODO: maybe move this to a separate function
                 if self.loop_enabled && self.current_time >= self.loop_end {
                     let minimum_loop_length = 5.0;
                     if (self.loop_end - self.loop_start) > minimum_loop_length {
