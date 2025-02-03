@@ -260,21 +260,6 @@ impl eframe::App for SupersawApp {
                         ui.close_menu();
                     }
                 });
-
-                ui.menu_button("Track", |ui| {
-                    if ui.button("Add MIDI Track").clicked() {
-                        // TODO: Implement MIDI track creation
-                        ui.close_menu();
-                    }
-                    if ui.button("Add Drum Rack").clicked() {
-                        // TODO: Implement drum rack creation
-                        ui.close_menu();
-                    }
-                    if ui.button("Add Audio Track").clicked() {
-                        // TODO: Implement audio track creation
-                        ui.close_menu();
-                    }
-                });
             });
         });
 
