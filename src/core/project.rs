@@ -36,6 +36,7 @@ pub struct Project {
     pub tracks: Vec<Track>,
     #[serde(skip)]
     pub project_path: Option<PathBuf>,
+    pub ppq: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +87,8 @@ impl Project {
     pub fn new(name: String) -> Self {
         Self {
             name,
-            bpm: 140.0, // Default BPM for trance
+            bpm: 120.0,
+            ppq: 480,
             tracks: Vec::new(),
             project_path: None,
         }
