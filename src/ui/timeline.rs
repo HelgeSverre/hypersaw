@@ -214,37 +214,16 @@ impl Timeline {
         let ruler_rect =
             egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), ruler_height));
 
-        // Draw debug outline of ruler viewport
-        ui.painter()
-            .rect_stroke(ruler_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::RED));
-
-        // Draw scroll offset visualization
-        let scroll_marker = egui::pos2(
-            ruler_rect.left() + self.scroll_offset,
-            ruler_rect.center().y,
-        );
-        ui.painter()
-            .circle_filled(scroll_marker, 4.0, egui::Color32::GREEN);
-
-        // Add scroll offset text
-        ui.painter().text(
-            ruler_rect.right_top(),
-            egui::Align2::RIGHT_TOP,
-            format!("Scroll: {:.1}", self.scroll_offset),
-            egui::FontId::monospace(14.0),
-            egui::Color32::RED,
-        );
-
         let response = ui.allocate_rect(ruler_rect, egui::Sense::click_and_drag());
 
         const EDGE_SCROLL_MARGIN: f32 = 50.0; // Pixels from edge where scrolling starts
-        const EDGE_SCROLL_SPEED: f32 = 5.0;
+        const EDGE_SCROLL_SPEED: f32 = 10.0; // Pixels per frame when scrolling
 
         if response.dragged() {
             if let Some(pos) = response.hover_pos() {
                 // Handle edge scrolling
                 if pos.x < rect.left() + EDGE_SCROLL_MARGIN {
-                    self.scroll_offset = (self.scroll_offset - EDGE_SCROLL_SPEED).max(0.0);
+                    self.scroll_offset = (self.scroll_offset - EDGE_SCROLL_SPEED);
                 } else if pos.x > rect.right() - EDGE_SCROLL_MARGIN {
                     self.scroll_offset += EDGE_SCROLL_SPEED;
                 }
@@ -255,7 +234,7 @@ impl Timeline {
                 let absolute_time = viewport_time + (self.scroll_offset / self.pixels_per_second);
 
                 self.command_collector.add_command(DawCommand::SeekTime {
-                    time: absolute_time.max(0.0) as f64,
+                    time: absolute_time as f64,
                 });
             }
         } else if response.clicked() {
@@ -265,7 +244,7 @@ impl Timeline {
                 let absolute_time = viewport_time + (self.scroll_offset / self.pixels_per_second);
 
                 self.command_collector.add_command(DawCommand::SeekTime {
-                    time: absolute_time.max(0.0) as f64,
+                    time: absolute_time as f64,
                 });
             }
         }
