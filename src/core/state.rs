@@ -1,8 +1,9 @@
-use crate::core::{EditorView, Project, StatusManager};
+use crate::core::{EditorView, Project, SnapMode, StatusManager};
 
 #[derive(Clone, Debug)]
 pub struct DawState {
     pub project: Project,
+    pub snap_mode: SnapMode,
     pub metronome: bool,
     pub playing: bool,
     pub recording: bool,
@@ -22,6 +23,7 @@ impl DawState {
     pub fn new() -> Self {
         Self {
             project: Project::new("Untitled".to_string()),
+            snap_mode: SnapMode::Halfbeat,
             metronome: false,
             playing: false,
             recording: false,

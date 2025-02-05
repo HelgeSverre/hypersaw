@@ -7,6 +7,44 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SnapMode {
+    None,
+    Bar,
+    Beat,
+    Halfbeat, // Half beat (8th note)
+    Quarter, // Quarter beat (16th note)
+    Eighth,  // Eighth beat (32nd note)
+    Triplet, // Triplet (1/3 of beat)
+}
+
+impl SnapMode {
+    pub fn get_division(&self, bpm: f64) -> f64 {
+        let beat_duration = 60.0 / bpm; // Duration of one beat in seconds
+        match self {
+            SnapMode::None => 0.0,
+            SnapMode::Bar => beat_duration * 4.0,
+            SnapMode::Beat => beat_duration,
+            SnapMode::Halfbeat => beat_duration / 2.0,
+            SnapMode::Quarter => beat_duration / 4.0,
+            SnapMode::Eighth => beat_duration / 8.0,
+            SnapMode::Triplet => beat_duration / 3.0,
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        match self {
+            SnapMode::None => "None",
+            SnapMode::Bar => "Bar",
+            SnapMode::Beat => "Beat",
+            SnapMode::Halfbeat => "1/8",
+            SnapMode::Quarter => "1/16",
+            SnapMode::Eighth => "1/32",
+            SnapMode::Triplet => "Triplet",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EditorView {
     Arrangement,
@@ -33,10 +71,10 @@ impl Default for EditorView {
 pub struct Project {
     pub name: String,
     pub bpm: f64,
+    pub ppq: u32,
     pub tracks: Vec<Track>,
     #[serde(skip)]
     pub project_path: Option<PathBuf>,
-    pub ppq: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

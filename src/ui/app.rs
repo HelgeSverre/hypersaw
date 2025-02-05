@@ -1,8 +1,9 @@
 use crate::core::{
-    Clip, CommandManager, DawCommand, DawState, EditorView, MessageType, Project, StatusMessage,
-    Track, TrackType,
+    Clip, CommandManager, DawCommand, DawState, EditorView, MessageType, Project, SnapMode,
+    StatusMessage, Track, TrackType,
 };
 use crate::ui::piano_roll::PianoRoll;
+use crate::ui::plugin_browser::PluginBrowser;
 use crate::ui::Timeline;
 use eframe::egui;
 use egui::Key;
@@ -16,8 +17,11 @@ pub struct SupersawApp {
     midi_output: Option<midir::MidiOutputConnection>,
     midi_ports: Vec<String>,
     file_dialog: Option<FileDialog>,
+
+    // Views
     timeline: Timeline,
     piano_roll: PianoRoll,
+    plugin_browser: PluginBrowser,
 }
 
 enum FileDialog {
@@ -101,7 +105,8 @@ impl SupersawApp {
             file_dialog: None,
             timeline: Timeline::default(),
             piano_roll: PianoRoll::default(),
-            command_manager: CommandManager::new(),
+            command_manager: CommandManager::default(),
+            plugin_browser: PluginBrowser::default(),
         };
 
         app.state.status.set_message(
@@ -197,6 +202,40 @@ impl SupersawApp {
                     }
                 }
             }
+
+            ui.separator();
+            egui::ComboBox::from_label("Snap")
+                .selected_text(self.state.snap_mode.display_name())
+                .show_ui(ui, |ui| {
+                    for snap_mode in [
+                        SnapMode::None,
+                        SnapMode::Bar,
+                        SnapMode::Beat,
+                        SnapMode::Halfbeat,
+                        SnapMode::Quarter,
+                        SnapMode::Eighth,
+                        SnapMode::Triplet,
+                    ] {
+                        if ui
+                            .selectable_value(
+                                &mut self.state.snap_mode,
+                                snap_mode,
+                                snap_mode.display_name(),
+                            )
+                            .clicked()
+                        {
+                            if let Err(e) = self
+                                .command_manager
+                                .execute(DawCommand::SetSnapMode { snap_mode }, &mut self.state)
+                            {
+                                self.state
+                                    .status
+                                    .error(format!("Failed to set snap mode: {}", e));
+                            }
+                        }
+                    }
+                });
+
             ui.separator();
 
             // Display formatted time
@@ -356,6 +395,13 @@ impl eframe::App for SupersawApp {
                         ui.close_menu();
                     }
                 });
+
+                ui.menu_button("Plugins", |ui| {
+                    if ui.button("Browse Plugins...").clicked() {
+                        self.plugin_browser.show_browser();
+                        ui.close_menu();
+                    }
+                });
             });
         });
 
@@ -383,6 +429,7 @@ impl eframe::App for SupersawApp {
                 self.draw_track_list(ui);
             });
 
+        // Draw the main content area
         egui::CentralPanel::default().show(ctx, |ui| match &self.state.current_view {
             EditorView::Arrangement => {
                 let commands = self.timeline.show(ui, &mut self.state);
@@ -406,6 +453,16 @@ impl eframe::App for SupersawApp {
                 ui.label("Sample Editor (Not Implemented)");
             }
         });
+
+        // Handle plugin browser
+        let commands = self.plugin_browser.show(ctx, &mut self.state);
+        for command in commands {
+            if let Err(e) = self.command_manager.execute(command, &mut self.state) {
+                self.state
+                    .status
+                    .error(format!("Plugin browser command failed: {}", e));
+            }
+        }
 
         // Handle file dialogs
         if let Some(dialog_type) = &self.file_dialog {
