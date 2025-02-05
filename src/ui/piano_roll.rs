@@ -9,7 +9,7 @@ const NOTES_PER_OCTAVE: i32 = 12;
 pub struct PianoRoll {
     key_width: f32,
     key_height: f32,
-    grid_snap: f32,
+    grid_snap: bool,
     zoom: f32,
     scroll_x: f32,
     scroll_y: f32,
@@ -19,12 +19,14 @@ pub struct PianoRoll {
     command_collector: CommandCollector,
 }
 
+#[derive(Debug)]
 enum DragOperation {
     MovingNotes { start_x: f32, start_y: f32 },
     ResizingNotes { edge: ResizeEdge, start_x: f32 },
     Drawing { start_x: f32, start_y: f32 },
 }
 
+#[derive(Debug)]
 enum ResizeEdge {
     Left,
     Right,
@@ -35,7 +37,7 @@ impl PianoRoll {
         Self {
             key_width: 80.0,
             key_height: 20.0,
-            grid_snap: 0.25,
+            grid_snap: true,
             zoom: 100.0,
             scroll_x: 0.0,
             scroll_y: 0.0,
@@ -43,33 +45,6 @@ impl PianoRoll {
             selected_notes: Vec::new(),
             dragging: None,
             command_collector: CommandCollector::new(),
-        }
-    }
-
-    fn get_total_height(&self) -> f32 {
-        (DEFAULT_OCTAVES * NOTES_PER_OCTAVE) as f32 * self.key_height
-    }
-
-    //todo move into utils/midi module
-    fn get_note_name(note_number: i32) -> String {
-        let note_names = [
-            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-        ];
-        let octave = (note_number / 12) - 1;
-        let note = note_number % 12;
-        format!("{}{}", note_names[note as usize], octave)
-    }
-
-    fn center_on_middle_c(&mut self, viewport_height: f32) {
-        // Only center if we haven't initialized the scroll position yet
-        if self.viewport_height != viewport_height {
-            self.viewport_height = viewport_height;
-            let total_height = self.get_total_height();
-            let middle_c_position = (MIDDLE_C as f32) * self.key_height;
-            self.scroll_y = middle_c_position - (viewport_height / 2.0);
-
-            // Clamp scroll position to keep piano roll in view
-            self.scroll_y = self.scroll_y.clamp(0.0, total_height - viewport_height);
         }
     }
 
@@ -97,21 +72,23 @@ impl PianoRoll {
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
             self.center_on_middle_c(rect.height());
-
-            // Draw the piano roll components
             self.draw_background(ui, rect);
-            self.draw_piano_keys(ui, rect);
             self.draw_grid(ui, rect);
             self.draw_notes(ui, rect, clip_id, track_id, state);
+            self.draw_piano_keys(ui, rect);
 
-            // Handle input
-            self.handle_scrolling(ui, rect);
-            self.handle_zoom(ui);
+            // self.handle_scrolling(ui, rect);
+            self.handle_zoom(ui, rect);
 
-            // Handle dragging for panning
-            if response.dragged_by(egui::PointerButton::Middle) {
-                self.scroll_x -= response.drag_delta().x;
-                let new_scroll_y = self.scroll_y - response.drag_delta().y * -1.0;
+            // Handle middle-button dragging for panning
+            if response.dragged() {
+                // Horizontal scroll
+                let invert = -1.0;
+                let delta = response.drag_delta();
+                self.scroll_x = (self.scroll_x + delta.x * invert).max(0.0);
+
+                // Vertical scroll
+                let new_scroll_y = (self.scroll_y + delta.y).max(0.0);
                 self.scroll_y =
                     new_scroll_y.clamp(0.0, self.get_total_height() - self.viewport_height);
             }
@@ -121,26 +98,40 @@ impl PianoRoll {
     }
 
     fn handle_scrolling(&mut self, ui: &egui::Ui, rect: egui::Rect) {
-        // Handle vertical scrolling
         ui.input(|i| {
-            let scroll_delta = i.raw_scroll_delta.y;
             if i.modifiers.shift {
                 // Horizontal scroll with shift
+                let scroll_delta = i.raw_scroll_delta.x;
+                println!("Horizontal scroll with shift {}", scroll_delta);
                 self.scroll_x = (self.scroll_x + scroll_delta).max(0.0);
             } else {
                 // Vertical scroll without shift
-                let new_scroll_y = self.scroll_y - scroll_delta;
+                let scroll_delta = i.raw_scroll_delta.y;
+                println!("Vertical scroll without shift {}", scroll_delta);
+                let new_scroll_y = self.scroll_y + scroll_delta;
                 self.scroll_y =
                     new_scroll_y.clamp(0.0, self.get_total_height() - self.viewport_height);
             }
         });
     }
 
-    fn handle_zoom(&mut self, ui: &egui::Ui) {
+    fn handle_zoom(&mut self, ui: &egui::Ui, rect: egui::Rect) {
         ui.input(|i| {
             if i.modifiers.ctrl || i.modifiers.command {
-                let zoom_delta = i.raw_scroll_delta.y / 100.0;
-                self.zoom = (self.zoom * (1.0 + zoom_delta)).clamp(20.0, 500.0);
+                if let Some(mouse_pos) = i.pointer.hover_pos() {
+                    // Calculate time at mouse position before zoom
+                    let time_at_mouse =
+                        (mouse_pos.x - rect.left() - self.key_width + self.scroll_x) / self.zoom;
+                    let pitch_at_mouse =
+                        ((rect.bottom() - mouse_pos.y + self.scroll_y) / self.key_height).floor();
+
+                    let zoom_delta = i.raw_scroll_delta.y / 100.0;
+                    self.zoom = (self.zoom * (1.0 + zoom_delta)).clamp(20.0, 500.0);
+
+                    // Adjust scroll to maintain mouse position
+                    let new_mouse_x = time_at_mouse * self.zoom;
+                    self.scroll_x = new_mouse_x - (mouse_pos.x - rect.left() - self.key_width);
+                }
             }
         });
     }
@@ -148,6 +139,56 @@ impl PianoRoll {
     fn draw_background(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         ui.painter()
             .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+    }
+
+    fn handle_note_drag(
+        &mut self,
+        response: &egui::Response,
+        note: &MidiNote,
+        clip_id: &str,
+        state: &DawState,
+    ) {
+        if response.dragged() {
+            println!("Dragging note: {:?}, dragging: {:?}", note, self.dragging);
+            if let None = self.dragging {
+                self.dragging = Some(DragOperation::MovingNotes {
+                    start_x: response.hover_pos().unwrap().x,
+                    start_y: response.hover_pos().unwrap().y,
+                });
+            }
+
+            if let Some(DragOperation::MovingNotes { start_x, start_y }) = self.dragging {
+                let current_pos = response.hover_pos().unwrap();
+                let delta_x = current_pos.x - start_x;
+                let delta_y = current_pos.y - start_y;
+
+                let delta_time = delta_x / self.zoom;
+                let delta_pitch = -(delta_y / self.key_height) as i8;
+
+                // Calculate new time with snapping
+                let time = note.start_time + delta_time as f64;
+
+                // TODO: If holding "command/alt" ignore snapping
+                let new_time = if self.grid_snap {
+                    TimeUtils::snap_time(time, state.project.bpm, state.snap_mode)
+                } else {
+                    time
+                };
+
+                let actual_delta_time = new_time - note.start_time;
+
+                self.command_collector.add_command(DawCommand::MoveNotes {
+                    clip_id: clip_id.to_string(),
+                    note_ids: self.selected_notes.clone(),
+                    delta_time: actual_delta_time,
+                    delta_pitch,
+                });
+            }
+        }
+
+        if response.drag_stopped() {
+            self.dragging = None;
+        }
     }
 
     fn draw_piano_keys(&self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -159,6 +200,10 @@ impl PianoRoll {
         let start_note = (self.scroll_y / self.key_height).floor() as i32;
         let end_note = ((self.scroll_y + rect.height()) / self.key_height).ceil() as i32;
         let visible_notes = start_note..=end_note;
+
+        // Draw background for piano keys
+        ui.painter()
+            .rect_filled(keys_rect, 0.0, ui.visuals().extreme_bg_color);
 
         // Draw white keys first
         for note_number in visible_notes.clone() {
@@ -205,7 +250,6 @@ impl PianoRoll {
         } else {
             ui.visuals().window_fill
         };
-        ui.painter().rect_filled(key_rect, 0.0, color);
 
         // Add key border
         ui.painter().rect_stroke(
@@ -215,6 +259,7 @@ impl PianoRoll {
             StrokeKind::Outside,
         );
 
+        ui.painter().rect_filled(key_rect, 0.0, color);
         // Add key response for potential MIDI preview
         let response = ui.allocate_rect(key_rect, egui::Sense::click());
 
@@ -227,11 +272,11 @@ impl PianoRoll {
         let note_name = format!("{}{}", note_names[note as usize], octave);
 
         // Only show full note name for C notes or when hovering
-        if note == 0 || (!is_black && response.hovered()) {
+        if note == 0 || response.hovered() {
             let text_pos = key_rect.left_center() + egui::vec2(4.0, 0.0);
             ui.painter().text(
                 text_pos,
-                egui::Align2::LEFT_CENTER,
+                egui::Align2::CENTER_CENTER,
                 &note_name,
                 FontId::monospace(10.0),
                 if is_black {
@@ -311,7 +356,7 @@ impl PianoRoll {
             self.key_height,
             self.scroll_x,
             self.scroll_y,
-            note_area, // Use note_area instead of full viewport
+            note_area,
         );
 
         // Find the clip and ensure it's loaded
@@ -322,7 +367,6 @@ impl PianoRoll {
             }) {
                 if let Some(midi_data) = midi_data {
                     for note in &midi_data.notes {
-                        // Skip notes outside viewport for performance
                         if !note_position.is_note_visible(
                             note.start_time,
                             note.pitch,
@@ -334,7 +378,6 @@ impl PianoRoll {
                         let note_rect =
                             note_position.note_to_rect(note.start_time, note.pitch, note.duration);
 
-                        // Add interaction handling
                         let response = ui.allocate_rect(note_rect, egui::Sense::click_and_drag());
 
                         // Draw base note shape
@@ -356,7 +399,7 @@ impl PianoRoll {
                         ui.painter()
                             .rect_filled(velocity_rect, 0.0, ui.visuals().text_color());
 
-                        // Handle interactions
+                        // Handle note selection
                         if response.clicked() {
                             if !ui.input(|i| i.modifiers.shift) {
                                 self.selected_notes.clear();
@@ -364,41 +407,38 @@ impl PianoRoll {
                             self.selected_notes.push(note.id.clone());
                         }
 
-                        if response.dragged() {
-                            if let None = self.dragging {
-                                self.dragging = Some(DragOperation::MovingNotes {
-                                    start_x: response.hover_pos().unwrap().x,
-                                    start_y: response.hover_pos().unwrap().y,
-                                });
-                            }
-
-                            if let Some(DragOperation::MovingNotes { start_x, start_y }) =
-                                self.dragging
-                            {
-                                let current_pos = response.hover_pos().unwrap();
-                                let delta_x = current_pos.x - start_x;
-                                let delta_y = current_pos.y - start_y;
-
-                                let delta_time = delta_x / self.zoom;
-                                let delta_pitch = -(delta_y / self.key_height) as i8;
-
-                                println!("Moving note {}", note.id);
-
-                                self.command_collector.add_command(DawCommand::MoveNotes {
-                                    clip_id: clip_id.to_string(),
-                                    note_ids: self.selected_notes.clone(),
-                                    delta_time: delta_time as f64,
-                                    delta_pitch,
-                                });
-                            }
-                        }
-
-                        if response.drag_stopped() {
-                            self.dragging = None;
-                        }
+                        // Handle note dragging with snapping
+                        self.handle_note_drag(&response, note, clip_id, state);
                     }
                 }
             }
+        }
+    }
+
+    fn get_total_height(&self) -> f32 {
+        (DEFAULT_OCTAVES * NOTES_PER_OCTAVE) as f32 * self.key_height
+    }
+
+    //todo move into utils/midi module
+    fn get_note_name(note_number: i32) -> String {
+        let note_names = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+        ];
+        let octave = (note_number / 12) - 1;
+        let note = note_number % 12;
+        format!("{}{}", note_names[note as usize], octave)
+    }
+
+    fn center_on_middle_c(&mut self, viewport_height: f32) {
+        // Only center if we haven't initialized the scroll position yet
+        if self.viewport_height != viewport_height {
+            self.viewport_height = viewport_height;
+            let total_height = self.get_total_height();
+            let middle_c_position = (MIDDLE_C as f32) * self.key_height;
+            self.scroll_y = middle_c_position - (viewport_height / 2.0);
+
+            // Clamp scroll position to keep piano roll in view
+            self.scroll_y = self.scroll_y.clamp(0.0, total_height - viewport_height);
         }
     }
 }
