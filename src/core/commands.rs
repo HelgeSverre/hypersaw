@@ -63,11 +63,18 @@ pub enum DawCommand {
 
     // Does nothing, used for testing and such
     NoOp,
+    SetSnapMode {
+        snap_mode: SnapMode,
+    },
 }
 
 impl Command for DawCommand {
     fn execute(&self, state: &mut DawState) -> Result<(), Box<dyn std::error::Error>> {
         match self {
+            DawCommand::SetSnapMode { snap_mode } => {
+                state.snap_mode = *snap_mode;
+                Ok(())
+            }
             DawCommand::SeekTime { time } => {
                 if state.loop_enabled {
                     // If we seeked outside of the loop, disable the loop
@@ -246,6 +253,7 @@ impl Command for DawCommand {
 
     fn name(&self) -> &'static str {
         match self {
+            DawCommand::SetSnapMode { .. } => "Set Snap Mode",
             DawCommand::SeekTime { .. } => "Seek Time",
             DawCommand::OpenPianoRoll { .. } => "Open Piano Roll",
             DawCommand::SelectClip { .. } => "Select Clip",

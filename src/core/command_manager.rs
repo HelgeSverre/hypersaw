@@ -36,14 +36,25 @@ impl StateSnapshot {
 }
 
 impl CommandManager {
-    pub fn new() -> Self {
+    pub fn default() -> Self {
         Self {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             state_snapshots: Vec::new(),
-            max_snapshot_count: 50, // todo: configurable
             last_snapshot_time: Instant::now(),
-            time_between_snapshots: Duration::from_millis(120), // todo: configurable
+            max_snapshot_count: 50,
+            time_between_snapshots: Duration::from_millis(120),
+        }
+    }
+
+    pub fn new(max_snapshot_count: usize, time_between_snapshots: Duration) -> Self {
+        Self {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            state_snapshots: Vec::new(),
+            last_snapshot_time: Instant::now(),
+            max_snapshot_count,
+            time_between_snapshots,
         }
     }
 
