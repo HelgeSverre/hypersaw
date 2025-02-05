@@ -8,7 +8,6 @@ use eframe::epaint::StrokeKind;
 pub struct Timeline {
     pixels_per_second: f32,
     scroll_offset: f32,
-    grid_size: f32,
     snap_enabled: bool,
     track_height: f32,
     drag_start: Option<(egui::Pos2, f32)>, // (pointer_pos, clip_start_time)
@@ -20,7 +19,6 @@ impl Default for Timeline {
         Self {
             pixels_per_second: 100.0,
             scroll_offset: 0.0,
-            grid_size: 1.0,     // todo: remove
             snap_enabled: true, // TODO: add toggle in UI
             track_height: 80.0,
             drag_start: None,
@@ -36,7 +34,7 @@ impl Timeline {
         self.draw_background(ui, rect);
         self.draw_grid(ui, rect, state);
         self.handle_zooming(ui);
-        self.handle_scrolling(ui);
+        self.handle_scrolling(ui, &response);
         self.handle_file_drops(ui, state);
         self.handle_delete_clip(ui, state);
 
@@ -140,13 +138,20 @@ impl Timeline {
         }
     }
 
-    fn handle_scrolling(&mut self, ui: &mut egui::Ui) {
-        if ui.input(|i| i.modifiers.shift) {
-            ui.input(|i| {
-                let scroll_delta = i.raw_scroll_delta.x;
-                self.scroll_offset = self.scroll_offset + scroll_delta;
-            });
+    fn handle_scrolling(&mut self, ui: &egui::Ui, response: &egui::Response) {
+        if response.dragged() {
+            let invert = -1.0; // Make dragging intuitive
+            let delta = response.drag_delta();
+            self.scroll_offset = (self.scroll_offset + delta.x * invert).max(0.0);
         }
+
+        // Support mouse wheel scrolling too
+        ui.input(|i| {
+            if i.modifiers.shift {
+                let scroll_delta = i.raw_scroll_delta.x;
+                self.scroll_offset = (self.scroll_offset + scroll_delta).max(0.0);
+            }
+        });
     }
 
     fn handle_file_drops(&mut self, ui: &mut egui::Ui, state: &mut DawState) {
