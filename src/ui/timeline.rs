@@ -77,8 +77,8 @@ impl Timeline {
     fn handle_scrolling(&mut self, ui: &mut egui::Ui) {
         if ui.input(|i| i.modifiers.shift) {
             ui.input(|i| {
-                let scroll_delta = i.raw_scroll_delta.y;
-                self.scroll_offset = (self.scroll_offset + scroll_delta).max(0.0);
+                let scroll_delta = i.raw_scroll_delta.x;
+                self.scroll_offset = (self.scroll_offset + scroll_delta);
             });
         }
     }
