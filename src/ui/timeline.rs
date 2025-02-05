@@ -307,21 +307,22 @@ impl Timeline {
             }
 
             // Draw track background
-            ui.painter().rect_filled(
-                track_rect,
-                0.0,
-                if state.selected_track == Some(track.id.clone()) {
-                    ui.visuals().selection.bg_fill
-                } else if track_idx % 2 == 0 {
-                    ui.visuals().faint_bg_color
-                } else {
-                    ui.visuals().window_fill
-                },
-            );
+
+            if state.selected_track == Some(track.id.clone()) {
+                // Highlight selected track
+                ui.painter()
+                    .rect_filled(track_rect, 0.0, ui.visuals().selection.bg_fill);
+            } else if track_idx % 2 == 0 {
+                // Odd rows
+                ui.painter()
+                    .rect_filled(track_rect, 0.0, ui.visuals().faint_bg_color);
+            } else {
+                // Don't draw anything for even rows
+            }
 
             // Draw track separator
             ui.painter().line_segment(
-                [track_rect.left_top(), track_rect.right_top()],
+                [track_rect.left_bottom(), track_rect.right_bottom()],
                 (1.0, ui.visuals().window_stroke.color),
             );
 
