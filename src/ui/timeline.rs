@@ -368,7 +368,7 @@ impl Timeline {
             );
 
             ui.painter().text(
-                egui::pos2(x + 2.0, ruler_rect.top() + 2.0),
+                egui::pos2(x + 5.0, ruler_rect.top() + 5.0),
                 egui::Align2::LEFT_TOP,
                 time_str,
                 egui::FontId::monospace(10.0),
