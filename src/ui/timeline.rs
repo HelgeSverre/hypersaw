@@ -303,6 +303,10 @@ impl Timeline {
         let ruler_rect =
             egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), ruler_height));
 
+        // **Fill the ruler background to prevent grid line bleeding**
+        let ruler_bg_color = ui.visuals().extreme_bg_color.linear_multiply(1.2);
+        ui.painter().rect_filled(ruler_rect, 0.0, ruler_bg_color);
+
         let response = ui.allocate_rect(ruler_rect, egui::Sense::click_and_drag());
 
         const EDGE_SCROLL_MARGIN: f32 = 50.0; // Pixels from edge where scrolling starts
