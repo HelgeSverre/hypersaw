@@ -19,8 +19,8 @@ impl Default for Timeline {
         Self {
             pixels_per_second: 100.0,
             scroll_offset: 0.0,
-            grid_size: 1.0,
-            snap_enabled: true,
+            grid_size: 1.0,     // todo: remove
+            snap_enabled: true, // TODO: add toggle in UI
             track_height: 80.0,
             drag_start: None,
             command_collector: CommandCollector::new(),
@@ -48,15 +48,8 @@ impl Timeline {
     }
 
     fn draw_background(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        ui.painter().rect_filled(
-            rect,
-            0.0,
-            if self.snap_enabled {
-                ui.visuals().extreme_bg_color
-            } else {
-                ui.visuals().code_bg_color
-            },
-        );
+        ui.painter()
+            .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
     }
 
     fn draw_grid(&self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
@@ -343,7 +336,6 @@ impl Timeline {
             }
 
             // Draw track background
-
             if state.selected_track == Some(track.id.clone()) {
                 // Highlight selected track
                 ui.painter()
@@ -413,7 +405,8 @@ impl Timeline {
 
                 // Snap to grid if enabled
                 let snapped_time = if self.snap_enabled {
-                    (new_start_time / self.grid_size).round() * self.grid_size
+                    TimeUtils::snap_time(new_start_time as f64, state.project.bpm, state.snap_mode)
+                        as f32
                 } else {
                     new_start_time
                 };
@@ -552,6 +545,8 @@ impl Timeline {
             let new_start = (start_time + delta).max(0.0);
             let new_length = (length + (start_time - new_start)).max(0.1);
 
+            // TODO: snapping support when holding key-combo
+
             // Move the clip
             self.command_collector.add_command(DawCommand::MoveClip {
                 clip_id: match clip {
@@ -581,6 +576,8 @@ impl Timeline {
         if right_response.dragged() {
             let delta = right_response.drag_delta().x / self.pixels_per_second;
             let new_length = (length + delta).max(0.1);
+
+            // TODO: snapping support when holding key-combo
 
             self.command_collector.add_command(DawCommand::ResizeClip {
                 clip_id: match clip {
