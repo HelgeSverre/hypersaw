@@ -55,34 +55,67 @@ impl Timeline {
 
     fn draw_grid(&self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
         let bpm = state.project.bpm;
-        let snap_division = state.snap_mode.get_division(bpm);
+        let division = state.snap_mode.get_division(bpm); // Subdivision based on snap mode
+        let beat_seconds = 60.0 / bpm; // One beat duration
+        let bar_seconds = beat_seconds * 4.0; // One bar duration
 
-        // Draw major grid lines (bars)
-        let bar_duration = TimeUtils::beats_to_seconds(4.0, bpm);
-        let bar_pixels = bar_duration * self.pixels_per_second as f64;
-
-        // Draw minor grid lines based on snap mode
-        let snap_pixels = snap_division * self.pixels_per_second as f64;
+        let pixels_per_beat = self.pixels_per_second * beat_seconds as f32;
+        let pixels_per_bar = self.pixels_per_second * bar_seconds as f32;
+        let pixels_per_division = self.pixels_per_second * division as f32;
 
         let start_time = self.scroll_offset / self.pixels_per_second;
         let end_time = (self.scroll_offset + rect.width()) / self.pixels_per_second;
 
+        let start_beat = ((start_time as f64) / beat_seconds) as i32;
+        let end_beat = ((end_time as f64) / beat_seconds).ceil() as i32;
+
         let grid_color = ui.visuals().widgets.noninteractive.bg_fill;
 
-        for time in (start_time as i32)..=(end_time as i32) {
-            let x = rect.left() + (time as f32 * self.pixels_per_second) - self.scroll_offset;
+        for beat in start_beat..=end_beat {
+            let x = rect.left() + (beat as f32 * pixels_per_beat) - self.scroll_offset;
+            let is_bar = beat % 4 == 0;
 
-            // Draw major grid lines
-            if time % 4 == 0 {
-                ui.painter().line_segment(
-                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                    (1.0, grid_color.linear_multiply(5.0)),
+            // Alternate background shading every bar
+            if is_bar {
+                let bar_rect = egui::Rect::from_min_size(
+                    egui::pos2(x, rect.top()),
+                    egui::vec2(pixels_per_bar, rect.height()),
                 );
+
+                let bg_color = if (beat / 4) % 2 == 0 {
+                    ui.visuals().extreme_bg_color.linear_multiply(1.1)
+                } else {
+                    ui.visuals().extreme_bg_color.linear_multiply(0.9)
+                };
+
+                ui.painter().rect_filled(bar_rect, 0.0, bg_color);
+            }
+
+            // Draw major grid lines (bars and beats)
+            let line_color = if is_bar {
+                ui.visuals().window_stroke.color.linear_multiply(2.0)
             } else {
-                // Draw minor grid lines
+                ui.visuals().window_stroke.color
+            };
+
+            ui.painter().line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                (1.0, line_color),
+            );
+
+            // **Subdivisions**
+            for i in 1..4 {
+                let sub_x = x + (i as f32 * pixels_per_division);
+                if sub_x > rect.right() {
+                    break;
+                }
+                let sub_line_color = ui.visuals().window_stroke.color.linear_multiply(0.5);
                 ui.painter().line_segment(
-                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                    (1.0, grid_color),
+                    [
+                        egui::pos2(sub_x, rect.top()),
+                        egui::pos2(sub_x, rect.bottom()),
+                    ],
+                    (0.5, sub_line_color),
                 );
             }
         }
@@ -109,7 +142,7 @@ impl Timeline {
         if ui.input(|i| i.modifiers.shift) {
             ui.input(|i| {
                 let scroll_delta = i.raw_scroll_delta.x;
-                self.scroll_offset = (self.scroll_offset + scroll_delta);
+                self.scroll_offset = self.scroll_offset + scroll_delta;
             });
         }
     }
@@ -273,7 +306,7 @@ impl Timeline {
                 // todo: cleanup this so we dont get accelleration and jumping when seeking
                 if !state.playing {
                     if pos.x < rect.left() + EDGE_SCROLL_MARGIN {
-                        self.scroll_offset = (self.scroll_offset - EDGE_SCROLL_SPEED);
+                        self.scroll_offset = self.scroll_offset - EDGE_SCROLL_SPEED;
                     } else if pos.x > rect.right() - EDGE_SCROLL_MARGIN {
                         self.scroll_offset += EDGE_SCROLL_SPEED;
                     }

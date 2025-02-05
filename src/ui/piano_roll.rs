@@ -72,8 +72,7 @@ impl PianoRoll {
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
             self.center_on_middle_c(rect.height());
-            self.draw_background(ui, rect);
-            self.draw_grid(ui, rect);
+            self.draw_grid(ui, rect, state);
             self.draw_notes(ui, rect, clip_id, track_id, state);
             self.draw_piano_keys(ui, rect);
 
@@ -134,11 +133,6 @@ impl PianoRoll {
                 }
             }
         });
-    }
-
-    fn draw_background(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        ui.painter()
-            .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
     }
 
     fn handle_note_drag(
@@ -292,36 +286,77 @@ impl PianoRoll {
         }
     }
 
-    fn draw_grid(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        // Get the grid area (everything to the right of the piano keys)
+    fn draw_grid(&self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
         let grid_rect = egui::Rect::from_min_max(
             egui::pos2(rect.left() + self.key_width, rect.top()),
             rect.max,
         );
 
-        // Draw vertical grid lines (beats)
-        let start_beat = (self.scroll_x / self.zoom).floor() as i32;
-        let end_beat = ((self.scroll_x + grid_rect.width()) / self.zoom).ceil() as i32;
+        let bpm = state.project.bpm;
+        let division = state.snap_mode.get_division(bpm); // Get division based on snap mode
+
+        let pixels_per_beat = self.zoom;
+        let pixels_per_bar = pixels_per_beat * 4.0;
+        let pixels_per_division = pixels_per_beat * (division / (60.0 / bpm)) as f32;
+
+        let start_beat = (self.scroll_x / pixels_per_beat).floor() as i32;
+        let end_beat = ((self.scroll_x + grid_rect.width()) / pixels_per_beat).ceil() as i32;
 
         for beat in start_beat..=end_beat {
-            let x = grid_rect.left() + beat as f32 * self.zoom - self.scroll_x;
+            let x = grid_rect.left() + beat as f32 * pixels_per_beat - self.scroll_x;
             let is_bar = beat % 4 == 0;
+
+            // Alternate background shading every bar
+            if is_bar {
+                let bar_rect = egui::Rect::from_min_size(
+                    egui::pos2(x, grid_rect.top()),
+                    egui::vec2(pixels_per_bar, grid_rect.height()),
+                );
+
+                let bg_color = if (beat / 4) % 2 == 0 {
+                    ui.visuals().extreme_bg_color.linear_multiply(1.1)
+                } else {
+                    ui.visuals().extreme_bg_color.linear_multiply(0.9)
+                };
+
+                ui.painter().rect_filled(bar_rect, 0.0, bg_color);
+            }
+
+            // Draw major grid lines (bars and beats)
+            let line_color = if is_bar {
+                ui.visuals().window_stroke.color.linear_multiply(2.0)
+            } else {
+                ui.visuals().window_stroke.color
+            };
 
             ui.painter().line_segment(
                 [
                     egui::pos2(x, grid_rect.top()),
                     egui::pos2(x, grid_rect.bottom()),
                 ],
-                (
-                    if is_bar { 1.0 } else { 0.5 },
-                    ui.visuals().window_stroke.color,
-                ),
+                (1.0, line_color),
             );
+
+            // **Subdivisions**
+            for i in 1..4 {
+                let sub_x = x + (i as f32 * pixels_per_division);
+                if sub_x > grid_rect.right() {
+                    break;
+                }
+                let sub_line_color = ui.visuals().window_stroke.color.linear_multiply(0.5);
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(sub_x, grid_rect.top()),
+                        egui::pos2(sub_x, grid_rect.bottom()),
+                    ],
+                    (0.5, sub_line_color),
+                );
+            }
         }
 
-        // Draw horizontal grid lines (notes)
+        // Draw horizontal note grid (per pitch)
         for note in 0..128 {
-            let y = grid_rect.bottom() - (note as f32 + 1.0) * self.key_height;
+            let y = grid_rect.bottom() - (note as f32 + 1.0) * self.key_height + self.scroll_y;
             let is_c = note % 12 == 0;
 
             ui.painter().line_segment(
@@ -405,6 +440,74 @@ impl PianoRoll {
                                 self.selected_notes.clear();
                             }
                             self.selected_notes.push(note.id.clone());
+                        }
+
+                        // Draw resize handles
+                        let handle_width = 4.0;
+                        let left_handle = egui::Rect::from_min_size(
+                            note_rect.left_top(),
+                            egui::vec2(handle_width, note_rect.height()),
+                        );
+                        let right_handle = egui::Rect::from_min_size(
+                            egui::pos2(note_rect.right() - handle_width, note_rect.top()),
+                            egui::vec2(handle_width, note_rect.height()),
+                        );
+
+                        let left_response = ui.allocate_rect(left_handle, egui::Sense::drag());
+                        let right_response = ui.allocate_rect(right_handle, egui::Sense::drag());
+
+                        // Handle dragging (resizing)
+                        if left_response.dragged() {
+                            let delta = (left_response.drag_delta().x / self.zoom) as f64;
+                            let new_start_time = if self.grid_snap {
+                                TimeUtils::snap_time(
+                                    (note.start_time - delta).max(0.0),
+                                    state.project.bpm,
+                                    state.snap_mode,
+                                )
+                            } else {
+                                (note.start_time - delta).max(0.0)
+                            };
+                            let new_duration = if self.grid_snap {
+                                TimeUtils::snap_time(
+                                    (note.duration + delta).max(0.1),
+                                    state.project.bpm,
+                                    state.snap_mode,
+                                )
+                            } else {
+                                (note.duration - delta).max(0.1)
+                            };
+
+                            self.command_collector.add_command(DawCommand::ResizeNote {
+                                clip_id: clip_id.to_string(),
+                                note_id: note.id.clone(),
+                                new_start_time,
+                                new_duration,
+                            });
+                        }
+
+                        if right_response.dragged() {
+                            let delta = (right_response.drag_delta().x / self.zoom) as f64;
+                            let new_duration = if self.grid_snap {
+                                TimeUtils::snap_time(
+                                    (note.duration + delta).max(0.1),
+                                    state.project.bpm,
+                                    state.snap_mode,
+                                )
+                            } else {
+                                (note.duration + delta).max(0.1)
+                            };
+
+                            self.command_collector.add_command(DawCommand::ResizeNote {
+                                clip_id: clip_id.to_string(),
+                                note_id: note.id.clone(),
+                                new_start_time: note.start_time,
+                                new_duration,
+                            });
+                        }
+
+                        if left_response.hovered() || right_response.hovered() {
+                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
                         }
 
                         // Handle note dragging with snapping

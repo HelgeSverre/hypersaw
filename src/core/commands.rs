@@ -30,6 +30,12 @@ pub enum DawCommand {
         note_ids: Vec<NoteID>,
     },
 
+    ResizeNote {
+        clip_id: String,
+        note_id: String,
+        new_start_time: f64,
+        new_duration: f64,
+    },
     AddNote {
         clip_id: String,
         start_time: f64,
@@ -272,6 +278,10 @@ impl Command for DawCommand {
 
                 Ok(())
             }
+            DawCommand::ResizeNote { .. } => {
+                // TODO: Implement
+                Ok(())
+            }
             DawCommand::MoveNotes { .. } => {
                 // TODO: Implement
                 Ok(())
@@ -295,6 +305,7 @@ impl Command for DawCommand {
 
     fn name(&self) -> &'static str {
         match self {
+            DawCommand::ResizeNote { .. } => "Resize Note",
             DawCommand::MoveNotes { .. } => "Move Notes",
             DawCommand::DeleteNotes { .. } => "Delete Notes",
             DawCommand::AddNote { .. } => "Add Note",
