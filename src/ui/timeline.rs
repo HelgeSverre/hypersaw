@@ -33,6 +33,7 @@ impl Timeline {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
 
         self.draw_background(ui, rect);
+        self.draw_grid(ui, rect, state);
         self.handle_zooming(ui);
         self.handle_scrolling(ui);
         self.handle_file_drops(ui, state);
@@ -56,6 +57,41 @@ impl Timeline {
                 ui.visuals().code_bg_color
             },
         );
+    }
+
+    fn draw_grid(&self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
+        let bpm = state.project.bpm;
+        let snap_division = state.snap_mode.get_division(bpm);
+
+        // Draw major grid lines (bars)
+        let bar_duration = TimeUtils::beats_to_seconds(4.0, bpm);
+        let bar_pixels = bar_duration * self.pixels_per_second as f64;
+
+        // Draw minor grid lines based on snap mode
+        let snap_pixels = snap_division * self.pixels_per_second as f64;
+
+        let start_time = self.scroll_offset / self.pixels_per_second;
+        let end_time = (self.scroll_offset + rect.width()) / self.pixels_per_second;
+
+        let grid_color = ui.visuals().widgets.noninteractive.bg_fill;
+
+        for time in (start_time as i32)..=(end_time as i32) {
+            let x = rect.left() + (time as f32 * self.pixels_per_second) - self.scroll_offset;
+
+            // Draw major grid lines
+            if time % 4 == 0 {
+                ui.painter().line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    (1.0, grid_color.linear_multiply(5.0)),
+                );
+            } else {
+                // Draw minor grid lines
+                ui.painter().line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    (1.0, grid_color),
+                );
+            }
+        }
     }
 
     fn handle_zooming(&mut self, ui: &mut egui::Ui) {
