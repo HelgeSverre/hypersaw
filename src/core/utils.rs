@@ -2,8 +2,7 @@ use crate::core::SnapMode;
 
 pub struct TimeUtils {}
 
-impl TimeUtils {
-}
+impl TimeUtils {}
 
 impl TimeUtils {
     pub fn snap_time(time: f64, bpm: f64, snap_mode: SnapMode) -> f64 {

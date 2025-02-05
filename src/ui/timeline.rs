@@ -72,7 +72,7 @@ impl Timeline {
         for bar in start_bar..=end_bar {
             let x = rect.left() + (bar as f32 * pixels_per_bar) - self.scroll_offset;
 
-            // **Alternate background shading every 4 bars**
+            // Alternate background shading every 4 bars
             if bar % 8 < 4 {
                 let bar_rect = egui::Rect::from_min_size(
                     egui::pos2(x, rect.top()),
@@ -83,14 +83,14 @@ impl Timeline {
                 ui.painter().rect_filled(bar_rect, 0.0, bg_color);
             }
 
-            // **Draw bar lines (stronger)**
+            // Draw bar lines (stronger)
             let bar_line_color = ui.visuals().window_stroke.color.linear_multiply(2.0);
             ui.painter().line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                 (1.5, bar_line_color),
             );
 
-            // **Draw beat and subdivision lines**
+            // Draw beat and subdivision lines
             for beat in 0..4 {
                 let beat_x = x + (beat as f32 * pixels_per_beat);
                 let beat_line_color = ui.visuals().window_stroke.color.linear_multiply(0.8);
@@ -102,7 +102,7 @@ impl Timeline {
                     (1.0, beat_line_color),
                 );
 
-                // **Draw correct number of subdivisions per beat**
+                // Draw correct number of subdivisions per beat
                 for sub in 1..subdivisions_per_beat {
                     let sub_x = beat_x + (sub as f32 * pixels_per_division);
                     if sub_x > rect.right() {
@@ -303,7 +303,7 @@ impl Timeline {
         let ruler_rect =
             egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), ruler_height));
 
-        // **Fill the ruler background to prevent grid line bleeding**
+        // Fill the ruler background to prevent grid line bleeding
         let ruler_bg_color = ui.visuals().extreme_bg_color.linear_multiply(1.2);
         ui.painter().rect_filled(ruler_rect, 0.0, ruler_bg_color);
 

@@ -23,7 +23,7 @@ fn main() -> eframe::Result<()> {
                 eprintln!("Failed to get default output device: {}", e);
                 std::process::exit(1);
             }
-            
+
             pa
         }
         Err(e) => {
