@@ -38,7 +38,7 @@ impl Timeline {
         self.handle_file_drops(ui, state);
         self.handle_delete_clip(ui, state);
 
-        self.draw_ruler(ui, rect);
+        self.draw_ruler(ui, rect, state);
         self.draw_tracks(ui, rect.shrink2(egui::vec2(0.0, 20.0)), state);
         self.handle_loop_region(ui, rect, state);
         self.draw_playhead(ui, rect, state);
@@ -68,6 +68,7 @@ impl Timeline {
                         .max(10.0)
                         .min(500.0);
                     let new_mouse_x = time_at_mouse * self.pixels_per_second;
+
                     self.scroll_offset = new_mouse_x - mouse_pos.x;
                 }
             });
@@ -209,7 +210,7 @@ impl Timeline {
         }
     }
 
-    fn draw_ruler(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+    fn draw_ruler(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
         let ruler_height = 20.0;
         let ruler_rect =
             egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), ruler_height));
@@ -221,11 +222,13 @@ impl Timeline {
 
         if response.dragged() {
             if let Some(pos) = response.hover_pos() {
-                // Handle edge scrolling
-                if pos.x < rect.left() + EDGE_SCROLL_MARGIN {
-                    self.scroll_offset = (self.scroll_offset - EDGE_SCROLL_SPEED);
-                } else if pos.x > rect.right() - EDGE_SCROLL_MARGIN {
-                    self.scroll_offset += EDGE_SCROLL_SPEED;
+                // todo: cleanup this so we dont get accelleration and jumping when seeking
+                if !state.playing {
+                    if pos.x < rect.left() + EDGE_SCROLL_MARGIN {
+                        self.scroll_offset = (self.scroll_offset - EDGE_SCROLL_SPEED);
+                    } else if pos.x > rect.right() - EDGE_SCROLL_MARGIN {
+                        self.scroll_offset += EDGE_SCROLL_SPEED;
+                    }
                 }
 
                 // Convert viewport position to time
@@ -559,14 +562,16 @@ impl Timeline {
     fn draw_playhead(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
         let playhead_x = state.current_time * self.pixels_per_second as f64;
         let visible_width = rect.width() as f64;
-        let visible_width_threshold = visible_width * 0.2;
+        let visible_width_threshold = visible_width * 0.8;
 
         let playhead_position = playhead_x - self.scroll_offset as f64;
 
-        if playhead_position > visible_width * 0.8 {
-            self.scroll_offset = (playhead_x - visible_width_threshold) as f32;
-        } else if playhead_position < visible_width_threshold {
-            self.scroll_offset = (playhead_x - visible_width_threshold).max(0.0) as f32;
+        if state.playing {
+            if playhead_position > visible_width * 0.8 {
+                self.scroll_offset = (playhead_x - visible_width_threshold) as f32;
+            } else if playhead_position < visible_width_threshold {
+                self.scroll_offset = (playhead_x - visible_width_threshold).max(0.0) as f32;
+            }
         }
 
         let playhead_x = rect.left() as f64 + playhead_x - self.scroll_offset as f64;
