@@ -55,68 +55,70 @@ impl Timeline {
 
     fn draw_grid(&self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
         let bpm = state.project.bpm;
-        let division = state.snap_mode.get_division(bpm); // Subdivision based on snap mode
-        let beat_seconds = 60.0 / bpm; // One beat duration
-        let bar_seconds = beat_seconds * 4.0; // One bar duration
+        let beat_duration = 60.0 / bpm;
+        let bar_duration = beat_duration * 4.0;
 
-        let pixels_per_beat = self.pixels_per_second * beat_seconds as f32;
-        let pixels_per_bar = self.pixels_per_second * bar_seconds as f32;
-        let pixels_per_division = self.pixels_per_second * division as f32;
+        let pixels_per_beat = self.pixels_per_second * beat_duration as f32;
+        let pixels_per_bar = pixels_per_beat * 4.0;
 
         let start_time = self.scroll_offset / self.pixels_per_second;
         let end_time = (self.scroll_offset + rect.width()) / self.pixels_per_second;
 
-        let start_beat = ((start_time as f64) / beat_seconds) as i32;
-        let end_beat = ((end_time as f64) / beat_seconds).ceil() as i32;
+        let start_bar = ((start_time as f64) / bar_duration).floor() as i32;
+        let end_bar = ((end_time as f64) / bar_duration).ceil() as i32;
 
-        let grid_color = ui.visuals().widgets.noninteractive.bg_fill;
+        let division = state.snap_mode.get_division(bpm);
+        let subdivisions_per_beat = (beat_duration / division).round() as i32; // How many subdivision lines per beat
+        let pixels_per_division = pixels_per_beat / subdivisions_per_beat as f32;
 
-        for beat in start_beat..=end_beat {
-            let x = rect.left() + (beat as f32 * pixels_per_beat) - self.scroll_offset;
-            let is_bar = beat % 4 == 0;
+        for bar in start_bar..=end_bar {
+            let x = rect.left() + (bar as f32 * pixels_per_bar) - self.scroll_offset;
 
-            // Alternate background shading every bar
-            if is_bar {
+            // **Alternate background shading every 4 bars**
+            if bar % 8 < 4 {
                 let bar_rect = egui::Rect::from_min_size(
                     egui::pos2(x, rect.top()),
-                    egui::vec2(pixels_per_bar, rect.height()),
+                    egui::vec2(pixels_per_bar * 4.0, rect.height()),
                 );
 
-                let bg_color = if (beat / 4) % 2 == 0 {
-                    ui.visuals().extreme_bg_color.linear_multiply(1.1)
-                } else {
-                    ui.visuals().extreme_bg_color.linear_multiply(0.9)
-                };
-
+                let bg_color = ui.visuals().extreme_bg_color.linear_multiply(1.05);
                 ui.painter().rect_filled(bar_rect, 0.0, bg_color);
             }
 
-            // Draw major grid lines (bars and beats)
-            let line_color = if is_bar {
-                ui.visuals().window_stroke.color.linear_multiply(2.0)
-            } else {
-                ui.visuals().window_stroke.color
-            };
-
+            // **Draw bar lines (stronger)**
+            let bar_line_color = ui.visuals().window_stroke.color.linear_multiply(2.0);
             ui.painter().line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                (1.0, line_color),
+                (1.5, bar_line_color),
             );
 
-            // **Subdivisions**
-            for i in 1..4 {
-                let sub_x = x + (i as f32 * pixels_per_division);
-                if sub_x > rect.right() {
-                    break;
-                }
-                let sub_line_color = ui.visuals().window_stroke.color.linear_multiply(0.5);
+            // **Draw beat and subdivision lines**
+            for beat in 0..4 {
+                let beat_x = x + (beat as f32 * pixels_per_beat);
+                let beat_line_color = ui.visuals().window_stroke.color.linear_multiply(0.8);
                 ui.painter().line_segment(
                     [
-                        egui::pos2(sub_x, rect.top()),
-                        egui::pos2(sub_x, rect.bottom()),
+                        egui::pos2(beat_x, rect.top()),
+                        egui::pos2(beat_x, rect.bottom()),
                     ],
-                    (0.5, sub_line_color),
+                    (1.0, beat_line_color),
                 );
+
+                // **Draw correct number of subdivisions per beat**
+                for sub in 1..subdivisions_per_beat {
+                    let sub_x = beat_x + (sub as f32 * pixels_per_division);
+                    if sub_x > rect.right() {
+                        break;
+                    }
+                    let sub_line_color = ui.visuals().window_stroke.color.linear_multiply(0.5);
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(sub_x, rect.top()),
+                            egui::pos2(sub_x, rect.bottom()),
+                        ],
+                        (0.5, sub_line_color),
+                    );
+                }
             }
         }
     }

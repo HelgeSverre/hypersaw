@@ -293,70 +293,79 @@ impl PianoRoll {
         );
 
         let bpm = state.project.bpm;
-        let division = state.snap_mode.get_division(bpm); // Get division based on snap mode
+        let beat_duration = 60.0 / bpm;
+        let bar_duration = beat_duration * 4.0;
 
         let pixels_per_beat = self.zoom;
         let pixels_per_bar = pixels_per_beat * 4.0;
-        let pixels_per_division = pixels_per_beat * (division / (60.0 / bpm)) as f32;
 
-        let start_beat = (self.scroll_x / pixels_per_beat).floor() as i32;
-        let end_beat = ((self.scroll_x + grid_rect.width()) / pixels_per_beat).ceil() as i32;
+        let start_bar = (self.scroll_x / pixels_per_bar).floor() as i32;
+        let end_bar = ((self.scroll_x + grid_rect.width()) / pixels_per_bar).ceil() as i32;
 
-        for beat in start_beat..=end_beat {
-            let x = grid_rect.left() + beat as f32 * pixels_per_beat - self.scroll_x;
-            let is_bar = beat % 4 == 0;
+        let division = state.snap_mode.get_division(bpm);
+        let subdivisions_per_beat = (beat_duration / division).round() as i32;
+        let pixels_per_division = pixels_per_beat / subdivisions_per_beat as f32;
 
-            // Alternate background shading every bar
-            if is_bar {
+        for bar in start_bar..=end_bar {
+            let x = grid_rect.left() + bar as f32 * pixels_per_bar - self.scroll_x;
+
+            // **Ensure shading is properly aligned**
+            if bar % 8 < 4 {
                 let bar_rect = egui::Rect::from_min_size(
                     egui::pos2(x, grid_rect.top()),
-                    egui::vec2(pixels_per_bar, grid_rect.height()),
+                    egui::vec2(pixels_per_bar * 4.0, grid_rect.height()),
                 );
 
-                let bg_color = if (beat / 4) % 2 == 0 {
-                    ui.visuals().extreme_bg_color.linear_multiply(1.1)
-                } else {
-                    ui.visuals().extreme_bg_color.linear_multiply(0.9)
-                };
-
+                let bg_color = ui.visuals().extreme_bg_color.linear_multiply(1.08);
                 ui.painter().rect_filled(bar_rect, 0.0, bg_color);
             }
 
-            // Draw major grid lines (bars and beats)
-            let line_color = if is_bar {
-                ui.visuals().window_stroke.color.linear_multiply(2.0)
-            } else {
-                ui.visuals().window_stroke.color
-            };
-
+            // **Draw bar lines**
+            let bar_line_color = ui.visuals().window_stroke.color.linear_multiply(2.0);
             ui.painter().line_segment(
                 [
                     egui::pos2(x, grid_rect.top()),
                     egui::pos2(x, grid_rect.bottom()),
                 ],
-                (1.0, line_color),
+                (1.5, bar_line_color),
             );
 
-            // **Subdivisions**
-            for i in 1..4 {
-                let sub_x = x + (i as f32 * pixels_per_division);
-                if sub_x > grid_rect.right() {
-                    break;
-                }
-                let sub_line_color = ui.visuals().window_stroke.color.linear_multiply(0.5);
+            // **Draw beat and subdivision lines**
+            for beat in 0..4 {
+                let beat_x = x + (beat as f32 * pixels_per_beat);
+                let beat_line_color = ui.visuals().window_stroke.color.linear_multiply(0.8);
                 ui.painter().line_segment(
                     [
-                        egui::pos2(sub_x, grid_rect.top()),
-                        egui::pos2(sub_x, grid_rect.bottom()),
+                        egui::pos2(beat_x, grid_rect.top()),
+                        egui::pos2(beat_x, grid_rect.bottom()),
                     ],
-                    (0.5, sub_line_color),
+                    (1.0, beat_line_color),
                 );
+
+                for sub in 1..subdivisions_per_beat {
+                    let sub_x = beat_x + (sub as f32 * pixels_per_division);
+                    if sub_x > grid_rect.right() {
+                        break;
+                    }
+                    let sub_line_color = ui.visuals().window_stroke.color.linear_multiply(0.5);
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(sub_x, grid_rect.top()),
+                            egui::pos2(sub_x, grid_rect.bottom()),
+                        ],
+                        (0.5, sub_line_color),
+                    );
+                }
             }
         }
 
-        // Draw horizontal note grid (per pitch)
-        for note in 0..128 {
-            let y = grid_rect.bottom() - (note as f32 + 1.0) * self.key_height + self.scroll_y;
+        // **Draw horizontal note grid (per pitch)**
+        let note_height = self.key_height;
+        let start_note = (self.scroll_y / note_height).floor() as i32;
+        let end_note = ((self.scroll_y + grid_rect.height()) / note_height).ceil() as i32;
+
+        for note in start_note..=end_note {
+            let y = grid_rect.bottom() - (note as f32 + 1.0) * note_height + self.scroll_y;
             let is_c = note % 12 == 0;
 
             ui.painter().line_segment(
