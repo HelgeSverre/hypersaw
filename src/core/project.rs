@@ -13,9 +13,9 @@ pub enum SnapMode {
     Bar,
     Beat,
     Halfbeat, // Half beat (8th note)
-    Quarter, // Quarter beat (16th note)
-    Eighth,  // Eighth beat (32nd note)
-    Triplet, // Triplet (1/3 of beat)
+    Quarter,  // Quarter beat (16th note)
+    Eighth,   // Eighth beat (32nd note)
+    Triplet,  // Triplet (1/3 of beat)
 }
 
 impl SnapMode {
