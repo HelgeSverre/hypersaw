@@ -2,11 +2,13 @@ use crate::core::{
     Clip, CommandManager, DawCommand, DawState, EditorView, MessageType, Project, SnapMode,
     StatusMessage, Track, TrackType,
 };
+use crate::ui::channel_strip::ChannelStripWindow;
 use crate::ui::piano_roll::PianoRoll;
 use crate::ui::plugin_browser::PluginBrowser;
 use crate::ui::Timeline;
 use eframe::egui;
 use egui::Key;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
@@ -22,6 +24,8 @@ pub struct SupersawApp {
     timeline: Timeline,
     piano_roll: PianoRoll,
     plugin_browser: PluginBrowser,
+
+    channel_strips: HashMap<String, ChannelStripWindow>,
 }
 
 enum FileDialog {
@@ -35,14 +39,19 @@ impl SupersawApp {
     fn handle_key_action(&mut self, action: KeyAction) {
         match action {
             KeyAction::TogglePlay => {
-                self.command_manager.execute(
+                if let Err(e) = self.command_manager.execute(
                     if self.state.playing {
                         DawCommand::PausePlayback
                     } else {
                         DawCommand::StartPlayback
                     },
                     &mut self.state,
-                );
+                ) {
+                    eprintln!("Failed to toggle playback: {}", e);
+                    self.state
+                        .status
+                        .error(format!("Failed to toggle playback: {}", e));
+                }
             }
             KeyAction::LoadProject => {
                 self.file_dialog = Some(FileDialog::LoadProject);
@@ -107,6 +116,7 @@ impl SupersawApp {
             piano_roll: PianoRoll::default(),
             command_manager: CommandManager::default(),
             plugin_browser: PluginBrowser::default(),
+            channel_strips: HashMap::new(),
         };
 
         app.state.status.set_message(
@@ -311,6 +321,16 @@ impl SupersawApp {
 
                     ui.checkbox(&mut track.is_muted, "M");
                     ui.checkbox(&mut track.is_soloed, "S");
+
+                    if ui.button("📊").clicked() {
+                        let track_id = track.id.clone();
+
+                        self.channel_strips.insert(
+                            track_id.clone(),
+                            //todo: pass track clone?
+                            ChannelStripWindow::new(track_id, track.name.clone()),
+                        );
+                    }
                 });
             }
 
@@ -325,6 +345,28 @@ impl SupersawApp {
                 ui.label(port);
             }
         });
+    }
+
+    fn update_channel_strips(&mut self, ctx: &egui::Context) {
+        // let mut strips_to_remove = Vec::new();
+
+        for (track_id, strip) in &mut self.channel_strips {
+            let commands = strip.show(ctx, &mut self.state);
+
+            // let commands = strip.show(ctx, &mut self.state);
+            //
+            // for command in commands {
+            //     if let Err(e) = self.command_manager.execute(command, &mut self.state) {
+            //         self.state
+            //             .status
+            //             .error(format!("Channel strip command failed: {}", e));
+            //     }
+            // }
+        }
+
+        // for track_id in strips_to_remove {
+        //     self.channel_strips.remove(&track_id);
+        // }
     }
 
     fn show_add_track_menu(&mut self) {
@@ -534,5 +576,7 @@ impl eframe::App for SupersawApp {
                 }
             }
         }
+
+        self.update_channel_strips(ctx);
     }
 }

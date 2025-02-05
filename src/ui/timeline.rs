@@ -117,10 +117,19 @@ impl Timeline {
     fn handle_file_drops(&mut self, ui: &mut egui::Ui, state: &mut DawState) {
         let mut files = ui.input(|i| i.raw.dropped_files.clone());
         if let Some(file) = files.pop() {
+            println!("Dropping files");
             if let Some(path) = file.path {
+                println!("Dropping file: {:?}", path);
+
                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    // TODO: Wrong, use util and cleanup
                     let time = (pos.x + self.scroll_offset) / self.pixels_per_second;
+
+                    println!("Dropping file at time: {}", time);
+
                     if let Some(track_id) = &state.selected_track {
+                        println!("Dropping file on track: {}", track_id);
+
                         let extension = path
                             .extension()
                             .and_then(|e| e.to_str())
@@ -128,18 +137,27 @@ impl Timeline {
                             .to_lowercase();
                         let is_midi = extension == "mid" || extension == "midi";
                         let is_audio = extension == "wav" || extension == "mp3";
+
+                        println!(
+                            "name : {}, extension: {}, is_midi: {}, is_audio: {}",
+                            path.display(),
+                            extension,
+                            is_midi,
+                            is_audio
+                        );
+
                         if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id)
                         {
                             let can_add = match &track.track_type {
                                 TrackType::Midi { .. } => is_midi,
-                                TrackType::Audio => is_audio,
+                                // TODO: Handle audio tracks
                                 _ => false,
                             };
                             if can_add {
                                 self.command_collector.add_command(DawCommand::AddClip {
                                     track_id: track_id.clone(),
                                     start_time: time as f64,
-                                    length: 4.0,
+                                    length: 10.0,
                                     file_path: path,
                                 });
                             }
@@ -406,11 +424,8 @@ impl Timeline {
 
                 // Snap to grid if enabled
                 let snapped_time = if self.snap_enabled {
-                    TimeUtils::snap_time(
-                        new_start_time as f64,
-                        state.project.bpm,
-                        state.snap_mode,
-                    ) as f32
+                    TimeUtils::snap_time(new_start_time as f64, state.project.bpm, state.snap_mode)
+                        as f32
                 } else {
                     new_start_time
                 };

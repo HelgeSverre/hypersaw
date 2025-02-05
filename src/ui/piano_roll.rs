@@ -1,15 +1,20 @@
 use crate::core::*;
 use eframe::egui;
-use egui::FontId;
+use egui::{FontId, StrokeKind};
+
+const MIDDLE_C: i32 = 60; // MIDI note number for middle C
+const DEFAULT_OCTAVES: i32 = 8; // Number of octaves to show
+const NOTES_PER_OCTAVE: i32 = 12;
 
 pub struct PianoRoll {
     key_width: f32,
     key_height: f32,
-    grid_snap: f32, // In beats
-    zoom: f32,      // Pixels per beat
+    grid_snap: f32,
+    zoom: f32,
     scroll_x: f32,
     scroll_y: f32,
-    selected_notes: Vec<usize>,
+    viewport_height: f32,
+    selected_notes: Vec<String>, // Change to store UUIDs as strings
     dragging: Option<DragOperation>,
     command_collector: CommandCollector,
 }
@@ -25,8 +30,8 @@ enum ResizeEdge {
     Right,
 }
 
-impl Default for PianoRoll {
-    fn default() -> Self {
+impl PianoRoll {
+    pub fn default() -> Self {
         Self {
             key_width: 80.0,
             key_height: 20.0,
@@ -34,20 +39,46 @@ impl Default for PianoRoll {
             zoom: 100.0,
             scroll_x: 0.0,
             scroll_y: 0.0,
+            viewport_height: 0.0,
             selected_notes: Vec::new(),
             dragging: None,
             command_collector: CommandCollector::new(),
         }
     }
-}
 
-impl PianoRoll {
+    fn get_total_height(&self) -> f32 {
+        (DEFAULT_OCTAVES * NOTES_PER_OCTAVE) as f32 * self.key_height
+    }
+
+    //todo move into utils/midi module
+    fn get_note_name(note_number: i32) -> String {
+        let note_names = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+        ];
+        let octave = (note_number / 12) - 1;
+        let note = note_number % 12;
+        format!("{}{}", note_names[note as usize], octave)
+    }
+
+    fn center_on_middle_c(&mut self, viewport_height: f32) {
+        // Only center if we haven't initialized the scroll position yet
+        if self.viewport_height != viewport_height {
+            self.viewport_height = viewport_height;
+            let total_height = self.get_total_height();
+            let middle_c_position = (MIDDLE_C as f32) * self.key_height;
+            self.scroll_y = middle_c_position - (viewport_height / 2.0);
+
+            // Clamp scroll position to keep piano roll in view
+            self.scroll_y = self.scroll_y.clamp(0.0, total_height - viewport_height);
+        }
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) -> Vec<DawCommand> {
         if let EditorView::PianoRoll {
             clip_id, track_id, ..
         } = &state.current_view
         {
-            // Try to load the MIDI data if not already loaded
+            // Load MIDI data if needed
             if let Some(track) = state.project.tracks.iter_mut().find(|t| &t.id == track_id) {
                 if let Some(clip @ Clip::Midi { loaded: false, .. }) = track
                     .clips
@@ -65,27 +96,51 @@ impl PianoRoll {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
+            self.center_on_middle_c(rect.height());
+
+            // Draw the piano roll components
             self.draw_background(ui, rect);
             self.draw_piano_keys(ui, rect);
             self.draw_grid(ui, rect);
             self.draw_notes(ui, rect, clip_id, track_id, state);
 
-            if response.dragged() {
-                self.scroll_x -= response.drag_delta().x;
-                self.scroll_y += response.drag_delta().y;
-            }
-
+            // Handle input
+            self.handle_scrolling(ui, rect);
             self.handle_zoom(ui);
+
+            // Handle dragging for panning
+            if response.dragged_by(egui::PointerButton::Middle) {
+                self.scroll_x -= response.drag_delta().x;
+                let new_scroll_y = self.scroll_y - response.drag_delta().y * -1.0;
+                self.scroll_y =
+                    new_scroll_y.clamp(0.0, self.get_total_height() - self.viewport_height);
+            }
         }
 
         self.command_collector.take_commands()
+    }
+
+    fn handle_scrolling(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+        // Handle vertical scrolling
+        ui.input(|i| {
+            let scroll_delta = i.raw_scroll_delta.y;
+            if i.modifiers.shift {
+                // Horizontal scroll with shift
+                self.scroll_x = (self.scroll_x + scroll_delta).max(0.0);
+            } else {
+                // Vertical scroll without shift
+                let new_scroll_y = self.scroll_y - scroll_delta;
+                self.scroll_y =
+                    new_scroll_y.clamp(0.0, self.get_total_height() - self.viewport_height);
+            }
+        });
     }
 
     fn handle_zoom(&mut self, ui: &egui::Ui) {
         ui.input(|i| {
             if i.modifiers.ctrl || i.modifiers.command {
                 let zoom_delta = i.raw_scroll_delta.y / 100.0;
-                self.zoom = (self.zoom * (1.0 + zoom_delta)).max(20.0).min(500.0);
+                self.zoom = (self.zoom * (1.0 + zoom_delta)).clamp(20.0, 500.0);
             }
         });
     }
@@ -101,63 +156,107 @@ impl PianoRoll {
             egui::vec2(self.key_width, rect.height()),
         ));
 
-        // Draw white keys first
-        for octave in 0..8 {
-            for white_key in [0, 2, 4, 5, 7, 9, 11] {
-                let note = octave * 12 + white_key;
-                let y = rect.bottom() - (note as f32 + 1.0) * self.key_height;
-                let key_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left(), y),
-                    egui::pos2(rect.left() + self.key_width, y + self.key_height),
-                );
-                ui.painter()
-                    .rect_filled(key_rect, 0.0, ui.visuals().window_fill);
+        let start_note = (self.scroll_y / self.key_height).floor() as i32;
+        let end_note = ((self.scroll_y + rect.height()) / self.key_height).ceil() as i32;
+        let visible_notes = start_note..=end_note;
 
-                // Draw key label
-                let note_name = format!("{:?}", note);
-                let text_pos = key_rect.center() - egui::vec2(0.0, 8.0);
-                ui.painter().text(
-                    text_pos,
-                    egui::Align2::CENTER_CENTER,
-                    note_name,
-                    FontId::monospace(8.0),
-                    ui.visuals().text_color(),
-                );
+        // Draw white keys first
+        for note_number in visible_notes.clone() {
+            let note = note_number % 12;
+            if [0, 2, 4, 5, 7, 9, 11].contains(&note) {
+                self.draw_key(ui, note_number, false, keys_rect);
             }
         }
 
         // Draw black keys on top
-        for octave in 0..8 {
-            for black_key in [1, 3, 6, 8, 10] {
-                let note = octave * 12 + black_key;
-                let y = rect.bottom() - (note as f32 + 1.0) * self.key_height;
-                let key_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left(), y),
-                    egui::pos2(rect.left() + self.key_width * 0.6, y + self.key_height),
-                );
-                ui.painter()
-                    .rect_filled(key_rect, 0.0, ui.visuals().extreme_bg_color);
-
-                // Draw key label
-                let note_name = format!("{:?}", note);
-                let text_pos = key_rect.center() - egui::vec2(0.0, 8.0);
-                ui.painter().text(
-                    text_pos,
-                    egui::Align2::CENTER_CENTER,
-                    note_name,
-                    FontId::monospace(8.0),
-                    ui.visuals().strong_text_color(),
-                );
+        for note_number in visible_notes {
+            let note = note_number % 12;
+            if [1, 3, 6, 8, 10].contains(&note) {
+                self.draw_key(ui, note_number, true, keys_rect);
             }
         }
     }
 
+    fn draw_key(&self, ui: &mut egui::Ui, note_number: i32, is_black: bool, rect: egui::Rect) {
+        let y = rect.bottom() - (note_number as f32 + 1.0) * self.key_height + self.scroll_y;
+
+        // Calculate key dimensions
+        let key_width = if is_black {
+            self.key_width * 0.6
+        } else {
+            self.key_width
+        };
+
+        // Offset black keys to overlap whites
+        let x_offset = if is_black {
+            -self.key_width * 0.15
+        } else {
+            0.0
+        };
+
+        let key_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + x_offset, y),
+            egui::pos2(rect.left() + x_offset + key_width, y + self.key_height),
+        );
+
+        // Draw key background
+        let color = if is_black {
+            ui.visuals().extreme_bg_color
+        } else {
+            ui.visuals().window_fill
+        };
+        ui.painter().rect_filled(key_rect, 0.0, color);
+
+        // Add key border
+        ui.painter().rect_stroke(
+            key_rect,
+            0.0,
+            egui::Stroke::new(1.0, ui.visuals().window_stroke.color),
+            StrokeKind::Outside,
+        );
+
+        // Add key response for potential MIDI preview
+        let response = ui.allocate_rect(key_rect, egui::Sense::click());
+
+        // Draw note name
+        let note = note_number % 12;
+        let octave = (note_number / 12) - 1;
+        let note_names = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+        ];
+        let note_name = format!("{}{}", note_names[note as usize], octave);
+
+        // Only show full note name for C notes or when hovering
+        if note == 0 || (!is_black && response.hovered()) {
+            let text_pos = key_rect.left_center() + egui::vec2(4.0, 0.0);
+            ui.painter().text(
+                text_pos,
+                egui::Align2::LEFT_CENTER,
+                &note_name,
+                FontId::monospace(10.0),
+                if is_black {
+                    ui.visuals().strong_text_color()
+                } else {
+                    ui.visuals().text_color()
+                },
+            );
+        }
+
+        if response.hovered() {
+            // TODO: Preview MIDI note
+        }
+    }
+
     fn draw_grid(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let grid_rect = rect.translate(egui::vec2(self.key_width, 0.0));
+        // Get the grid area (everything to the right of the piano keys)
+        let grid_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + self.key_width, rect.top()),
+            rect.max,
+        );
 
         // Draw vertical grid lines (beats)
         let start_beat = (self.scroll_x / self.zoom).floor() as i32;
-        let end_beat = ((self.scroll_x + rect.width()) / self.zoom).ceil() as i32;
+        let end_beat = ((self.scroll_x + grid_rect.width()) / self.zoom).ceil() as i32;
 
         for beat in start_beat..=end_beat {
             let x = grid_rect.left() + beat as f32 * self.zoom - self.scroll_x;
@@ -201,15 +300,18 @@ impl PianoRoll {
         track_id: &str,
         state: &DawState,
     ) {
-        let viewport = ui.clip_rect();
-        let grid_rect = rect.translate(egui::vec2(self.key_width, 0.0));
+        // Calculate note area (to the right of piano keys)
+        let note_area = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + self.key_width, rect.top()),
+            rect.max,
+        );
 
         let note_position = NotePositioning::new(
             self.zoom,
             self.key_height,
             self.scroll_x,
             self.scroll_y,
-            viewport,
+            note_area, // Use note_area instead of full viewport
         );
 
         // Find the clip and ensure it's loaded
@@ -236,7 +338,7 @@ impl PianoRoll {
                         let response = ui.allocate_rect(note_rect, egui::Sense::click_and_drag());
 
                         // Draw base note shape
-                        let is_selected = self.selected_notes.contains(&note.id.parse().unwrap());
+                        let is_selected = self.selected_notes.contains(&note.id);
                         let color = if is_selected {
                             ui.visuals().selection.bg_fill
                         } else {
@@ -259,7 +361,7 @@ impl PianoRoll {
                             if !ui.input(|i| i.modifiers.shift) {
                                 self.selected_notes.clear();
                             }
-                            self.selected_notes.push(note.id.parse().unwrap());
+                            self.selected_notes.push(note.id.clone());
                         }
 
                         if response.dragged() {
@@ -277,13 +379,17 @@ impl PianoRoll {
                                 let delta_x = current_pos.x - start_x;
                                 let delta_y = current_pos.y - start_y;
 
-                                // TODO: Add command for moving notes
-                                //             self.command_collector.add_command(DawCommand::MoveNotes {
-                                //     clip_id: clip_id.to_string(),
-                                //     note_ids: self.selected_notes.clone(),
-                                //     delta_time: delta_x / self.zoom,
-                                //     delta_pitch: -(delta_y / self.key_height) as i8,
-                                //             });
+                                let delta_time = delta_x / self.zoom;
+                                let delta_pitch = -(delta_y / self.key_height) as i8;
+
+                                println!("Moving note {}", note.id);
+
+                                self.command_collector.add_command(DawCommand::MoveNotes {
+                                    clip_id: clip_id.to_string(),
+                                    note_ids: self.selected_notes.clone(),
+                                    delta_time: delta_time as f64,
+                                    delta_pitch,
+                                });
                             }
                         }
 

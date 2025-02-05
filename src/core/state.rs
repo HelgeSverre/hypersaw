@@ -17,6 +17,7 @@ pub struct DawState {
     pub selected_clip: Option<String>,
     pub current_view: EditorView,
     pub status: StatusManager,
+    // pub plugin_manager: PluginManager,
 }
 
 impl DawState {

@@ -78,7 +78,7 @@ impl PluginBrowser {
                 ui.set_max_size(egui::vec2(800.0, 600.0));
 
                 egui::Frame::window(&ctx.style())
-                    .inner_margin(Margin::same(10.0))
+                    .inner_margin(Margin::from(10.0))
                     .show(ui, |ui| {
                         self.draw_browser_contents(ui, state);
                     });

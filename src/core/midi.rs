@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+pub type NoteID = String;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MidiEvent {
     pub tick: u32,
@@ -128,7 +130,8 @@ impl MidiClipData {
                         midly::MidiMessage::NoteOn { key, vel } => {
                             if vel.as_int() > 0 {
                                 let note_id = format!("{}:{}", channel.as_int(), key.as_int());
-                                pending_notes.insert(note_id, (current_time_ticks, vel.as_int().into()));
+                                pending_notes
+                                    .insert(note_id, (current_time_ticks, vel.as_int().into()));
                             } else {
                                 handle_note_off(
                                     &mut notes,

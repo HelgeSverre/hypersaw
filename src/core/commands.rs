@@ -20,14 +20,14 @@ pub enum DawCommand {
     // Notes
     MoveNotes {
         clip_id: String,
-        note_ids: Vec<usize>,
+        note_ids: Vec<NoteID>,
         delta_time: f64,
         delta_pitch: i8,
     },
 
     DeleteNotes {
         clip_id: String,
-        note_ids: Vec<usize>,
+        note_ids: Vec<NoteID>,
     },
 
     AddNote {
