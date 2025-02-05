@@ -118,24 +118,37 @@ impl SupersawApp {
             "/Users/helge/code/hypersaw/data/moon-loves-the-sun.mid",
             "/Users/helge/code/hypersaw/data/emotions.mid",
             "/Users/helge/code/hypersaw/data/silentium.mid",
-            "/Users/helge/code/hypersaw/data/system-f-out-of-the-blue.mid",
+            // "/Users/helge/code/hypersaw/data/system-f-out-of-the-blue.mid",
         ];
 
         // Add 4 test tracks
         for (i, midi_file) in dummy_midis.iter().enumerate() {
+            let file_path = PathBuf::from(midi_file);
+
+            // Create clip with initial placeholder length
+            let mut clip = Clip::Midi {
+                id: Uuid::new_v4().to_string(),
+                start_time: 0.0,
+                length: 4.0, // Will be updated after loading
+                file_path: file_path.clone(),
+                midi_data: None,
+                loaded: false,
+            };
+
+            // Load the MIDI data
+            if let Err(e) = clip.load_midi() {
+                eprintln!("Failed to load MIDI file {}: {}", midi_file, e);
+                continue;
+            }
+
             let track = Track {
                 id: Uuid::new_v4().to_string(),
                 name: format!("Track {}", i + 1),
                 track_type: TrackType::Midi {
                     channel: 1,
-                    device_name: String::from(midi_file.split('/').last().unwrap()),
+                    device_name: String::from(file_path.file_name().unwrap().to_string_lossy()),
                 },
-                clips: vec![Clip::Midi {
-                    id: Uuid::new_v4().to_string(),
-                    start_time: 0.0,
-                    length: 4.0,
-                    file_path: PathBuf::from(midi_file),
-                }],
+                clips: vec![clip],
                 is_muted: false,
                 is_soloed: false,
             };
@@ -365,7 +378,7 @@ impl eframe::App for SupersawApp {
                 self.handle_key_action(KeyAction::SaveProject);
             }
 
-            if (i.key_pressed(Key::Space)) {
+            if i.key_pressed(Key::Space) {
                 self.handle_key_action(KeyAction::TogglePlay);
             }
         });

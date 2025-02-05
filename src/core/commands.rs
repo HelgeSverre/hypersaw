@@ -11,13 +11,34 @@ pub trait Command {
 
 #[derive(Debug)]
 pub enum DawCommand {
+    // Editor
     OpenPianoRoll {
         clip_id: String,
         track_id: String,
     },
-    SelectClip {
+
+    // Notes
+    MoveNotes {
         clip_id: String,
+        note_ids: Vec<usize>,
+        delta_time: f64,
+        delta_pitch: i8,
     },
+
+    DeleteNotes {
+        clip_id: String,
+        note_ids: Vec<usize>,
+    },
+
+    AddNote {
+        clip_id: String,
+        start_time: f64,
+        duration: f64,
+        pitch: u8,
+        velocity: u8,
+    },
+
+    // Track
     SelectTrack {
         track_id: String,
     },
@@ -27,6 +48,11 @@ pub enum DawCommand {
     },
     DeleteTrack {
         track_id: String,
+    },
+
+    // Clips
+    SelectClip {
+        clip_id: String,
     },
     AddClip {
         track_id: String,
@@ -48,6 +74,7 @@ pub enum DawCommand {
         new_length: f64,
     },
 
+    // Transport
     EnableMetronome,
     DisableMetronome,
     SetBpm {
@@ -57,6 +84,7 @@ pub enum DawCommand {
         time: f64,
     },
 
+    // Playback
     StopPlayback,
     StartPlayback,
     PausePlayback,
@@ -77,8 +105,8 @@ impl Command for DawCommand {
             }
             DawCommand::SeekTime { time } => {
                 if state.loop_enabled {
-                    // If we seeked outside of the loop, disable the loop
-                    if (*time < state.loop_start || *time > state.loop_end) {
+                    // If we seeked outside the loop, disable the loop
+                    if *time < state.loop_start || *time > state.loop_end {
                         state.loop_enabled = false;
                     }
                 }
@@ -143,6 +171,8 @@ impl Command for DawCommand {
                             start_time: *start_time,
                             length: *length,
                             file_path: file_path.clone(),
+                            midi_data: None, // Add this
+                            loaded: false,   // Add this
                         },
                         TrackType::Audio => Clip::Audio {
                             id: Uuid::new_v4().to_string(),
@@ -242,6 +272,18 @@ impl Command for DawCommand {
 
                 Ok(())
             }
+            DawCommand::MoveNotes { .. } => {
+                // TODO: Implement
+                Ok(())
+            }
+            DawCommand::DeleteNotes { .. } => {
+                // TODO: Implement
+                Ok(())
+            }
+            DawCommand::AddNote { .. } => {
+                // TODO: Implement
+                Ok(())
+            }
         }
     }
 
@@ -253,6 +295,9 @@ impl Command for DawCommand {
 
     fn name(&self) -> &'static str {
         match self {
+            DawCommand::MoveNotes { .. } => "Move Notes",
+            DawCommand::DeleteNotes { .. } => "Delete Notes",
+            DawCommand::AddNote { .. } => "Add Note",
             DawCommand::SetSnapMode { .. } => "Set Snap Mode",
             DawCommand::SeekTime { .. } => "Seek Time",
             DawCommand::OpenPianoRoll { .. } => "Open Piano Roll",

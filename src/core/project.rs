@@ -1,6 +1,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
+use crate::core::MidiClipData;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
@@ -109,7 +110,11 @@ pub enum Clip {
         id: String,
         start_time: f64,
         length: f64,
-        file_path: PathBuf, // Relative to project directory
+        file_path: PathBuf,
+        #[serde(default)]
+        midi_data: Option<MidiClipData>,
+        #[serde(default)]
+        loaded: bool,
     },
     Audio {
         id: String,
@@ -119,6 +124,39 @@ pub enum Clip {
         start_offset: f64,  // Start point within audio file
         end_offset: f64,    // End point within audio file
     },
+}
+
+impl Clip {
+    pub fn load_midi(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Clip::Midi {
+            file_path,
+            midi_data,
+            loaded,
+            length,
+            ..
+        } = self
+        {
+            if !*loaded {
+                let data = MidiClipData::load_from_file(file_path)?;
+                *length = data.length;
+                *midi_data = Some(data);
+                *loaded = true;
+            }
+            Ok(())
+        } else {
+            Err("Not a MIDI clip".into())
+        }
+    }
+
+    pub fn unload_midi(&mut self) {
+        if let Clip::Midi {
+            midi_data, loaded, ..
+        } = self
+        {
+            *midi_data = None;
+            *loaded = false;
+        }
+    }
 }
 
 impl Project {

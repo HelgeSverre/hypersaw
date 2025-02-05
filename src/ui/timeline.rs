@@ -3,6 +3,7 @@
 
 use crate::core::*;
 use eframe::egui;
+use eframe::epaint::StrokeKind;
 
 pub struct Timeline {
     pixels_per_second: f32,
@@ -405,8 +406,11 @@ impl Timeline {
 
                 // Snap to grid if enabled
                 let snapped_time = if self.snap_enabled {
-                    TimeUtils::snap_time(new_start_time as f64, state.project.bpm, state.snap_mode)
-                        as f32
+                    TimeUtils::snap_time(
+                        new_start_time as f64,
+                        state.project.bpm,
+                        state.snap_mode,
+                    ) as f32
                 } else {
                     new_start_time
                 };
@@ -486,6 +490,7 @@ impl Timeline {
                 clip_rect,
                 4.0,
                 egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                StrokeKind::Outside,
             );
         }
 

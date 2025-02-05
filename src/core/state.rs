@@ -31,7 +31,7 @@ impl DawState {
             last_update: None,
             selected_track: None,
             selected_clip: None,
-            loop_enabled: true,
+            loop_enabled: false,
             loop_start: 3.0,
             loop_end: 4.0,
             current_view: EditorView::default(),
