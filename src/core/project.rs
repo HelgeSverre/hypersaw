@@ -13,10 +13,13 @@ pub enum SnapMode {
     None,
     Bar,
     Beat,
-    Halfbeat, // Half beat (8th note)
-    Quarter,  // Quarter beat (16th note)
-    Eighth,   // Eighth beat (32nd note)
-    Triplet,  // Triplet (1/3 of beat)
+    Halfbeat,         // 1/2 beat (8th note)
+    Quarter,          // 1/4 beat (16th note)
+    Eighth,           // 1/8 beat (32nd note)
+    Sixteenth,        // 1/16 beat (64th note)
+    Triplet,          // 1/3 of a beat (8th-note triplet)
+    SixteenthTriplet, // 1/6 of a beat (16th-note triplet)
+    ThirtySecond,     // 1/32 beat (128th note)
 }
 
 impl SnapMode {
@@ -24,12 +27,15 @@ impl SnapMode {
         let beat_duration = 60.0 / bpm; // Duration of one beat in seconds
         match self {
             SnapMode::None => 0.0,
-            SnapMode::Bar => beat_duration * 4.0,
-            SnapMode::Beat => beat_duration,
-            SnapMode::Halfbeat => beat_duration / 2.0,
-            SnapMode::Quarter => beat_duration / 4.0,
-            SnapMode::Eighth => beat_duration / 8.0,
-            SnapMode::Triplet => beat_duration / 3.0,
+            SnapMode::Bar => beat_duration * 4.0, // Full measure
+            SnapMode::Beat => beat_duration,      // Quarter note
+            SnapMode::Halfbeat => beat_duration / 2.0, // Eighth note
+            SnapMode::Quarter => beat_duration / 4.0, // Sixteenth note
+            SnapMode::Eighth => beat_duration / 8.0, // 32nd note
+            SnapMode::Sixteenth => beat_duration / 16.0, // 64th note
+            SnapMode::Triplet => beat_duration / 3.0, // Eighth-note triplet
+            SnapMode::SixteenthTriplet => beat_duration / 6.0, // 16th-note triplet
+            SnapMode::ThirtySecond => beat_duration / 32.0, // 128th note
         }
     }
 
@@ -37,11 +43,14 @@ impl SnapMode {
         match self {
             SnapMode::None => "None",
             SnapMode::Bar => "Bar",
-            SnapMode::Beat => "Beat",
+            SnapMode::Beat => "Beat (1/4)",
             SnapMode::Halfbeat => "1/8",
             SnapMode::Quarter => "1/16",
             SnapMode::Eighth => "1/32",
-            SnapMode::Triplet => "Triplet",
+            SnapMode::Sixteenth => "1/64",
+            SnapMode::Triplet => "Triplet (1/3)",
+            SnapMode::SixteenthTriplet => "Triplet (1/6)",
+            SnapMode::ThirtySecond => "1/128",
         }
     }
 }
@@ -127,7 +136,7 @@ pub enum Clip {
 }
 
 impl Clip {
-    pub fn load_midi(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn load_midi(&mut self) -> Result<(), Box<dyn Error>> {
         if let Clip::Midi {
             file_path,
             midi_data,
