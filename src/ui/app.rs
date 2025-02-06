@@ -303,7 +303,6 @@ impl SupersawApp {
                         track.name,
                         match track.track_type {
                             TrackType::Midi { .. } => "MIDI",
-                            TrackType::DrumRack { .. } => "Drum",
                             TrackType::Audio => "Audio",
                         }
                     );
