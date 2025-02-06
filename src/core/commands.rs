@@ -248,7 +248,7 @@ impl Command for DawCommand {
             DawCommand::NoOp => Ok(()),
             DawCommand::EnableMetronome {} => {
                 state.metronome = true;
-                state.status.info("Metronome disabled".to_string());
+                state.status.info("Metronome enabled".to_string());
                 Ok(())
             }
             DawCommand::DisableMetronome => {
