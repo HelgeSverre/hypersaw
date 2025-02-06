@@ -12,6 +12,4 @@ midir = "0.10.1"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 portaudio = "0.8.0"
 rfd = "0.15.1"
-raw-window-handle = "0.6.2"
-vst3 = "0.1.2"
 midly = "0.5.3"
