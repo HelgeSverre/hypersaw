@@ -101,15 +101,7 @@ pub struct Track {
 #[serde(tag = "type")]
 pub enum TrackType {
     Midi { channel: u8, device_name: String },
-    DrumRack { samples: Vec<DrumPad> },
     Audio,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DrumPad {
-    pub note: u8,
-    pub name: String,
-    pub sample_path: PathBuf, // Relative to project directory
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -214,14 +206,6 @@ impl Project {
             println!("Saving track: {}", track.name);
 
             match &mut track.track_type {
-                TrackType::DrumRack { samples } => {
-                    for pad in samples {
-                        println!("Drum rack sample path: {:?}", pad.sample_path);
-                        let new_path = copy_to_project_dir(&pad.sample_path, &samples_dir)?;
-                        pad.sample_path = new_path;
-                    }
-                }
-
                 TrackType::Midi { .. } => {
                     println!("MIDI track detected");
                 }
