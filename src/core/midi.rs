@@ -102,7 +102,7 @@ impl MidiClipData {
         let mut notes = Vec::new();
         let mut events = Vec::new();
         let mut events_by_tick = HashMap::new();
-        let mut pending_notes = std::collections::HashMap::<String, (u32, i32)>::new();
+        let mut pending_notes = HashMap::<String, (u32, i32)>::new();
         let mut current_time_ticks = 0;
         let mut max_time_ticks = 0;
         let mut tempo_map = vec![TempoChange {
