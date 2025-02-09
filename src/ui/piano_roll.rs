@@ -14,7 +14,7 @@ pub struct PianoRoll {
     scroll_x: f32,
     scroll_y: f32,
     viewport_height: f32,
-    selected_notes: Vec<String>, // Change to store UUIDs as strings
+    selected_notes: Vec<EventID>,
     dragging: Option<DragOperation>,
     command_collector: CommandCollector,
 }
@@ -26,7 +26,7 @@ enum DragOperation {
     Drawing { start_x: f32, start_y: f32 },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum ResizeEdge {
     Left,
     Right,
@@ -47,7 +47,42 @@ impl PianoRoll {
             command_collector: CommandCollector::new(),
         }
     }
+    fn get_active_notes(
+        &self,
+        state: &DawState,
+        clip_id: &str,
+        track_id: &str,
+        current_time: f64,
+    ) -> Vec<u8> {
+        let mut active_notes = Vec::new();
 
+        if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id) {
+            if let Some(Clip::Midi {
+                midi_data,
+                start_time,
+                ..
+            }) = track
+                .clips
+                .iter()
+                .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+            {
+                if let Some(store) = midi_data {
+                    // Get relative time within the clip
+                    let clip_time = current_time - start_time;
+
+                    // Find all notes that contain the current time point
+                    for note in store.get_notes() {
+                        let note_end = note.start_time + note.duration;
+                        if clip_time >= note.start_time && clip_time < note_end {
+                            active_notes.push(note.key);
+                        }
+                    }
+                }
+            }
+        }
+
+        active_notes
+    }
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) -> Vec<DawCommand> {
         if let EditorView::PianoRoll {
             clip_id, track_id, ..
@@ -68,15 +103,34 @@ impl PianoRoll {
                 }
             }
 
+            // Get clip start time
+            let clip_start =
+                if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id) {
+                    if let Some(Clip::Midi { start_time, .. }) = track
+                        .clips
+                        .iter()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        *start_time
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
             self.center_on_middle_c(rect.height());
             self.draw_grid(ui, rect, state);
             self.draw_notes(ui, rect, clip_id, track_id, state);
-            self.draw_piano_keys(ui, rect);
+            self.draw_piano_keys(ui, rect, state, clip_id, track_id);
 
-            // self.handle_scrolling(ui, rect);
+            // Draw playhead after everything else
+            self.draw_playhead(ui, rect, clip_start, state.current_time);
+
+            // Handle zoom and scrolling
             self.handle_zoom(ui, rect);
 
             // Handle middle-button dragging for panning
@@ -91,6 +145,9 @@ impl PianoRoll {
                 self.scroll_y =
                     new_scroll_y.clamp(0.0, self.get_total_height() - self.viewport_height);
             }
+
+            // Auto-scroll to follow playhead if it's outside view
+            // self.handle_playhead_autoscroll(rect, clip_start, state.current_time);
         }
 
         self.command_collector.take_commands()
@@ -138,54 +195,49 @@ impl PianoRoll {
     fn handle_note_drag(
         &mut self,
         response: &egui::Response,
-        note: &MidiNote,
+        note: &Note,
         clip_id: &str,
         state: &DawState,
     ) {
         if response.dragged() {
-            println!("Dragging note: {:?}, dragging: {:?}", note, self.dragging);
-            if let None = self.dragging {
-                self.dragging = Some(DragOperation::MovingNotes {
-                    start_x: response.hover_pos().unwrap().x,
-                    start_y: response.hover_pos().unwrap().y,
-                });
+            // Ensure the note being dragged is selected
+            if !self.selected_notes.contains(&note.id) {
+                self.selected_notes.push(note.id.clone());
             }
 
-            if let Some(DragOperation::MovingNotes { start_x, start_y }) = self.dragging {
-                let current_pos = response.hover_pos().unwrap();
-                let delta_x = current_pos.x - start_x;
-                let delta_y = current_pos.y - start_y;
+            // Calculate deltas from last frame
+            let delta_x = response.drag_delta().x / self.zoom;
+            let delta_y = -(response.drag_delta().y / self.key_height) as i8;
 
-                let delta_time = delta_x / self.zoom;
-                let delta_pitch = -(delta_y / self.key_height) as i8;
+            // Apply snapping if enabled
+            let actual_delta_time = if self.grid_snap {
+                let new_time = TimeUtils::snap_time(
+                    note.start_time + delta_x as f64,
+                    state.project.bpm,
+                    state.snap_mode,
+                );
+                new_time - note.start_time
+            } else {
+                delta_x as f64
+            };
 
-                // Calculate new time with snapping
-                let time = note.start_time + delta_time as f64;
-
-                // TODO: If holding "command/alt" ignore snapping
-                let new_time = if self.grid_snap {
-                    TimeUtils::snap_time(time, state.project.bpm, state.snap_mode)
-                } else {
-                    time
-                };
-
-                let actual_delta_time = new_time - note.start_time;
-
-                self.command_collector.add_command(DawCommand::MoveNotes {
-                    clip_id: clip_id.to_string(),
-                    note_ids: self.selected_notes.clone(),
-                    delta_time: actual_delta_time,
-                    delta_pitch,
-                });
-            }
-        }
-
-        if response.drag_stopped() {
-            self.dragging = None;
+            self.command_collector.add_command(DawCommand::MoveNotes {
+                clip_id: clip_id.to_string(),
+                note_ids: self.selected_notes.clone(),
+                delta_time: actual_delta_time,
+                delta_pitch: delta_y,
+            });
         }
     }
 
-    fn draw_piano_keys(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+    fn draw_piano_keys(
+        &self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        state: &DawState,
+        clip_id: &str,
+        track_id: &str,
+    ) {
         let keys_rect = rect.intersect(egui::Rect::from_min_size(
             rect.min,
             egui::vec2(self.key_width, rect.height()),
@@ -195,6 +247,9 @@ impl PianoRoll {
         let end_note = ((self.scroll_y + rect.height()) / self.key_height).ceil() as i32;
         let visible_notes = start_note..=end_note;
 
+        // Get currently active notes
+        let active_notes = self.get_active_notes(state, clip_id, track_id, state.current_time);
+
         // Draw background for piano keys
         ui.painter()
             .rect_filled(keys_rect, 0.0, ui.visuals().extreme_bg_color);
@@ -203,7 +258,7 @@ impl PianoRoll {
         for note_number in visible_notes.clone() {
             let note = note_number % 12;
             if [0, 2, 4, 5, 7, 9, 11].contains(&note) {
-                self.draw_key(ui, note_number, false, keys_rect);
+                self.draw_key(ui, note_number as u8, false, keys_rect, &active_notes);
             }
         }
 
@@ -211,12 +266,19 @@ impl PianoRoll {
         for note_number in visible_notes {
             let note = note_number % 12;
             if [1, 3, 6, 8, 10].contains(&note) {
-                self.draw_key(ui, note_number, true, keys_rect);
+                self.draw_key(ui, note_number as u8, true, keys_rect, &active_notes);
             }
         }
     }
 
-    fn draw_key(&self, ui: &mut egui::Ui, note_number: i32, is_black: bool, rect: egui::Rect) {
+    fn draw_key(
+        &self,
+        ui: &mut egui::Ui,
+        note_number: u8,
+        is_black: bool,
+        rect: egui::Rect,
+        active_notes: &[u8],
+    ) {
         let y = rect.bottom() - (note_number as f32 + 1.0) * self.key_height + self.scroll_y;
 
         // Calculate key dimensions
@@ -238,11 +300,26 @@ impl PianoRoll {
             egui::pos2(rect.left() + x_offset + key_width, y + self.key_height),
         );
 
-        // Draw key background
-        let color = if is_black {
+        // Check if note is currently active
+        let is_active = active_notes.contains(&note_number);
+
+        // Draw key background with active state
+        let base_color = if is_black {
             ui.visuals().extreme_bg_color
         } else {
             ui.visuals().window_fill
+        };
+
+        let color = if is_active {
+            // Create a highlighted version of the key color
+            let highlight_color = egui::Color32::from_rgb(64, 128, 255);
+            if is_black {
+                highlight_color.linear_multiply(0.7)
+            } else {
+                highlight_color
+            }
+        } else {
+            base_color
         };
 
         // Add key border
@@ -266,18 +343,26 @@ impl PianoRoll {
         let note_name = format!("{}{}", note_names[note as usize], octave);
 
         // Only show full note name for C notes or when hovering
-        if note == 0 || response.hovered() {
+        if note == 0 || response.hovered() || is_active {
+            let text_color = if is_active {
+                if is_black {
+                    ui.visuals().text_color()
+                } else {
+                    ui.visuals().strong_text_color()
+                }
+            } else if is_black {
+                ui.visuals().strong_text_color()
+            } else {
+                ui.visuals().text_color()
+            };
+
             let text_pos = key_rect.left_center() + egui::vec2(4.0, 0.0);
             ui.painter().text(
                 text_pos,
                 egui::Align2::CENTER_CENTER,
                 &note_name,
                 FontId::monospace(10.0),
-                if is_black {
-                    ui.visuals().strong_text_color()
-                } else {
-                    ui.visuals().text_color()
-                },
+                text_color,
             );
         }
 
@@ -389,7 +474,6 @@ impl PianoRoll {
         track_id: &str,
         state: &DawState,
     ) {
-        // Calculate note area (to the right of piano keys)
         let note_area = egui::Rect::from_min_max(
             egui::pos2(rect.left() + self.key_width, rect.top()),
             rect.max,
@@ -403,128 +487,273 @@ impl PianoRoll {
             note_area,
         );
 
-        // Find the clip and ensure it's loaded
+        // Get visible notes
+        let visible_notes = self.get_visible_notes(note_area, track_id, clip_id, state);
+
+        // First pass: Draw note bodies
+        for note in &visible_notes {
+            if !note_position.is_note_visible(note.start_time, note.key, note.duration) {
+                continue;
+            }
+
+            let note_rect = note_position.note_to_rect(note.start_time, note.key, note.duration);
+
+            // Draw base note shape
+            let is_selected = self.selected_notes.contains(&note.id);
+            let color = if is_selected {
+                ui.visuals().selection.bg_fill
+            } else {
+                egui::Color32::from_rgb(64, 128, 255)
+            };
+
+            ui.painter().rect_filled(note_rect, 4.0, color);
+
+            // Draw velocity indicator
+            self.draw_velocity_indicator(ui, note_rect, note.velocity);
+        }
+
+        // Second pass: Handle interactions and overlays
+        // Only handle note interactions if we're not currently drawing
+        if !matches!(self.dragging, Some(DragOperation::Drawing { .. })) {
+            for note in &visible_notes {
+                if !note_position.is_note_visible(note.start_time, note.key, note.duration) {
+                    continue;
+                }
+
+                let note_rect =
+                    note_position.note_to_rect(note.start_time, note.key, note.duration);
+
+                // Handle note interactions
+                self.handle_note_interaction(ui, note_rect, note, clip_id, state);
+            }
+        }
+    }
+
+    fn handle_resize_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        note_rect: egui::Rect,
+        note: &Note,
+        clip_id: &str,
+        state: &DawState,
+        note_response: &egui::Response,
+    ) {
+        let handle_width = 4.0;
+
+        // Create resize handles
+        let left_handle = egui::Rect::from_min_size(
+            note_rect.left_top(),
+            egui::vec2(handle_width, note_rect.height()),
+        );
+        let right_handle = egui::Rect::from_min_size(
+            egui::pos2(note_rect.right() - handle_width, note_rect.top()),
+            egui::vec2(handle_width, note_rect.height()),
+        );
+
+        // Draw handles when note is hovered or selected
+        if note_response.hovered() || self.selected_notes.contains(&note.id) {
+            ui.painter()
+                .rect_filled(left_handle, 0.0, ui.visuals().selection.stroke.color);
+            ui.painter()
+                .rect_filled(right_handle, 0.0, ui.visuals().selection.stroke.color);
+        }
+
+        // Handle resizing
+        let left_response = ui.allocate_rect(left_handle, egui::Sense::drag());
+        let right_response = ui.allocate_rect(right_handle, egui::Sense::drag());
+
+        if (left_response.dragged() || right_response.dragged())
+            && !matches!(self.dragging, Some(DragOperation::MovingNotes { .. }))
+        {
+            let (edge, delta) = if left_response.dragged() {
+                (ResizeEdge::Left, -left_response.drag_delta().x)
+            } else {
+                (ResizeEdge::Right, right_response.drag_delta().x)
+            };
+
+            // Convert pixel delta to time delta
+            let delta_time = delta / self.zoom;
+
+            // Calculate new times based on the delta
+            let (new_start_time, new_duration) = match edge {
+                ResizeEdge::Left => {
+                    let proposed_start = note.start_time - delta_time as f64;
+                    let new_start = if self.grid_snap {
+                        TimeUtils::snap_time(proposed_start, state.project.bpm, state.snap_mode)
+                    } else {
+                        proposed_start
+                    };
+
+                    // Calculate new duration by preserving the end time
+                    let note_end = note.start_time + note.duration;
+                    let new_duration = (note_end - new_start).max(0.1);
+
+                    (new_start, new_duration)
+                }
+                ResizeEdge::Right => {
+                    let proposed_duration = note.duration + delta_time as f64;
+                    let new_duration = if self.grid_snap {
+                        TimeUtils::snap_time(proposed_duration, state.project.bpm, state.snap_mode)
+                    } else {
+                        proposed_duration
+                    };
+                    (note.start_time, new_duration.max(0.1))
+                }
+            };
+
+            self.command_collector.add_command(DawCommand::ResizeNote {
+                clip_id: clip_id.to_string(),
+                note_id: note.id.clone(),
+                new_start_time,
+                new_duration,
+            });
+        }
+
+        // Update cursor
+        if left_response.hovered() || right_response.hovered() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+        }
+    }
+    fn handle_note_interaction(
+        &mut self,
+        ui: &mut egui::Ui,
+        note_rect: egui::Rect,
+        note: &Note,
+        clip_id: &str,
+        state: &DawState,
+    ) {
+        let response = ui.allocate_rect(note_rect, egui::Sense::click_and_drag());
+
+        // Handle selection
+        if response.clicked() {
+            if self.selected_notes.contains(&note.id) {
+                // Deselect note if already selected
+                self.selected_notes.retain(|id| id != &note.id);
+            } else {
+                self.selected_notes.push(note.id.clone());
+            }
+        }
+
+        // Draw resize handles and handle resizing
+        self.handle_resize_controls(ui, note_rect, note, clip_id, state, &response);
+
+        // Handle dragging
+        if matches!(
+            self.dragging,
+            None | Some(DragOperation::MovingNotes { .. })
+        ) {
+            self.handle_note_drag(&response, note, clip_id, state);
+        }
+    }
+
+    fn draw_velocity_indicator(&self, ui: &mut egui::Ui, note_rect: egui::Rect, velocity: u8) {
+        let velocity_height = (velocity as f32 / 127.0) * note_rect.height();
+        let velocity_rect = egui::Rect::from_min_size(
+            note_rect.left_bottom() - egui::vec2(0.0, velocity_height),
+            egui::vec2(3.0, velocity_height),
+        );
+        ui.painter()
+            .rect_filled(velocity_rect, 0.0, ui.visuals().text_color());
+    }
+
+    // Add this method to draw the playhead
+    fn draw_playhead(
+        &self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        clip_start: f64,
+        current_time: f64,
+    ) {
+        let grid_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + self.key_width, rect.top()),
+            rect.max,
+        );
+
+        // Calculate relative time within the clip
+        let relative_time = current_time - clip_start;
+
+        // Convert time to x-coordinate
+        let playhead_x = grid_rect.left() + (relative_time as f32 * self.zoom) - self.scroll_x;
+
+        // Only draw if playhead is within view
+        if playhead_x >= grid_rect.left() && playhead_x <= grid_rect.right() {
+            // Draw playhead line
+            let playhead_color = ui.visuals().selection.stroke.color;
+            ui.painter().line_segment(
+                [
+                    egui::pos2(playhead_x, grid_rect.top()),
+                    egui::pos2(playhead_x, grid_rect.bottom()),
+                ],
+                (2.0, playhead_color),
+            );
+
+            // Draw playhead head (triangle)
+            let triangle_size = 8.0;
+            let points = vec![
+                egui::pos2(playhead_x - triangle_size / 2.0, grid_rect.top()),
+                egui::pos2(playhead_x + triangle_size / 2.0, grid_rect.top()),
+                egui::pos2(playhead_x, grid_rect.top() + triangle_size),
+            ];
+            ui.painter().add(egui::Shape::convex_polygon(
+                points,
+                playhead_color,
+                (1.0, playhead_color),
+            ));
+        }
+    }
+
+    // Add auto-scroll functionality to follow playhead
+    fn handle_playhead_autoscroll(&mut self, rect: egui::Rect, clip_start: f64, current_time: f64) {
+        let grid_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + self.key_width, rect.top()),
+            rect.max,
+        );
+
+        // Calculate relative time within the clip
+        let relative_time = current_time - clip_start;
+
+        // Convert time to x-coordinate
+        let playhead_x = grid_rect.left() + (relative_time as f32 * self.zoom) - self.scroll_x;
+
+        // Define margins for auto-scroll (e.g., 100 pixels from edge)
+        let margin = 100.0;
+
+        // Auto-scroll if playhead is outside view or too close to edges
+        if playhead_x > grid_rect.right() - margin {
+            self.scroll_x += playhead_x - (grid_rect.right() - margin);
+        } else if playhead_x < grid_rect.left() + margin {
+            self.scroll_x = (self.scroll_x - ((grid_rect.left() + margin) - playhead_x)).max(0.0);
+        }
+    }
+
+    fn get_visible_notes(
+        &self,
+        note_area: egui::Rect,
+        track_id: &str,
+        clip_id: &str,
+        state: &DawState,
+    ) -> Vec<Note> {
+        let start_time = self.scroll_x / self.zoom;
+        let end_time = (self.scroll_x + note_area.width()) / self.zoom;
+
         if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id) {
-            if let Some(Clip::Midi { midi_data, .. }) = track.clips.iter().find(|c| match c {
-                Clip::Midi { id, .. } => id == clip_id,
-                _ => false,
-            }) {
-                if let Some(midi_data) = midi_data {
-                    for note in &midi_data.notes {
-                        if !note_position.is_note_visible(
-                            note.start_time,
-                            note.pitch,
-                            note.duration,
-                        ) {
-                            continue;
-                        }
-
-                        let note_rect =
-                            note_position.note_to_rect(note.start_time, note.pitch, note.duration);
-
-                        let response = ui.allocate_rect(note_rect, egui::Sense::click_and_drag());
-
-                        // Draw base note shape
-                        let is_selected = self.selected_notes.contains(&note.id);
-                        let color = if is_selected {
-                            ui.visuals().selection.bg_fill
-                        } else {
-                            egui::Color32::from_rgb(64, 128, 255)
-                        };
-
-                        ui.painter().rect_filled(note_rect, 4.0, color);
-
-                        // Draw velocity indicator
-                        let velocity_height = (note.velocity as f32 / 127.0) * note_rect.height();
-                        let velocity_rect = egui::Rect::from_min_size(
-                            note_rect.left_bottom() - egui::vec2(0.0, velocity_height),
-                            egui::vec2(3.0, velocity_height),
-                        );
-                        ui.painter()
-                            .rect_filled(velocity_rect, 0.0, ui.visuals().text_color());
-
-                        // Handle note selection
-                        if response.clicked() {
-                            if !ui.input(|i| i.modifiers.shift) {
-                                self.selected_notes.clear();
-                            }
-                            self.selected_notes.push(note.id.clone());
-                        }
-
-                        // Draw resize handles
-                        let handle_width = 4.0;
-                        let left_handle = egui::Rect::from_min_size(
-                            note_rect.left_top(),
-                            egui::vec2(handle_width, note_rect.height()),
-                        );
-                        let right_handle = egui::Rect::from_min_size(
-                            egui::pos2(note_rect.right() - handle_width, note_rect.top()),
-                            egui::vec2(handle_width, note_rect.height()),
-                        );
-
-                        let left_response = ui.allocate_rect(left_handle, egui::Sense::drag());
-                        let right_response = ui.allocate_rect(right_handle, egui::Sense::drag());
-
-                        // Handle dragging (resizing)
-                        if left_response.dragged() {
-                            let delta = (left_response.drag_delta().x / self.zoom) as f64;
-                            let new_start_time = if self.grid_snap {
-                                TimeUtils::snap_time(
-                                    (note.start_time - delta).max(0.0),
-                                    state.project.bpm,
-                                    state.snap_mode,
-                                )
-                            } else {
-                                (note.start_time - delta).max(0.0)
-                            };
-                            let new_duration = if self.grid_snap {
-                                TimeUtils::snap_time(
-                                    (note.duration + delta).max(0.1),
-                                    state.project.bpm,
-                                    state.snap_mode,
-                                )
-                            } else {
-                                (note.duration - delta).max(0.1)
-                            };
-
-                            self.command_collector.add_command(DawCommand::ResizeNote {
-                                clip_id: clip_id.to_string(),
-                                note_id: note.id.clone(),
-                                new_start_time,
-                                new_duration,
-                            });
-                        }
-
-                        if right_response.dragged() {
-                            let delta = (right_response.drag_delta().x / self.zoom) as f64;
-                            let new_duration = if self.grid_snap {
-                                TimeUtils::snap_time(
-                                    (note.duration + delta).max(0.1),
-                                    state.project.bpm,
-                                    state.snap_mode,
-                                )
-                            } else {
-                                (note.duration + delta).max(0.1)
-                            };
-
-                            self.command_collector.add_command(DawCommand::ResizeNote {
-                                clip_id: clip_id.to_string(),
-                                note_id: note.id.clone(),
-                                new_start_time: note.start_time,
-                                new_duration,
-                            });
-                        }
-
-                        if left_response.hovered() || right_response.hovered() {
-                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
-                        }
-
-                        // Handle note dragging with snapping
-                        self.handle_note_drag(&response, note, clip_id, state);
-                    }
+            if let Some(Clip::Midi { midi_data, .. }) = track
+                .clips
+                .iter()
+                .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+            {
+                if let Some(store) = midi_data {
+                    // Clone the notes to get owned values
+                    return store
+                        .get_notes_in_range(start_time as f64, end_time as f64)
+                        .into_iter()
+                        .cloned()
+                        .collect();
                 }
             }
         }
+
+        Vec::new()
     }
 
     fn get_total_height(&self) -> f32 {

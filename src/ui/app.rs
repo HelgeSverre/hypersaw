@@ -497,6 +497,9 @@ impl eframe::App for SupersawApp {
             EditorView::PianoRoll { .. } => {
                 let commands = self.piano_roll.show(ui, &mut self.state);
                 for command in commands {
+                    
+                    println!("command: {:?}", command);
+                    
                     if let Err(e) = self.command_manager.execute(command, &mut self.state) {
                         eprintln!("piano_roll: Command failed: {}", e);
                         self.state.status.error(format!("Command failed: {}", e));
