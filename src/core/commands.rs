@@ -278,20 +278,98 @@ impl Command for DawCommand {
 
                 Ok(())
             }
-            DawCommand::ResizeNote { .. } => {
-                // TODO: Implement
+
+            DawCommand::AddNote {
+                clip_id,
+                start_time,
+                duration,
+                pitch,
+                velocity,
+            } => {
+                // Find the clip and add the note
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { midi_data, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        if let Some(store) = midi_data {
+                            let note = Note {
+                                id: Uuid::new_v4().to_string(),
+                                channel: 0, // TODO: Get from track settings
+                                key: *pitch,
+                                velocity: *velocity,
+                                start_time: *start_time,
+                                duration: *duration,
+                                start_tick: store.time_to_tick(*start_time),
+                                duration_ticks: store.time_to_tick(*duration),
+                            };
+                            store.add_note(note);
+                        }
+                    }
+                }
                 Ok(())
             }
-            DawCommand::MoveNotes { .. } => {
-                // TODO: Implement
+
+            DawCommand::DeleteNotes { clip_id, note_ids } => {
+                // Find the clip and delete the notes
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { midi_data, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        if let Some(store) = midi_data {
+                            for note_id in note_ids {
+                                store.delete_note(note_id);
+                            }
+                        }
+                    }
+                }
                 Ok(())
             }
-            DawCommand::DeleteNotes { .. } => {
-                // TODO: Implement
+
+            DawCommand::MoveNotes {
+                clip_id,
+                note_ids,
+                delta_time,
+                delta_pitch,
+            } => {
+                // Find the clip and move the notes
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { midi_data, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        if let Some(store) = midi_data {
+                            for note_id in note_ids {
+                                store.move_note(note_id, *delta_time, *delta_pitch);
+                            }
+                        }
+                    }
+                }
                 Ok(())
             }
-            DawCommand::AddNote { .. } => {
-                // TODO: Implement
+
+            DawCommand::ResizeNote {
+                clip_id,
+                note_id,
+                new_start_time,
+                new_duration,
+            } => {
+                // Find the clip and resize the note
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { midi_data, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        if let Some(store) = midi_data {
+                            store.update_note(note_id, *new_start_time, *new_duration);
+                        }
+                    }
+                }
                 Ok(())
             }
         }

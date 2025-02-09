@@ -1,7 +1,11 @@
-use std::io::{Read, Write};
-use std::fs::File;
+use midly::{MetaMessage, MidiMessage as MidlyMessage, TrackEventKind};
+use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
+use uuid::Uuid;
 
 // Unique identifier for MIDI notes and events
 pub type EventID = String;
@@ -114,15 +118,22 @@ impl MidiEventStore {
             events_by_tick: BTreeMap::new(),
             event_data: HashMap::new(),
             notes: HashMap::new(),
-            tempo_map: vec![TempoChange { tick: 0, tempo: 500_000 }],
-            time_signatures: vec![TimeSignature { tick: 0, numerator: 4, denominator: 4 }],
+            tempo_map: vec![TempoChange {
+                tick: 0,
+                tempo: 500_000,
+            }],
+            time_signatures: vec![TimeSignature {
+                tick: 0,
+                numerator: 4,
+                denominator: 4,
+            }],
             ppq,
         }
     }
 
     pub fn add_event(&mut self, event: MidiEvent) {
         let id = event.id.clone();
-        let time = OrderedFloat(event.time);  // Convert f64 to OrderedFloat
+        let time = OrderedFloat(event.time); // Convert f64 to OrderedFloat
         let tick = event.tick;
 
         self.events_by_time
@@ -186,13 +197,20 @@ impl MidiEventStore {
     }
 }
 
-use super::*;
-use midly::{MetaMessage, MidiMessage as MidlyMessage, TrackEventKind};
-use std::path::PathBuf;
-use ordered_float::OrderedFloat;
-use uuid::Uuid;
-
 impl MidiEventStore {
+    // Accessors
+    pub fn get_last_event_time(&self) -> Option<f64> {
+        self.events_by_time.keys().last().map(|k| k.0)
+    }
+
+    pub fn get_events(&self) -> impl Iterator<Item = &MidiEvent> {
+        self.event_data.values()
+    }
+
+    pub fn get_notes(&self) -> impl Iterator<Item = &Note> {
+        self.notes.values()
+    }
+
     // Time conversion methods
     pub fn tick_to_time(&self, tick: u32) -> f64 {
         let tempo_change = self
@@ -214,6 +232,84 @@ impl MidiEventStore {
         (time * ticks_per_second) as u32
     }
 
+    pub fn delete_note(&mut self, note_id: &str) {
+        // First collect all the IDs we need to remove
+        let on_id = format!("{}_on", note_id);
+        let off_id = format!("{}_off", note_id);
+
+        // Remove from events_by_time
+        for events in self.events_by_time.values_mut() {
+            events.retain(|id| id != &on_id && id != &off_id);
+        }
+        // Clean up empty entries
+        self.events_by_time.retain(|_, events| !events.is_empty());
+
+        // Remove from events_by_tick
+        for events in self.events_by_tick.values_mut() {
+            events.retain(|id| id != &on_id && id != &off_id);
+        }
+        // Clean up empty entries
+        self.events_by_tick.retain(|_, events| !events.is_empty());
+
+        // Remove from event_data
+        self.event_data.remove(&on_id);
+        self.event_data.remove(&off_id);
+
+        // Remove the note itself
+        self.notes.remove(note_id);
+    }
+
+    pub fn update_note(&mut self, note_id: &str, new_start: f64, new_duration: f64) {
+        // First get a clone of the note we want to update
+        let mut updated_note = if let Some(note) = self.notes.get(note_id) {
+            note.clone()
+        } else {
+            return;
+        };
+
+        // Calculate new timings
+        let start_tick = self.time_to_tick(new_start);
+        let duration_ticks = self.time_to_tick(new_duration);
+
+        // Update the note's timing
+        updated_note.start_time = new_start;
+        updated_note.duration = new_duration;
+        updated_note.start_tick = start_tick;
+        updated_note.duration_ticks = duration_ticks;
+
+        // Remove old events
+        self.delete_note(note_id);
+
+        // Add updated note
+        self.add_note(updated_note);
+    }
+
+    pub fn move_note(&mut self, note_id: &str, delta_time: f64, delta_pitch: i8) {
+        // First get a clone of the note we want to update
+        let mut updated_note = if let Some(note) = self.notes.get(note_id) {
+            note.clone()
+        } else {
+            return;
+        };
+
+        // Update timing
+        let new_start = (updated_note.start_time + delta_time).max(0.0);
+        let start_tick = self.time_to_tick(new_start);
+
+        // Update pitch
+        let new_pitch = (updated_note.key as i16 + delta_pitch as i16).clamp(0, 127) as u8;
+
+        // Apply updates to the cloned note
+        updated_note.start_time = new_start;
+        updated_note.start_tick = start_tick;
+        updated_note.key = new_pitch;
+
+        // Remove old events
+        self.delete_note(note_id);
+
+        // Add updated note
+        self.add_note(updated_note);
+    }
     // Load from MIDI file
     pub fn load_from_file(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let mut file = File::open(path)?;
@@ -372,7 +468,7 @@ impl MidiEventStore {
         let smf = midly::Smf {
             header: midly::Header {
                 format: midly::Format::SingleTrack,
-                timing: midly::Timing::Metrical(self.ppq.into()),
+                timing: midly::Timing::Metrical((self.ppq as u16).into()), // Convert to u16 first
             },
             tracks,
         };
@@ -472,7 +568,7 @@ impl MidiEventStore {
             MidiMessage::PitchBend { channel, value } => Some((
                 *channel,
                 MidlyMessage::PitchBend {
-                    bend: (*value).into(),
+                    bend: midly::PitchBend::from_int(*value), // Use from_int instead of into
                 },
             )),
             _ => None,
