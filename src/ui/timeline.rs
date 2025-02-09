@@ -33,7 +33,7 @@ impl Timeline {
 
         self.draw_background(ui, rect);
         self.draw_grid(ui, rect, state);
-        self.handle_zooming(ui);
+        self.handle_zooming(ui, rect);
         self.handle_scrolling(ui, &response);
         self.handle_file_drops(ui, state);
         self.handle_delete_clip(ui, state);
@@ -121,18 +121,25 @@ impl Timeline {
         }
     }
 
-    fn handle_zooming(&mut self, ui: &mut egui::Ui) {
+    fn handle_zooming(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         if ui.input(|i| i.modifiers.ctrl) {
             ui.input(|i| {
-                let zoom_delta = i.raw_scroll_delta.y * 0.01;
                 if let Some(mouse_pos) = i.pointer.hover_pos() {
-                    let time_at_mouse = (mouse_pos.x + self.scroll_offset) / self.pixels_per_second;
+                    let zoom_delta = i.raw_scroll_delta.y * 0.01;
+
+                    // Calculate the exact time at mouse position before zooming
+                    let mouse_offset = mouse_pos.x - rect.left();
+                    let time_at_mouse =
+                        (mouse_offset + self.scroll_offset) / self.pixels_per_second;
+
+                    // Calculate and apply new zoom level
                     self.pixels_per_second = (self.pixels_per_second * (1.0 + zoom_delta))
                         .max(10.0)
                         .min(500.0);
-                    let new_mouse_x = time_at_mouse * self.pixels_per_second;
 
-                    self.scroll_offset = new_mouse_x - mouse_pos.x;
+                    // Calculate new scroll offset to maintain mouse position
+                    let new_pixel_offset = time_at_mouse * self.pixels_per_second;
+                    self.scroll_offset = new_pixel_offset - mouse_offset;
                 }
             });
         }
@@ -280,18 +287,40 @@ impl Timeline {
             let start_response = ui.allocate_rect(start_handle, egui::Sense::drag());
             let end_response = ui.allocate_rect(end_handle, egui::Sense::drag());
 
+            // Handle start handle dragging
             if start_response.dragged() {
                 let delta = start_response.drag_delta().x / self.pixels_per_second;
-                state.loop_start = (state.loop_start + delta as f64)
-                    .max(0.0)
-                    .min(state.loop_end - 0.1);
+
+                let new_start_snap = if self.snap_enabled {
+                    TimeUtils::snap_time(
+                        (state.loop_start + delta as f64).max(0.0),
+                        state.project.bpm,
+                        state.snap_mode,
+                    )
+                } else {
+                    (state.loop_start + delta as f64).max(0.0)
+                };
+
+                state.loop_start = new_start_snap;
             }
 
+            // Handle end handle dragging
             if end_response.dragged() {
                 let delta = end_response.drag_delta().x / self.pixels_per_second;
-                state.loop_end = (state.loop_end + delta as f64).max(state.loop_start + 0.1);
+                let new_end_snap = if self.snap_enabled {
+                    TimeUtils::snap_time(
+                        (state.loop_end + delta as f64).max(state.loop_start + 0.1),
+                        state.project.bpm,
+                        state.snap_mode,
+                    )
+                } else {
+                    (state.loop_end + delta as f64).max(state.loop_start + 0.1)
+                };
+
+                state.loop_end = new_end_snap;
             }
 
+            // Show cursor change when hovering over loop handles
             if start_response.hovered() || end_response.hovered() {
                 ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
             }
@@ -440,9 +469,10 @@ impl Timeline {
             } => (*start_time as f32, *length as f32),
         };
 
-        let clip_left =
-            track_rect.left() + start_time * self.pixels_per_second - self.scroll_offset;
-        let clip_width = length * self.pixels_per_second;
+        let viewport_pos = ViewportPosition::new(self.pixels_per_second, self.scroll_offset, track_rect);
+        let clip_left = viewport_pos.time_to_x(start_time as f64);
+        let clip_width = viewport_pos.duration_to_width(length as f64);
+
 
         let clip_rect = egui::Rect::from_min_size(
             egui::pos2(clip_left, track_rect.top() + 2.0),

@@ -24,7 +24,7 @@ impl DawState {
     pub fn new() -> Self {
         Self {
             project: Project::new("Untitled".to_string()),
-            snap_mode: SnapMode::Halfbeat,
+            snap_mode: SnapMode::Eighth,
             metronome: false,
             playing: false,
             recording: false,
