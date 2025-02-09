@@ -469,9 +469,10 @@ impl Timeline {
             } => (*start_time as f32, *length as f32),
         };
 
-        let clip_left =
-            track_rect.left() + start_time * self.pixels_per_second - self.scroll_offset;
-        let clip_width = length * self.pixels_per_second;
+        let viewport_pos = ViewportPosition::new(self.pixels_per_second, self.scroll_offset, track_rect);
+        let clip_left = viewport_pos.time_to_x(start_time as f64);
+        let clip_width = viewport_pos.duration_to_width(length as f64);
+
 
         let clip_rect = egui::Rect::from_min_size(
             egui::pos2(clip_left, track_rect.top() + 2.0),

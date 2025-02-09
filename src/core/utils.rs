@@ -81,3 +81,67 @@ impl NotePositioning {
         self.viewport.intersects(rect)
     }
 }
+
+
+
+pub struct ViewportPosition {
+    /// Pixels per second for time axis
+    pixels_per_second: f32,
+    /// Horizontal scroll offset in seconds
+    scroll_offset: f32,
+    /// Viewport rectangle for clipping
+    viewport: egui::Rect,
+}
+
+impl ViewportPosition {
+    pub fn new(pixels_per_second: f32, scroll_offset: f32, viewport: egui::Rect) -> Self {
+        Self {
+            pixels_per_second,
+            scroll_offset,
+            viewport,
+        }
+    }
+
+    /// Convert time to screen X coordinate
+    pub fn time_to_x(&self, time: f64) -> f32 {
+        self.viewport.left() + (time as f32 * self.pixels_per_second - self.scroll_offset)
+    }
+
+    /// Convert screen X coordinate to time
+    pub fn x_to_time(&self, x: f32) -> f64 {
+        ((x - self.viewport.left() + self.scroll_offset) / self.pixels_per_second) as f64
+    }
+
+    /// Convert time duration to screen width
+    pub fn duration_to_width(&self, duration: f64) -> f32 {
+        duration as f32 * self.pixels_per_second
+    }
+
+    /// Check if time range would be visible in viewport
+    pub fn is_time_visible(&self, start_time: f64, duration: f64) -> bool {
+        let start_x = self.time_to_x(start_time);
+        let width = self.duration_to_width(duration);
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(start_x, self.viewport.top()),
+            egui::vec2(width, self.viewport.height()),
+        );
+        self.viewport.intersects(rect)
+    }
+
+    /// Get visible time range
+    pub fn visible_time_range(&self) -> (f64, f64) {
+        let start_time = self.x_to_time(self.viewport.left());
+        let end_time = self.x_to_time(self.viewport.right());
+        (start_time, end_time)
+    }
+
+    /// Get zoom level
+    pub fn get_pixels_per_second(&self) -> f32 {
+        self.pixels_per_second
+    }
+
+    /// Get scroll offset
+    pub fn get_scroll_offset(&self) -> f32 {
+        self.scroll_offset
+    }
+}
