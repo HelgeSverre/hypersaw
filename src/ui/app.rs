@@ -125,9 +125,9 @@ impl SupersawApp {
         );
 
         let dummy_midis = [
-            "/Users/helge/code/hypersaw/data/moon-loves-the-sun.mid",
-            "/Users/helge/code/hypersaw/data/emotions.mid",
-            "/Users/helge/code/hypersaw/data/silentium.mid",
+            "data/moon-loves-the-sun.mid",
+            "data/emotions.mid",
+            "data/silentium.mid",
             // "/Users/helge/code/hypersaw/data/system-f-out-of-the-blue.mid",
         ];
 
