@@ -268,6 +268,7 @@ impl Timeline {
                 ui.visuals().selection.stroke.color,
             );
 
+
             let start_handle = egui::Rect::from_min_max(
                 egui::pos2(loop_start_x - 5.0, rect.top()),
                 egui::pos2(loop_start_x + 5.0, rect.top() + marker_height),
@@ -280,18 +281,40 @@ impl Timeline {
             let start_response = ui.allocate_rect(start_handle, egui::Sense::drag());
             let end_response = ui.allocate_rect(end_handle, egui::Sense::drag());
 
+            // Handle start handle dragging
             if start_response.dragged() {
                 let delta = start_response.drag_delta().x / self.pixels_per_second;
-                state.loop_start = (state.loop_start + delta as f64)
-                    .max(0.0)
-                    .min(state.loop_end - 0.1);
+
+                let new_start_snap = if self.snap_enabled {
+                    TimeUtils::snap_time(
+                        (state.loop_start + delta as f64).max(0.0),
+                        state.project.bpm,
+                        state.snap_mode,
+                    )
+                } else {
+                    (state.loop_start + delta as f64).max(0.0)
+                };
+
+                state.loop_start = new_start_snap;
             }
 
+            // Handle end handle dragging
             if end_response.dragged() {
                 let delta = end_response.drag_delta().x / self.pixels_per_second;
-                state.loop_end = (state.loop_end + delta as f64).max(state.loop_start + 0.1);
+                let new_end_snap = if self.snap_enabled {
+                    TimeUtils::snap_time(
+                        (state.loop_end + delta as f64).max(state.loop_start + 0.1),
+                        state.project.bpm,
+                        state.snap_mode,
+                    )
+                } else {
+                    (state.loop_end + delta as f64).max(state.loop_start + 0.1)
+                };
+
+                state.loop_end = new_end_snap;
             }
 
+            // Show cursor change when hovering over loop handles
             if start_response.hovered() || end_response.hovered() {
                 ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
             }
