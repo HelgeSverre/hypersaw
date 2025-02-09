@@ -14,7 +14,7 @@ pub struct PianoRoll {
     scroll_x: f32,
     scroll_y: f32,
     viewport_height: f32,
-    selected_notes: Vec<String>, // Change to store UUIDs as strings
+    selected_notes: Vec<EventID>,
     dragging: Option<DragOperation>,
     command_collector: CommandCollector,
 }
