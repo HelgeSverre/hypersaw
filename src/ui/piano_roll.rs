@@ -138,7 +138,7 @@ impl PianoRoll {
     fn handle_note_drag(
         &mut self,
         response: &egui::Response,
-        note: &MidiNote,
+        note: &Note,
         clip_id: &str,
         state: &DawState,
     ) {

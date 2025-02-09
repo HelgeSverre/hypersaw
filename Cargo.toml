@@ -13,3 +13,4 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 # portaudio = "0.8.0"
 rfd = "0.15.1"
 midly = "0.5.3"
+ordered-float = { version = "4.6.0", features = ["serde"] }

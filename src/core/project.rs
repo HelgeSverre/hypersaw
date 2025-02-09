@@ -1,12 +1,12 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
-use crate::core::MidiClipData;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+use crate::core::{MidiEvent, MidiEventStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum SnapMode {
@@ -120,9 +120,7 @@ pub enum Clip {
         start_time: f64,
         length: f64,
         file_path: PathBuf,
-        #[serde(default)]
-        midi_data: Option<MidiClipData>,
-        #[serde(default)]
+        midi_data: Option<MidiEventStore>,
         loaded: bool,
     },
     Audio {
@@ -136,7 +134,7 @@ pub enum Clip {
 }
 
 impl Clip {
-    pub fn load_midi(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn load_midi(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Clip::Midi {
             file_path,
             midi_data,
@@ -146,29 +144,73 @@ impl Clip {
         } = self
         {
             if !*loaded {
-                let data = MidiClipData::load_from_file(file_path)?;
-                *length = data.length;
-                *midi_data = Some(data);
+                let store = MidiEventStore::load_from_file(file_path)?;
+
+                // Update clip length based on actual MIDI content
+                if let Some(last_event) = store.events_by_time.keys().last() {
+                    *length = *last_event;
+                }
+
+                *midi_data = Some(store);
                 *loaded = true;
             }
-            Ok(())
-        } else {
-            Err("Not a MIDI clip".into())
         }
+            Ok(())
     }
 
-    pub fn unload_midi(&mut self) {
-        if let Clip::Midi {
-            midi_data, loaded, ..
-        } = self
-        {
-            *midi_data = None;
-            *loaded = false;
+    pub fn get_events_in_time_range(&self, start: f64, end: f64) -> Vec<MidiEvent> {
+        match self {
+            Clip::Midi { midi_data, start_time, .. } => {
+                if let Some(store) = midi_data {
+                    // Adjust time range for clip position
+                    let clip_start = start - start_time;
+                    let clip_end = end - start_time;
+
+                    store.get_events_in_range(clip_start, clip_end)
+                        .into_iter()
+                        .map(|event| MidiEvent {
+                            time: event.time + start_time,
+                            ..event.clone()
+                        })
+                        .collect()
+        } else {
+                    Vec::new()
+}
+            }
+            _ => Vec::new(),
         }
     }
 }
 
+// Track-level MIDI handling
+impl Track {
+    pub fn get_events_in_time_range(&self, start: f64, end: f64) -> Vec<MidiEvent> {
+        match &self.track_type {
+            TrackType::Midi { .. } => {
+                self.clips
+                    .iter()
+                    .flat_map(|clip| clip.get_events_in_time_range(start, end))
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+// Project-level MIDI handling
 impl Project {
+  pub fn get_all_events_in_time_range(&self, start: f64, end: f64) -> Vec<(String, MidiEvent)> {
+        self.tracks
+            .iter()
+            .flat_map(|track| {
+                track
+                    .get_events_in_time_range(start, end)
+                    .into_iter()
+                    .map(move |event| (track.id.clone(), event))
+            })
+            .collect()
+    }
+
     pub fn ticks_per_second(&self) -> f64 {
         (self.bpm / 60.0) * self.ppq as f64
     }
