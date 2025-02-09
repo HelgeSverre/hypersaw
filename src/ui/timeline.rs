@@ -33,7 +33,7 @@ impl Timeline {
 
         self.draw_background(ui, rect);
         self.draw_grid(ui, rect, state);
-        self.handle_zooming(ui);
+        self.handle_zooming(ui, rect);
         self.handle_scrolling(ui, &response);
         self.handle_file_drops(ui, state);
         self.handle_delete_clip(ui, state);
@@ -121,18 +121,25 @@ impl Timeline {
         }
     }
 
-    fn handle_zooming(&mut self, ui: &mut egui::Ui) {
+    fn handle_zooming(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         if ui.input(|i| i.modifiers.ctrl) {
             ui.input(|i| {
-                let zoom_delta = i.raw_scroll_delta.y * 0.01;
                 if let Some(mouse_pos) = i.pointer.hover_pos() {
-                    let time_at_mouse = (mouse_pos.x + self.scroll_offset) / self.pixels_per_second;
+                    let zoom_delta = i.raw_scroll_delta.y * 0.01;
+
+                    // Calculate the exact time at mouse position before zooming
+                    let mouse_offset = mouse_pos.x - rect.left();
+                    let time_at_mouse =
+                        (mouse_offset + self.scroll_offset) / self.pixels_per_second;
+
+                    // Calculate and apply new zoom level
                     self.pixels_per_second = (self.pixels_per_second * (1.0 + zoom_delta))
                         .max(10.0)
                         .min(500.0);
-                    let new_mouse_x = time_at_mouse * self.pixels_per_second;
 
-                    self.scroll_offset = new_mouse_x - mouse_pos.x;
+                    // Calculate new scroll offset to maintain mouse position
+                    let new_pixel_offset = time_at_mouse * self.pixels_per_second;
+                    self.scroll_offset = new_pixel_offset - mouse_offset;
                 }
             });
         }
@@ -267,7 +274,6 @@ impl Timeline {
                 0.0,
                 ui.visuals().selection.stroke.color,
             );
-
 
             let start_handle = egui::Rect::from_min_max(
                 egui::pos2(loop_start_x - 5.0, rect.top()),
