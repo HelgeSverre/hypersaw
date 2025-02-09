@@ -205,53 +205,28 @@ impl PianoRoll {
                 self.selected_notes.push(note.id.clone());
             }
 
-            // Initialize drag operation if not already dragging
-            match self.dragging {
-                None => {
-                    self.dragging = Some(DragOperation::MovingNotes {
-                        start_x: response.hover_pos().unwrap().x,
-                        start_y: response.hover_pos().unwrap().y,
-                    });
-                }
-                Some(DragOperation::MovingNotes { start_x, start_y }) => {
-                    let current_pos = response.hover_pos().unwrap();
+            // Calculate deltas from last frame
+            let delta_x = response.drag_delta().x / self.zoom;
+            let delta_y = -(response.drag_delta().y / self.key_height) as i8;
 
-                    // Calculate deltas from last frame
-                    let delta_x = response.drag_delta().x;
-                    let delta_y = response.drag_delta().y;
+            // Apply snapping if enabled
+            let actual_delta_time = if self.grid_snap {
+                let new_time = TimeUtils::snap_time(
+                    note.start_time + delta_x as f64,
+                    state.project.bpm,
+                    state.snap_mode,
+                );
+                new_time - note.start_time
+            } else {
+                delta_x as f64
+            };
 
-                    let delta_time = delta_x / self.zoom;
-                    let delta_pitch = -(delta_y / self.key_height) as i8;
-
-                    // Calculate new time with snapping
-                    let time = note.start_time + delta_time as f64;
-                    let new_time = if self.grid_snap {
-                        TimeUtils::snap_time(time, state.project.bpm, state.snap_mode)
-                    } else {
-                        time
-                    };
-
-                    let actual_delta_time = new_time - note.start_time;
-
-                    self.command_collector.add_command(DawCommand::MoveNotes {
-                        clip_id: clip_id.to_string(),
-                        note_ids: self.selected_notes.clone(),
-                        delta_time: actual_delta_time,
-                        delta_pitch,
-                    });
-
-                    // Update start position for next frame
-                    self.dragging = Some(DragOperation::MovingNotes {
-                        start_x: current_pos.x,
-                        start_y: current_pos.y,
-                    });
-                }
-                _ => {} // Ignore if we're in a different drag operation
-            }
-        }
-
-        if response.drag_stopped() {
-            self.dragging = None;
+            self.command_collector.add_command(DawCommand::MoveNotes {
+                clip_id: clip_id.to_string(),
+                note_ids: self.selected_notes.clone(),
+                delta_time: actual_delta_time,
+                delta_pitch: delta_y,
+            });
         }
     }
 
@@ -591,53 +566,47 @@ impl PianoRoll {
             && !matches!(self.dragging, Some(DragOperation::MovingNotes { .. }))
         {
             let (edge, delta) = if left_response.dragged() {
-                (ResizeEdge::Left, left_response.drag_delta().x)
+                (ResizeEdge::Left, -left_response.drag_delta().x)
             } else {
                 (ResizeEdge::Right, right_response.drag_delta().x)
             };
 
-            // Initialize resize operation
-            if self.dragging.is_none() {
-                self.dragging = Some(DragOperation::ResizingNotes {
-                    edge,
-                    start_x: note_rect.left(),
-                });
-            }
-
-            // Calculate new times
+            // Convert pixel delta to time delta
             let delta_time = delta / self.zoom;
+
+            // Calculate new times based on the delta
             let (new_start_time, new_duration) = match edge {
                 ResizeEdge::Left => {
-                    let new_start = (note.start_time - delta_time as f64).max(0.0);
-                    let new_duration = note.duration + (note.start_time - new_start);
+                    let proposed_start = note.start_time - delta_time as f64;
+                    let new_start = if self.grid_snap {
+                        TimeUtils::snap_time(proposed_start, state.project.bpm, state.snap_mode)
+                    } else {
+                        proposed_start
+                    };
+
+                    // Calculate new duration by preserving the end time
+                    let note_end = note.start_time + note.duration;
+                    let new_duration = (note_end - new_start).max(0.1);
+
                     (new_start, new_duration)
                 }
-                ResizeEdge::Right => (
-                    note.start_time,
-                    (note.duration + delta_time as f64).max(0.1),
-                ),
-            };
-
-            // Apply snapping if enabled
-            let (final_start, final_duration) = if self.grid_snap {
-                (
-                    TimeUtils::snap_time(new_start_time, state.project.bpm, state.snap_mode),
-                    TimeUtils::snap_time(new_duration, state.project.bpm, state.snap_mode),
-                )
-            } else {
-                (new_start_time, new_duration)
+                ResizeEdge::Right => {
+                    let proposed_duration = note.duration + delta_time as f64;
+                    let new_duration = if self.grid_snap {
+                        TimeUtils::snap_time(proposed_duration, state.project.bpm, state.snap_mode)
+                    } else {
+                        proposed_duration
+                    };
+                    (note.start_time, new_duration.max(0.1))
+                }
             };
 
             self.command_collector.add_command(DawCommand::ResizeNote {
                 clip_id: clip_id.to_string(),
                 note_id: note.id.clone(),
-                new_start_time: final_start,
-                new_duration: final_duration,
+                new_start_time,
+                new_duration,
             });
-        }
-
-        if left_response.drag_stopped() || right_response.drag_stopped() {
-            self.dragging = None;
         }
 
         // Update cursor
@@ -645,7 +614,6 @@ impl PianoRoll {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
         }
     }
-
     fn handle_note_interaction(
         &mut self,
         ui: &mut egui::Ui,
