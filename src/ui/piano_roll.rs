@@ -577,27 +577,39 @@ impl PianoRoll {
             // Calculate new times based on the delta
             let (new_start_time, new_duration) = match edge {
                 ResizeEdge::Left => {
+                    let note_end = note.start_time + note.duration;
                     let proposed_start = note.start_time - delta_time as f64;
+
+                    // Clamp the start time to not go beyond the note end
                     let new_start = if self.grid_snap {
-                        TimeUtils::snap_time(proposed_start, state.project.bpm, state.snap_mode)
+                        TimeUtils::snap_time(
+                            proposed_start.min(note_end - 0.1),
+                            state.project.bpm,
+                            state.snap_mode,
+                        )
                     } else {
-                        proposed_start
+                        proposed_start.min(note_end - 0.1)
                     };
 
-                    // Calculate new duration by preserving the end time
-                    let note_end = note.start_time + note.duration;
-                    let new_duration = (note_end - new_start).max(0.1);
-
+                    // Duration is always end - start
+                    let new_duration = note_end - new_start;
                     (new_start, new_duration)
                 }
                 ResizeEdge::Right => {
                     let proposed_duration = note.duration + delta_time as f64;
+
+                    // Clamp the duration to be positive
                     let new_duration = if self.grid_snap {
-                        TimeUtils::snap_time(proposed_duration, state.project.bpm, state.snap_mode)
+                        TimeUtils::snap_time(
+                            proposed_duration.max(0.1),
+                            state.project.bpm,
+                            state.snap_mode,
+                        )
                     } else {
-                        proposed_duration
+                        proposed_duration.max(0.1)
                     };
-                    (note.start_time, new_duration.max(0.1))
+
+                    (note.start_time, new_duration)
                 }
             };
 
@@ -614,6 +626,7 @@ impl PianoRoll {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
         }
     }
+
     fn handle_note_interaction(
         &mut self,
         ui: &mut egui::Ui,
