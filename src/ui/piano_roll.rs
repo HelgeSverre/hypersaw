@@ -281,23 +281,16 @@ impl PianoRoll {
     ) {
         let y = rect.bottom() - (note_number as f32 + 1.0) * self.key_height + self.scroll_y;
 
-        // Calculate key dimensions
+        // Simply adjust width for black keys, always start from left
         let key_width = if is_black {
             self.key_width * 0.6
         } else {
             self.key_width
         };
 
-        // Offset black keys to overlap whites
-        let x_offset = if is_black {
-            -self.key_width * 0.15
-        } else {
-            0.0
-        };
-
         let key_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + x_offset, y),
-            egui::pos2(rect.left() + x_offset + key_width, y + self.key_height),
+            egui::pos2(rect.left(), y),
+            egui::pos2(rect.left() + key_width, y + self.key_height),
         );
 
         // Check if note is currently active
@@ -322,7 +315,7 @@ impl PianoRoll {
             base_color
         };
 
-        // Add key border
+        ui.painter().rect_filled(key_rect, 0.0, color);
         ui.painter().rect_stroke(
             key_rect,
             0.0,
@@ -330,8 +323,6 @@ impl PianoRoll {
             StrokeKind::Outside,
         );
 
-        ui.painter().rect_filled(key_rect, 0.0, color);
-        // Add key response for potential MIDI preview
         let response = ui.allocate_rect(key_rect, egui::Sense::click());
 
         // Draw note name
@@ -342,7 +333,6 @@ impl PianoRoll {
         ];
         let note_name = format!("{}{}", note_names[note as usize], octave);
 
-        // Only show full note name for C notes or when hovering
         if note == 0 || response.hovered() || is_active {
             let text_color = if is_active {
                 if is_black {
@@ -356,7 +346,7 @@ impl PianoRoll {
                 ui.visuals().text_color()
             };
 
-            let text_pos = key_rect.left_center() + egui::vec2(4.0, 0.0);
+            let text_pos = key_rect.center();
             ui.painter().text(
                 text_pos,
                 egui::Align2::CENTER_CENTER,
@@ -364,10 +354,6 @@ impl PianoRoll {
                 FontId::monospace(10.0),
                 text_color,
             );
-        }
-
-        if response.hovered() {
-            // TODO: Preview MIDI note
         }
     }
 
