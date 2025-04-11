@@ -100,7 +100,7 @@ pub struct Track {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TrackType {
-    Midi { channel: u8, device_name: String },
+    Midi { channel: u8, device_name: Option<String> },
     Audio,
 }
 
