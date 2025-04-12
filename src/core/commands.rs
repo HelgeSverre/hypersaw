@@ -177,8 +177,8 @@ impl Command for DawCommand {
                             start_time: *start_time,
                             length: *length,
                             file_path: file_path.clone(),
-                            midi_data: None, // Add this
-                            loaded: false,   // Add this
+                            midi_data: None,
+                            loaded: false,
                         },
                         TrackType::Audio => Clip::Audio {
                             id: Uuid::new_v4().to_string(),

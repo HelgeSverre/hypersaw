@@ -8,6 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+type TrackId = String; // Uuid
+type ClipId = String; // Uuid
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum SnapMode {
     None,
@@ -26,7 +29,7 @@ impl SnapMode {
     pub fn get_division(&self, bpm: f64) -> f64 {
         let beat_duration = 60.0 / bpm; // Duration of one beat in seconds
         match self {
-            SnapMode::None => 0.0,
+            SnapMode::None => beat_duration,
             SnapMode::Bar => beat_duration * 4.0, // Full measure
             SnapMode::Beat => beat_duration,      // Quarter note
             SnapMode::Halfbeat => beat_duration / 2.0, // Eighth note
@@ -59,14 +62,14 @@ impl SnapMode {
 pub enum EditorView {
     Arrangement,
     PianoRoll {
-        clip_id: String,
-        track_id: String,
+        clip_id: ClipId,
+        track_id: TrackId,
         scroll_position: f32,
         vertical_zoom: f32,
     },
     SampleEditor {
-        clip_id: String,
-        track_id: String,
+        clip_id: ClipId,
+        track_id: TrackId,
         zoom_level: f32,
     },
 }
@@ -95,20 +98,25 @@ pub struct Track {
     pub clips: Vec<Clip>,
     pub is_muted: bool,
     pub is_soloed: bool,
+    // TODO: color
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TrackType {
-    Midi { channel: u8, device_name: Option<String> },
+    Midi {
+        channel: u8,
+        device_name: Option<String>,
+    },
     Audio,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum Clip {
+    // TODO: color
     Midi {
-        id: String,
+        id: ClipId,
         start_time: f64,
         length: f64,
         file_path: PathBuf,
@@ -116,7 +124,7 @@ pub enum Clip {
         loaded: bool,
     },
     Audio {
-        id: String,
+        id: ClipId,
         start_time: f64,
         length: f64,
         file_path: PathBuf, // Relative to project directory
@@ -301,6 +309,55 @@ impl Project {
         println!("Project loaded successfully.");
         Ok(project)
     }
+
+    pub fn create_midi_track_from_file_path(
+        &mut self,
+        file_path: &Path,
+    ) -> Result<TrackId, Box<dyn Error>> {
+        let mut clip = Clip::Midi {
+            id: Uuid::new_v4().to_string(),
+            start_time: 0.0,
+            length: 0.0,
+            file_path: file_path.to_path_buf(),
+            midi_data: None,
+            loaded: false,
+        };
+
+        // Load the MIDI data
+        if let Err(e) = clip.load_midi() {
+            return Err(format!("Failed to load MIDI file {}: {}", file_path.display(), e).into());
+        }
+
+        // Extract file name for track name
+        let mid_name = file_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Unnamed MIDI".to_string());
+
+        // Create track with the loaded clip
+        let track_id = Uuid::new_v4().to_string();
+        let track = Track {
+            id: track_id.clone(),
+            name: format!(
+                "{} - {}",
+                self.tracks.len() + 1,
+                mid_name.trim_end_matches(".mid")
+            ),
+            track_type: TrackType::Midi {
+                channel: 1,
+                device_name: None,
+            },
+            clips: vec![clip],
+            is_muted: false,
+            is_soloed: false,
+        };
+
+        // Add the track to the project
+        self.tracks.push(track);
+
+        // Return the new track ID
+        Ok(track_id)
+    }
 }
 
 // Helper function to copy a file to the project directory and return the relative path
@@ -314,13 +371,14 @@ fn copy_to_project_dir(source_path: &Path, target_dir: &Path) -> Result<PathBuf,
         .ok_or_else(|| "Invalid source path: Missing file name")?;
 
     // Generate unique filename to avoid conflicts
+    // Example: "myfile_123e4567-e89b-12d3-a456-426614174000.mid"
     let unique_name = format!(
         "{}_{}.{}",
         source_path
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy(),
-        Uuid::new_v4().to_string().split('-').next().unwrap(),
+        Uuid::new_v4().to_string(),
         source_path
             .extension()
             .unwrap_or_default()
