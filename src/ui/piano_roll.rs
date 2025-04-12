@@ -88,6 +88,7 @@ impl PianoRoll {
             clip_id, track_id, ..
         } = &state.current_view
         {
+            // TODO: move into the project.rs - track struct
             // Load MIDI data if needed
             if let Some(track) = state.project.tracks.iter_mut().find(|t| &t.id == track_id) {
                 if let Some(clip @ Clip::Midi { loaded: false, .. }) = track
@@ -144,6 +145,16 @@ impl PianoRoll {
                 let new_scroll_y = (self.scroll_y + delta.y).max(0.0);
                 self.scroll_y =
                     new_scroll_y.clamp(0.0, self.get_total_height() - self.viewport_height);
+            }
+
+            // If pressing delete, delete selected notes
+
+            if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+                self.command_collector.add_command(DawCommand::DeleteNotes {
+                    clip_id: clip_id.to_string(),
+                    note_ids: self.selected_notes.clone(),
+                });
+                self.selected_notes.clear();
             }
 
             // Auto-scroll to follow playhead if it's outside view
@@ -252,7 +263,7 @@ impl PianoRoll {
 
         // Draw background for piano keys
         ui.painter()
-            .rect_filled(keys_rect, 0.0, ui.visuals().extreme_bg_color);
+            .rect_filled(keys_rect, 0.0, ui.visuals().window_fill);
 
         // Draw white keys first
         for note_number in visible_notes.clone() {
