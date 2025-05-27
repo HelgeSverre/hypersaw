@@ -41,7 +41,7 @@ impl SupersawApp {
         match action {
             KeyAction::TogglePlay => {
                 if let Err(e) = self.command_manager.execute(
-                    if self.state.playing {
+                    if self.state.transport.is_playing() {
                         DawCommand::PausePlayback
                     } else {
                         DawCommand::StartPlayback
@@ -188,30 +188,38 @@ impl SupersawApp {
 
             // Play/Stop button
             if ui
-                .button(if self.state.playing { "⏹" } else { "▶" })
+                .button(if self.state.transport.is_playing() {
+                    "⏹"
+                } else {
+                    "▶"
+                })
                 .clicked()
             {
-                self.state.playing = !self.state.playing;
-                if self.state.playing {
-                    self.state.last_update = Some(std::time::Instant::now());
+                if let Err(e) = self.command_manager.execute(
+                    if self.state.transport.is_playing() {
+                        DawCommand::PausePlayback
+                    } else {
+                        DawCommand::StartPlayback
+                    },
+                    &mut self.state,
+                ) {
+                    eprintln!("Failed to toggle playback: {}", e);
+                    self.state
+                        .status
+                        .error(format!("Failed to toggle playback: {}", e));
                 }
             }
 
             if ui.button("⏮").clicked() {
-                // Return to start
-                self.state.current_time = 0.0;
+                self.state.transport.seek_to(0.0);
             }
 
             // Toggle metronome
             if ui.button("M").clicked() {
-                if let Err(e) = self.command_manager.execute(
-                    if self.state.metronome {
-                        DawCommand::DisableMetronome
-                    } else {
-                        DawCommand::EnableMetronome
-                    },
-                    &mut self.state,
-                ) {
+                if let Err(e) = self
+                    .command_manager
+                    .execute(DawCommand::ToggleMetronome, &mut self.state)
+                {
                     self.state
                         .status
                         .error(format!("Failed to toggle metronome: {}", e));
@@ -228,6 +236,13 @@ impl SupersawApp {
 
             for (label, delta) in [("−", -1.0), ("+", 1.0)] {
                 if ui.button(label).clicked() {
+                    // Modifier * 10 increment
+                    let delta = if ui.input(|i| i.modifiers.shift) {
+                        delta * 10.0
+                    } else {
+                        delta
+                    };
+
                     if let Err(e) = self.command_manager.execute(
                         DawCommand::SetBpm {
                             bpm: self.state.project.bpm + delta,
@@ -275,34 +290,30 @@ impl SupersawApp {
             ui.separator();
 
             // Display formatted time
-            let minutes = (self.state.current_time / 60.0).floor();
-            let seconds = (self.state.current_time % 60.0).floor();
-            let frames = ((self.state.current_time % 1.0) * 30.0).floor(); // Assuming 30fps
+            let minutes = (self.state.transport.get_position() / 60.0).floor();
+            let seconds = (self.state.transport.get_position() % 60.0).floor();
+            let frames = ((self.state.transport.get_position() % 1.0) * 30.0).floor(); // Assuming 30fps
             ui.label(format!("{:02}:{:02}:{:02}", minutes, seconds, frames));
 
             ui.separator();
 
-            let mut loop_enabled = self.state.loop_enabled;
+            let mut loop_enabled = self.state.transport.is_loop_enabled();
             if ui.toggle_value(&mut loop_enabled, "⟲").clicked() {
-                self.state.loop_enabled = loop_enabled;
+                self.state.transport.set_loop_enabled(loop_enabled);
             }
             if ui.button("Set Start").clicked() {
-                self.state.loop_start = self.state.current_time;
+                self.state.transport.set_loop_start_to_current_time();
             }
             if ui.button("Set End").clicked() {
-                self.state.loop_end = self.state.current_time;
+                self.state.transport.set_loop_end_to_current_time();
             }
 
-            let loop_range = format!(
-                "{:.1}s - {:.1}s",
-                self.state.loop_start, self.state.loop_end
-            );
-            ui.label(loop_range);
+            ui.label(self.state.transport.get_loop_region().formatted());
 
             ui.separator();
 
-            if ui.button("Arrangement").clicked() {
-                self.state.current_view = EditorView::Arrangement;
+            if ui.button("Timeline").clicked() {
+                self.state.current_view = EditorView::Timeline;
             }
         });
     }
@@ -563,47 +574,47 @@ enum KeyAction {
 
 impl eframe::App for SupersawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.state.update_playhead();
+        self.state.transport.on_ui_synced();
 
         // Send MIDI events during playback
-        if self.state.playing {
-            // Get all MIDI events for the current time step
-            let lookahead = 0.01;
-            let start_time = self.state.current_time;
-            let end_time = self.state.current_time + lookahead;
-
-            let events = self
-                .state
-                .project
-                .get_all_events_in_time_range(start_time, end_time);
-
-            for (track_id, event) in events {
-                // Find the track for this event
-                if let Some(track) = self.state.project.tracks.iter().find(|t| t.id == track_id) {
-                    // If it's a MIDI track, send the event
-                    if let TrackType::Midi {
-                        channel,
-                        device_name,
-                    } = &track.track_type
-                    {
-                        if let Some(device) = device_name {
-                            if !device.is_empty() && !track.is_muted {
-                                // Check if track is soloed, or if no tracks are soloed
-                                let any_soloed =
-                                    self.state.project.tracks.iter().any(|t| t.is_soloed);
-                                if !any_soloed || track.is_soloed {
-                                    if let Err(e) = self.send_midi_message(*channel, &event.message)
-                                    {
-                                        // Log the error, but don't show in UI to avoid spam
-                                        eprintln!("Failed to send MIDI message: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // if self.state.transport.is_playing() {
+        //     // Get all MIDI events for the current time step
+        //     let lookahead = 0.01;
+        //     let start_time = self.state.transport.get_position();
+        //     let end_time = self.state.transport.get_position() + lookahead;
+        //
+        //     let events = self
+        //         .state
+        //         .project
+        //         .get_all_events_in_time_range(start_time, end_time);
+        //
+        //     for (track_id, event) in events {
+        //         // Find the track for this event
+        //         if let Some(track) = self.state.project.tracks.iter().find(|t| t.id == track_id) {
+        //             // If it's a MIDI track, send the event
+        //             if let TrackType::Midi {
+        //                 channel,
+        //                 device_name,
+        //             } = &track.track_type
+        //             {
+        //                 if let Some(device) = device_name {
+        //                     if !device.is_empty() && !track.is_muted {
+        //                         // Check if track is soloed, or if no tracks are soloed
+        //                         let any_soloed =
+        //                             self.state.project.tracks.iter().any(|t| t.is_soloed);
+        //                         if !any_soloed || track.is_soloed {
+        //                             if let Err(e) = self.send_midi_message(*channel, &event.message)
+        //                             {
+        //                                 // Log the error, but don't show in UI to avoid spam
+        //                                 eprintln!("Failed to send MIDI message: {}", e);
+        //                             }
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
 
         // Keyboard shortcuts
         // SAVE -  Ctrl + S
@@ -689,7 +700,7 @@ impl eframe::App for SupersawApp {
 
         // Draw the main content area
         egui::CentralPanel::default().show(ctx, |ui| match &self.state.current_view {
-            EditorView::Arrangement => {
+            EditorView::Timeline => {
                 let commands = self.timeline.show(ui, &mut self.state);
                 for command in commands {
                     if let Err(e) = self.command_manager.execute(command, &mut self.state) {
@@ -795,7 +806,7 @@ impl eframe::App for SupersawApp {
         // self.update_channel_strips(ctx);
 
         // Request continuous repaints while playing
-        if self.state.playing {
+        if self.state.transport.is_playing() {
             ctx.request_repaint();
         }
     }

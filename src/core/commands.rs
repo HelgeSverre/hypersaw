@@ -1,11 +1,9 @@
-// src/core/commands.rs
 use super::*;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 pub trait Command {
     fn execute(&self, state: &mut DawState) -> Result<(), Box<dyn std::error::Error>>;
-    fn undo(&self, state: &mut DawState) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &'static str;
 }
 
@@ -83,6 +81,7 @@ pub enum DawCommand {
     // Transport
     EnableMetronome,
     DisableMetronome,
+    ToggleMetronome,
     SetBpm {
         bpm: f64,
     },
@@ -110,14 +109,8 @@ impl Command for DawCommand {
                 Ok(())
             }
             DawCommand::SeekTime { time } => {
-                if state.loop_enabled {
-                    // If we seeked outside the loop, disable the loop
-                    if *time < state.loop_start || *time > state.loop_end {
-                        state.loop_enabled = false;
-                    }
-                }
+                state.transport.seek_to(*time);
 
-                state.current_time = *time;
                 Ok(())
             }
             DawCommand::OpenPianoRoll { clip_id, track_id } => {
@@ -188,7 +181,6 @@ impl Command for DawCommand {
                             start_offset: 0.0,
                             end_offset: *length,
                         },
-                        _ => return Err("Invalid track type for clip".into()),
                     };
                     track.clips.push(clip);
                 }
@@ -251,6 +243,17 @@ impl Command for DawCommand {
                 state.status.info("Metronome enabled".to_string());
                 Ok(())
             }
+            DawCommand::ToggleMetronome => {
+                if state.metronome {
+                    state.metronome = false;
+                    state.status.info("Metronome disabled".to_string());
+                } else {
+                    state.metronome = true;
+                    state.status.info("Metronome enabled".to_string());
+                }
+
+                Ok(())
+            }
             DawCommand::DisableMetronome => {
                 state.metronome = false;
                 state.status.info("Metronome disabled".to_string());
@@ -258,23 +261,23 @@ impl Command for DawCommand {
             }
             DawCommand::SetBpm { bpm } => {
                 state.project.bpm = *bpm;
+                state.transport.set_bpm(*bpm);
                 state.status.info(format!("BPM set to: {}", bpm));
                 Ok(())
             }
             DawCommand::StopPlayback => {
-                state.playing = false;
-                state.current_time = 0.0;
+                state.stop_playback();
                 Ok(())
             }
 
             DawCommand::StartPlayback => {
-                state.playing = true;
+                state.start_playback();
 
                 Ok(())
             }
 
             DawCommand::PausePlayback => {
-                state.playing = false;
+                state.stop_playback();
 
                 Ok(())
             }
@@ -375,12 +378,6 @@ impl Command for DawCommand {
         }
     }
 
-    fn undo(&self, state: &mut DawState) -> Result<(), Box<dyn std::error::Error>> {
-        // TODO: Implement undo for each command
-        // Will need to store previous state information
-        Ok(())
-    }
-
     fn name(&self) -> &'static str {
         match self {
             DawCommand::ResizeNote { .. } => "Resize Note",
@@ -399,6 +396,7 @@ impl Command for DawCommand {
             DawCommand::MoveClip { .. } => "Move Clip",
             DawCommand::ResizeClip { .. } => "Resize Clip",
             DawCommand::NoOp => "NoOp",
+            DawCommand::ToggleMetronome { .. } => "Toggle Metronome",
             DawCommand::EnableMetronome { .. } => "Enable Metronome",
             DawCommand::DisableMetronome => "Disable Metronome",
             DawCommand::SetBpm { .. } => "Set BPM",

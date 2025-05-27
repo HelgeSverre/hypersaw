@@ -129,7 +129,7 @@ impl PianoRoll {
             self.draw_piano_keys(ui, rect, state, clip_id, track_id);
 
             // Draw playhead after everything else
-            self.draw_playhead(ui, rect, clip_start, state.current_time);
+            self.draw_playhead(ui, rect, clip_start, state.transport.get_position());
 
             // Handle zoom and scrolling
             self.handle_zoom(ui, rect);
@@ -148,7 +148,6 @@ impl PianoRoll {
             }
 
             // If pressing delete, delete selected notes
-
             if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
                 self.command_collector.add_command(DawCommand::DeleteNotes {
                     clip_id: clip_id.to_string(),
@@ -156,9 +155,6 @@ impl PianoRoll {
                 });
                 self.selected_notes.clear();
             }
-
-            // Auto-scroll to follow playhead if it's outside view
-            // self.handle_playhead_autoscroll(rect, clip_start, state.current_time);
         }
 
         self.command_collector.take_commands()
@@ -259,7 +255,8 @@ impl PianoRoll {
         let visible_notes = start_note..=end_note;
 
         // Get currently active notes
-        let active_notes = self.get_active_notes(state, clip_id, track_id, state.current_time);
+        let active_notes =
+            self.get_active_notes(state, clip_id, track_id, state.transport.get_position());
 
         // Draw background for piano keys
         ui.painter()
@@ -768,16 +765,6 @@ impl PianoRoll {
 
     fn get_total_height(&self) -> f32 {
         (DEFAULT_OCTAVES * NOTES_PER_OCTAVE) as f32 * self.key_height
-    }
-
-    //todo move into utils/midi module
-    fn get_note_name(note_number: i32) -> String {
-        let note_names = [
-            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-        ];
-        let octave = (note_number / 12) - 1;
-        let note = note_number % 12;
-        format!("{}{}", note_names[note as usize], octave)
     }
 
     fn center_on_middle_c(&mut self, viewport_height: f32) {

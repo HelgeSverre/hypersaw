@@ -1,16 +1,20 @@
 mod command_manager;
 mod commands;
 mod midi;
+mod midi_scheduler;
 mod plugins;
 mod project;
 mod state;
 mod status;
+mod transport;
 mod utils;
 
 pub use command_manager::*;
 pub use commands::*;
 pub use midi::*;
+pub use midi_scheduler::*;
 pub use project::*;
 pub use state::*;
 pub use status::*;
+pub use transport::*;
 pub use utils::*;

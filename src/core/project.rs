@@ -11,6 +11,7 @@ use uuid::Uuid;
 type TrackId = String; // Uuid
 type ClipId = String; // Uuid
 
+// TODO: rename : Quantization
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum SnapMode {
     None,
@@ -29,7 +30,9 @@ impl SnapMode {
     pub fn get_division(&self, bpm: f64) -> f64 {
         let beat_duration = 60.0 / bpm; // Duration of one beat in seconds
         match self {
+            // TODO: Currently we are using this for both snap and grid line rendering, so none will create "infinite lines"  of subdiision, add a enum for display time divisons
             SnapMode::None => beat_duration,
+                                             // snap to the gri
             SnapMode::Bar => beat_duration * 4.0, // Full measure
             SnapMode::Beat => beat_duration,      // Quarter note
             SnapMode::Halfbeat => beat_duration / 2.0, // Eighth note
@@ -60,7 +63,7 @@ impl SnapMode {
 
 #[derive(Debug, Clone)]
 pub enum EditorView {
-    Arrangement,
+    Timeline,
     PianoRoll {
         clip_id: ClipId,
         track_id: TrackId,
@@ -76,7 +79,7 @@ pub enum EditorView {
 
 impl Default for EditorView {
     fn default() -> Self {
-        Self::Arrangement
+        Self::Timeline
     }
 }
 
@@ -338,11 +341,7 @@ impl Project {
         let track_id = Uuid::new_v4().to_string();
         let track = Track {
             id: track_id.clone(),
-            name: format!(
-                "{} - {}",
-                self.tracks.len() + 1,
-                mid_name.trim_end_matches(".mid")
-            ),
+            name: format!("Track {} - {}", self.tracks.len() + 1, mid_name),
             track_type: TrackType::Midi {
                 channel: 1,
                 device_name: None,

@@ -10,7 +10,7 @@ use uuid::Uuid;
 // Unique identifier for MIDI notes and events
 pub type EventID = String;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd)]
 pub enum MidiMessage {
     // Note messages
     NoteOn {
@@ -323,11 +323,11 @@ impl MidiEventStore {
         };
 
         let mut store = MidiEventStore::new(ppq);
-        let mut running_tick = 0;
 
         // Process each track
         for track in smf.tracks {
-            running_tick = 0;
+            let mut running_tick = 0;
+
             let mut active_notes: HashMap<(u8, u8), (EventID, u32, u8)> = HashMap::new(); // (channel, key) -> (id, start_tick, velocity)
 
             for event in track {

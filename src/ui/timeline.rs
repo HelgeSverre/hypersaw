@@ -234,11 +234,13 @@ impl Timeline {
     }
 
     fn handle_loop_region(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &mut DawState) {
-        if state.loop_enabled {
-            let loop_start_x =
-                rect.left() + state.loop_start as f32 * self.pixels_per_second - self.scroll_offset;
-            let loop_end_x =
-                rect.left() + state.loop_end as f32 * self.pixels_per_second - self.scroll_offset;
+        if state.transport.is_loop_enabled() {
+            let loop_start_x = rect.left()
+                + state.transport.get_loop_region().start as f32 * self.pixels_per_second
+                - self.scroll_offset;
+            let loop_end_x = rect.left()
+                + state.transport.get_loop_region().end as f32 * self.pixels_per_second
+                - self.scroll_offset;
 
             let loop_rect = egui::Rect::from_min_max(
                 egui::pos2(loop_start_x, rect.top()),
@@ -293,15 +295,15 @@ impl Timeline {
 
                 let new_start_snap = if self.snap_enabled {
                     TimeUtils::snap_time(
-                        (state.loop_start + delta as f64).max(0.0),
+                        (state.transport.get_loop_region().start + delta as f64).max(0.0),
                         state.project.bpm,
                         state.snap_mode,
                     )
                 } else {
-                    (state.loop_start + delta as f64).max(0.0)
+                    (state.transport.get_loop_region().start + delta as f64).max(0.0)
                 };
 
-                state.loop_start = new_start_snap;
+                state.transport.get_loop_region().start = new_start_snap;
             }
 
             // Handle end handle dragging
@@ -309,15 +311,17 @@ impl Timeline {
                 let delta = end_response.drag_delta().x / self.pixels_per_second;
                 let new_end_snap = if self.snap_enabled {
                     TimeUtils::snap_time(
-                        (state.loop_end + delta as f64).max(state.loop_start + 0.1),
+                        (state.transport.get_loop_region().end + delta as f64)
+                            .max(state.transport.get_loop_region().start + 0.1),
                         state.project.bpm,
                         state.snap_mode,
                     )
                 } else {
-                    (state.loop_end + delta as f64).max(state.loop_start + 0.1)
+                    (state.transport.get_loop_region().end + delta as f64)
+                        .max(state.transport.get_loop_region().start + 0.1)
                 };
 
-                state.loop_end = new_end_snap;
+                state.transport.get_loop_region().end = new_end_snap;
             }
 
             // Show cursor change when hovering over loop handles
@@ -344,7 +348,7 @@ impl Timeline {
         if response.dragged() {
             if let Some(pos) = response.hover_pos() {
                 // todo: cleanup this so we dont get accelleration and jumping when seeking
-                if !state.playing {
+                if !state.transport.is_playing() {
                     if pos.x < rect.left() + EDGE_SCROLL_MARGIN {
                         self.scroll_offset = self.scroll_offset - EDGE_SCROLL_SPEED;
                     } else if pos.x > rect.right() - EDGE_SCROLL_MARGIN {
@@ -688,13 +692,13 @@ impl Timeline {
     }
 
     fn draw_playhead(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
-        let playhead_x = state.current_time * self.pixels_per_second as f64;
+        let playhead_x = state.transport.get_position() * self.pixels_per_second as f64;
         let visible_width = rect.width() as f64;
         let visible_width_threshold = visible_width * 0.8;
 
         let playhead_position = playhead_x - self.scroll_offset as f64;
 
-        if state.playing {
+        if state.transport.is_playing() {
             if playhead_position > visible_width * 0.8 {
                 self.scroll_offset = (playhead_x - visible_width_threshold) as f32;
             } else if playhead_position < visible_width_threshold {

@@ -124,9 +124,9 @@ impl CommandManager {
                 self.state_snapshots.remove(0);
             }
 
-            let snapshot = StateSnapshot::from_state(state.clone());
-            self.last_snapshot_time = now;
-            self.state_snapshots.push(snapshot);
+            // let snapshot = StateSnapshot::from_state(state.clone());
+            // self.last_snapshot_time = now;
+            // self.state_snapshots.push(snapshot);
         }
     }
 }
