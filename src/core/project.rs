@@ -98,7 +98,8 @@ pub struct Track {
     pub clips: Vec<Clip>,
     pub is_muted: bool,
     pub is_soloed: bool,
-    // TODO: color
+    pub is_armed: bool,
+    pub color: String, // Hex color like "#fde047"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +351,8 @@ impl Project {
             clips: vec![clip],
             is_muted: false,
             is_soloed: false,
+            is_armed: false,
+            color: "#fde047".to_string(), // Default yellow
         };
 
         // Add the track to the project

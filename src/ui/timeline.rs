@@ -1,8 +1,8 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
-use crate::core::*;
 use crate::core::utils::SnapHandler;
+use crate::core::*;
 use eframe::egui;
 use eframe::epaint::StrokeKind;
 
@@ -45,36 +45,62 @@ impl Timeline {
     pub fn update_midi_ports(&mut self, ports: Vec<String>) {
         self.midi_ports = ports;
     }
-    
+
+    fn get_color_palette() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("White", "#ffffff"),
+            ("Black", "#000000"),
+            ("Gray", "#3F3F46"),
+            ("Red", "#fca5a5"),
+            ("Orange", "#fdba74"),
+            ("Amber", "#fcd34d"),
+            ("Yellow", "#fde047"),
+            ("Lime", "#bef264"),
+            ("Green", "#86efac"),
+            ("Emerald", "#6ee7b7"),
+            ("Teal", "#5eead4"),
+            ("Cyan", "#67e8f9"),
+            ("Sky", "#7dd3fc"),
+            ("Blue", "#93c5fd"),
+            ("Indigo", "#a5b4fc"),
+            ("Violet", "#c4b5fd"),
+            ("Purple", "#d8b4fe"),
+            ("Fuchsia", "#f0abfc"),
+            ("Pink", "#f9a8d4"),
+            ("Rose", "#fda4af"),
+        ]
+    }
+
     pub fn take_pending_midi_connections(&mut self) -> Vec<(String, String)> {
         std::mem::take(&mut self.pending_midi_connections)
     }
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) -> Vec<DawCommand> {
-        let (full_rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
-        
+        let (full_rect, response) =
+            ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+
         let ruler_height = 20.0;
-        
+
         // Split into regions
         let header_width = self.track_header_width;
-        
+
         // Header area (left side, below ruler)
         let header_rect = egui::Rect::from_min_size(
             egui::pos2(full_rect.left(), full_rect.top() + ruler_height),
             egui::vec2(header_width, full_rect.height() - ruler_height),
         );
-        
+
         // Timeline area (right side, including ruler)
         let timeline_rect = egui::Rect::from_min_size(
             egui::pos2(full_rect.left() + header_width, full_rect.top()),
             egui::vec2(full_rect.width() - header_width, full_rect.height()),
         );
-        
+
         // Tracks area (timeline minus ruler)
         let tracks_rect = egui::Rect::from_min_size(
             egui::pos2(timeline_rect.left(), timeline_rect.top() + ruler_height),
             egui::vec2(timeline_rect.width(), timeline_rect.height() - ruler_height),
         );
-        
+
         // Ruler area (only above timeline)
         let ruler_rect = egui::Rect::from_min_size(
             timeline_rect.min,
@@ -84,7 +110,7 @@ impl Timeline {
         // Draw timeline background and grid
         self.draw_background(ui, tracks_rect);
         self.draw_grid(ui, tracks_rect, state);
-        
+
         // Handle interactions
         self.handle_zooming(ui, timeline_rect);
         self.handle_scrolling(ui, &response);
@@ -293,7 +319,7 @@ impl Timeline {
             }
         }
     }
-    
+
     fn handle_escape_key(&mut self, ui: &mut egui::Ui) {
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.command_collector.add_command(DawCommand::DeselectAll);
@@ -398,7 +424,7 @@ impl Timeline {
         // Store and set the clip rect for ruler area
         let original_clip_rect = ui.clip_rect();
         ui.set_clip_rect(rect);
-        
+
         // Fill the ruler background to prevent grid line bleeding
         let ruler_bg_color = ui.visuals().extreme_bg_color.linear_multiply(1.2);
         ui.painter().rect_filled(rect, 0.0, ruler_bg_color);
@@ -453,10 +479,7 @@ impl Timeline {
 
             // Draw major marker
             ui.painter().line_segment(
-                [
-                    egui::pos2(x, rect.top()),
-                    egui::pos2(x, rect.bottom()),
-                ],
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                 (1.0, ui.visuals().text_color()),
             );
 
@@ -475,19 +498,20 @@ impl Timeline {
                 ui.visuals().text_color(),
             );
         }
-        
+
         // Restore original clip rect
         ui.set_clip_rect(original_clip_rect);
     }
 
     fn draw_track_headers(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
         // Draw header background
-        ui.painter().rect_filled(rect, 0.0, ui.visuals().window_fill);
-        
+        ui.painter()
+            .rect_filled(rect, 0.0, ui.visuals().window_fill);
+
         // Store original clip rect and set header clip rect
         let original_clip_rect = ui.clip_rect();
         ui.set_clip_rect(rect);
-        
+
         // Draw track headers manually with scroll offset
         for (track_idx, track) in state.project.tracks.iter().enumerate() {
             let track_top = rect.top() + (track_idx as f32 * self.track_height) - self.scroll_y;
@@ -495,41 +519,48 @@ impl Timeline {
                 egui::pos2(rect.left(), track_top),
                 egui::vec2(rect.width(), self.track_height),
             );
-            
+
             // Skip if not visible
             if track_rect.bottom() < rect.top() || track_rect.top() > rect.bottom() {
                 continue;
             }
-            
+
             // Draw track header
             self.draw_track_header(ui, track_rect, track, track_idx, state);
         }
-        
+
         // Draw "Add Track" button at the bottom
         let total_height = state.project.tracks.len() as f32 * self.track_height;
         let add_track_y = rect.top() + total_height - self.scroll_y;
-        if add_track_y > rect.top() && add_track_y < rect.bottom() {
-            let button_rect = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + 10.0, add_track_y + 10.0),
-                egui::vec2(rect.width() - 20.0, 30.0),
-            );
-            
+
+        // Always show the button, even when there are no tracks
+        let button_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 10.0, add_track_y.max(rect.top()) + 10.0),
+            egui::vec2(rect.width() - 20.0, 30.0),
+        );
+
+        // Only draw if button is within visible area
+        if button_rect.bottom() > rect.top() && button_rect.top() < rect.bottom() {
             let response = ui.allocate_rect(button_rect, egui::Sense::click());
             if response.clicked() {
                 self.command_collector.add_command(DawCommand::AddTrack {
-                    track_type: TrackType::Midi { channel: 1, device_name: None },
+                    track_type: TrackType::Midi {
+                        channel: 1,
+                        device_name: None,
+                    },
                     name: format!("Track {}", state.project.tracks.len() + 1),
                 });
             }
-            
+
             // Draw button
             let style = if response.hovered() {
                 ui.visuals().widgets.hovered
             } else {
                 ui.visuals().widgets.inactive
             };
-            
-            ui.painter().rect_filled(button_rect, 4.0, style.weak_bg_fill);
+
+            ui.painter()
+                .rect_filled(button_rect, 4.0, style.weak_bg_fill);
             ui.painter().text(
                 button_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -538,11 +569,11 @@ impl Timeline {
                 style.text_color(),
             );
         }
-        
+
         // Restore original clip rect
         ui.set_clip_rect(original_clip_rect);
     }
-    
+
     fn draw_track_header(
         &mut self,
         ui: &mut egui::Ui,
@@ -552,7 +583,7 @@ impl Timeline {
         state: &DawState,
     ) {
         let is_selected = state.selected_track == Some(track.id.clone());
-        
+
         // Draw background
         let bg_color = if is_selected {
             ui.visuals().selection.bg_fill
@@ -561,159 +592,261 @@ impl Timeline {
         } else {
             ui.visuals().extreme_bg_color
         };
-        
+
         ui.painter().rect_filled(rect, 0.0, bg_color);
-        
+
+        // Draw track color stripe on the left (like Bitwig)
+        let stripe_rect = egui::Rect::from_min_size(rect.min, egui::vec2(4.0, rect.height()));
+        let track_color =
+            hex_to_color32(&track.color).unwrap_or(egui::Color32::from_rgb(253, 224, 71)); // Default yellow
+        ui.painter().rect_filled(stripe_rect, 0.0, track_color);
+
         // Draw separator line at bottom
         ui.painter().line_segment(
             [rect.left_bottom(), rect.right_bottom()],
             (1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
-        
+
         // Draw right border to separate from timeline
         ui.painter().line_segment(
             [rect.right_top(), rect.right_bottom()],
             (1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
-        
-        // Content area with padding
-        let content_rect = rect.shrink(4.0);
+
+        // Content area with padding (accounting for color stripe)
+        let content_rect = egui::Rect::from_min_size(
+            rect.min + egui::vec2(10.0, 6.0),
+            egui::vec2(rect.width() - 16.0, rect.height() - 12.0),
+        );
+
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
             ui.vertical(|ui| {
-                // First row: Track info and controls
+                ui.spacing_mut().item_spacing.y = 4.0;
+
+                // First row: Track name and controls
                 ui.horizontal(|ui| {
-                    // Track number with icon
-                    let track_icon = match &track.track_type {
-                        TrackType::Midi { .. } => "🎹",
-                        TrackType::Audio => "🎵",
-                    };
-                    
-                    ui.label(
-                        egui::RichText::new(format!("{:02} {}", index + 1, track_icon))
-                            .monospace()
-                            .size(11.0)
-                            .color(ui.visuals().text_color().linear_multiply(0.6))
-                    );
-                    
-                    // Mute and Solo buttons
-                    let mute_button = egui::Button::new("M").small();
-                    let mute_button = if track.is_muted {
-                        mute_button.fill(egui::Color32::from_rgb(180, 60, 60))
-                    } else {
-                        mute_button
-                    };
-                    
-                    if ui.add(mute_button).clicked() {
-                        if track.is_muted {
-                            self.command_collector.add_command(DawCommand::UnmuteTrack {
-                                track_id: track.id.clone(),
-                            });
-                        } else {
-                            self.command_collector.add_command(DawCommand::MuteTrack {
-                                track_id: track.id.clone(),
-                            });
-                        }
-                    }
-                    
-                    let solo_button = egui::Button::new("S").small();
-                    let solo_button = if track.is_soloed {
-                        solo_button.fill(egui::Color32::from_rgb(180, 180, 60))
-                    } else {
-                        solo_button
-                    };
-                    
-                    if ui.add(solo_button).clicked() {
-                        if track.is_soloed {
-                            self.command_collector.add_command(DawCommand::UnsoloTrack {
-                                track_id: track.id.clone(),
-                            });
-                        } else {
-                            self.command_collector.add_command(DawCommand::SoloTrack {
-                                track_id: track.id.clone(),
-                            });
-                        }
-                    }
-                });
-                
-                // Second row: Track name
-                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+
+                    // Track name (clickable for selection)
                     let name_response = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&track.name)
-                                .size(12.0)
-                        )
-                        .sense(egui::Sense::click())
+                        egui::Label::new(egui::RichText::new(&track.name).size(13.0))
+                            .sense(egui::Sense::click()),
                     );
-                    
+
                     if name_response.clicked() {
                         self.command_collector.add_command(DawCommand::SelectTrack {
                             track_id: track.id.clone(),
                         });
                     }
-                });
-                
-                // Third row: Track-specific controls
-                if self.track_height > 60.0 {
-                    match &track.track_type {
-                        TrackType::Midi { channel, device_name } => {
-                            ui.horizontal(|ui| {
-                                // MIDI channel dropdown
-                                let mut channel_changed = false;
-                                let mut new_channel = *channel;
-                                
-                                egui::ComboBox::new(
-                                    format!("midi_channel_{}", track.id),
-                                    "",
-                                )
-                                .width(40.0)
-                                .selected_text(format!("Ch{}", channel))
-                                .show_ui(ui, |ui| {
-                                    for ch in 1..=16 {
-                                        if ui.selectable_value(&mut new_channel, ch, format!("Ch{}", ch)).clicked() {
-                                            channel_changed = true;
-                                        }
-                                    }
-                                });
-                                
-                                if channel_changed {
-                                    self.command_collector.add_command(DawCommand::SetTrackMidiChannel {
+
+                    // Push buttons to the right
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+
+                        // Menu button
+                        ui.push_id(format!("track_menu_{}", track.id), |ui| {
+                            ui.menu_button("☰", |ui| {
+                                if ui.button("Delete Track").clicked() {
+                                    self.command_collector.add_command(DawCommand::DeleteTrack {
                                         track_id: track.id.clone(),
-                                        channel: new_channel,
+                                    });
+                                    ui.close_menu();
+                                }
+                            })
+                            .response
+                            .on_hover_text("Track Menu");
+                        });
+
+                        // Mute button
+                        ui.push_id(format!("mute_{}", track.id), |ui| {
+                            let mute_button = egui::Button::new("M").small();
+                            let mute_button = if track.is_muted {
+                                mute_button.fill(egui::Color32::from_rgb(180, 60, 60))
+                            } else {
+                                mute_button
+                            };
+
+                            if ui.add(mute_button).on_hover_text("Mute").clicked() {
+                                if track.is_muted {
+                                    self.command_collector.add_command(DawCommand::UnmuteTrack {
+                                        track_id: track.id.clone(),
+                                    });
+                                } else {
+                                    self.command_collector.add_command(DawCommand::MuteTrack {
+                                        track_id: track.id.clone(),
                                     });
                                 }
-                                
+                            }
+                        });
+
+                        // Solo button
+                        ui.push_id(format!("solo_{}", track.id), |ui| {
+                            let solo_button = egui::Button::new("S").small();
+                            let solo_button = if track.is_soloed {
+                                solo_button.fill(egui::Color32::from_rgb(180, 180, 60))
+                            } else {
+                                solo_button
+                            };
+
+                            if ui.add(solo_button).on_hover_text("Solo").clicked() {
+                                if track.is_soloed {
+                                    self.command_collector.add_command(DawCommand::UnsoloTrack {
+                                        track_id: track.id.clone(),
+                                    });
+                                } else {
+                                    self.command_collector.add_command(DawCommand::SoloTrack {
+                                        track_id: track.id.clone(),
+                                    });
+                                }
+                            }
+                        });
+
+                        // Record/Arm button
+                        ui.push_id(format!("arm_{}", track.id), |ui| {
+                            let arm_button = egui::Button::new("R").small();
+                            let arm_button = if track.is_armed {
+                                arm_button.fill(egui::Color32::from_rgb(255, 60, 60))
+                            } else {
+                                arm_button
+                            };
+
+                            if ui.add(arm_button).on_hover_text("Record Arm").clicked() {
+                                if track.is_armed {
+                                    self.command_collector.add_command(DawCommand::UnarmTrack {
+                                        track_id: track.id.clone(),
+                                    });
+                                } else {
+                                    self.command_collector.add_command(DawCommand::ArmTrack {
+                                        track_id: track.id.clone(),
+                                    });
+                                }
+                            }
+                        });
+
+                        // Color picker - use menu_button with space label
+                        let current_color = hex_to_color32(&track.color)
+                            .unwrap_or(egui::Color32::from_rgb(253, 224, 71));
+
+                        ui.push_id(format!("color_menu_{}", track.id), |ui| {
+                            let button_response = ui.menu_button(" ", |ui| {
+                                ui.set_min_width(50.0);
+
+                                let palette = Self::get_color_palette();
+                                for (name, hex) in palette {
+                                    let color = hex_to_color32(hex).unwrap();
+                                    ui.horizontal(|ui| {
+                                        // Color preview
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(16.0, 16.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(rect, 2.0, color);
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            2.0,
+                                            (
+                                                1.0,
+                                                ui.visuals().widgets.noninteractive.bg_stroke.color,
+                                            ),
+                                            StrokeKind::Middle,
+                                        );
+
+                                        let is_selected = track.color == hex;
+                                        if ui.selectable_label(is_selected, name).clicked() {
+                                            self.command_collector.add_command(
+                                                DawCommand::SetTrackColor {
+                                                    track_id: track.id.clone(),
+                                                    color: hex.to_string(),
+                                                },
+                                            );
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+                            });
+
+                            // Draw color indicator on the menu button
+                            let button_rect = button_response.response.rect;
+
+                            let color_rect = button_rect.shrink(3.0);
+                            ui.painter().rect_filled(color_rect, 2.0, current_color);
+
+                            button_response.response.on_hover_text("Track Color");
+                        });
+                    });
+                });
+
+                // Second row for MIDI settings if track is tall enough
+                if self.track_height > 70.0 {
+                    match &track.track_type {
+                        TrackType::Midi {
+                            channel,
+                            device_name,
+                        } => {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+
                                 // MIDI port dropdown
                                 let display_text = match device_name {
                                     Some(dev) if !dev.is_empty() => dev.as_str(),
-                                    _ => "None",
+                                    _ => "No Device",
                                 };
-                                
-                                egui::ComboBox::new(
-                                    format!("midi_port_{}", track.id),
-                                    "",
-                                )
-                                .width(100.0)
-                                .selected_text(display_text)
-                                .show_ui(ui, |ui| {
-                                    if ui.selectable_label(device_name.is_none(), "None").clicked() {
-                                        self.pending_midi_connections.push((track.id.clone(), String::new()));
-                                    }
-                                    
-                                    for port in &self.midi_ports {
-                                        let is_selected = device_name.as_ref() == Some(port);
-                                        if ui.selectable_label(is_selected, port).clicked() {
-                                            self.pending_midi_connections.push((track.id.clone(), port.clone()));
+
+                                egui::ComboBox::new(format!("midi_port_{}", track.id), "")
+                                    .width(ui.available_width() - 60.0)
+                                    .selected_text(display_text)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(device_name.is_none(), "No Device")
+                                            .clicked()
+                                        {
+                                            self.pending_midi_connections
+                                                .push((track.id.clone(), String::new()));
                                         }
-                                    }
-                                });
+
+                                        for port in &self.midi_ports {
+                                            let is_selected = device_name.as_ref() == Some(port);
+                                            if ui.selectable_label(is_selected, port).clicked() {
+                                                self.pending_midi_connections
+                                                    .push((track.id.clone(), port.clone()));
+                                            }
+                                        }
+                                    });
+
+                                // MIDI channel selector
+                                let mut channel_changed = false;
+                                let mut new_channel = *channel;
+
+                                egui::ComboBox::new(format!("midi_channel_{}", track.id), "")
+                                    .width(45.0)
+                                    .selected_text(format!("Ch{}", channel))
+                                    .show_ui(ui, |ui| {
+                                        for ch in 1..=16 {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut new_channel,
+                                                    ch,
+                                                    format!("Ch{}", ch),
+                                                )
+                                                .clicked()
+                                            {
+                                                channel_changed = true;
+                                            }
+                                        }
+                                    });
+
+                                if channel_changed {
+                                    self.command_collector.add_command(
+                                        DawCommand::SetTrackMidiChannel {
+                                            track_id: track.id.clone(),
+                                            channel: new_channel,
+                                        },
+                                    );
+                                }
                             });
                         }
                         TrackType::Audio => {
-                            ui.label(
-                                egui::RichText::new("Audio Track")
-                                    .size(10.0)
-                                    .color(ui.visuals().text_color().linear_multiply(0.7))
-                            );
+                            // Audio track specific controls could go here
                         }
                     }
                 }
@@ -725,7 +858,7 @@ impl Timeline {
         // Store and set the clip rect for tracks area
         let original_clip_rect = ui.clip_rect();
         ui.set_clip_rect(rect);
-        
+
         let start_time = self.scroll_offset / self.pixels_per_second;
         let end_time = (self.scroll_offset + rect.width()) / self.pixels_per_second;
 
@@ -760,22 +893,31 @@ impl Timeline {
                 [track_rect.left_bottom(), track_rect.right_bottom()],
                 (1.0, ui.visuals().window_stroke.color),
             );
-            
+
             // Handle click on empty track area for deselection
-            let response = ui.interact(track_rect, ui.id().with(format!("track_{}", track_idx)), egui::Sense::click());
+            let response = ui.interact(
+                track_rect,
+                ui.id().with(format!("track_{}", track_idx)),
+                egui::Sense::click(),
+            );
             if response.clicked() {
                 // Check if click was on empty area (not on a clip)
                 let click_pos = response.hover_pos().unwrap_or_default();
-                let click_time = (click_pos.x - track_rect.left() + self.scroll_offset) / self.pixels_per_second;
-                
+                let click_time =
+                    (click_pos.x - track_rect.left() + self.scroll_offset) / self.pixels_per_second;
+
                 let clicked_on_clip = track.clips.iter().any(|clip| {
                     let (start, length) = match clip {
-                        Clip::Midi { start_time, length, .. } => (*start_time as f32, *length as f32),
-                        Clip::Audio { start_time, length, .. } => (*start_time as f32, *length as f32),
+                        Clip::Midi {
+                            start_time, length, ..
+                        } => (*start_time as f32, *length as f32),
+                        Clip::Audio {
+                            start_time, length, ..
+                        } => (*start_time as f32, *length as f32),
                     };
                     click_time >= start && click_time <= start + length
                 });
-                
+
                 if !clicked_on_clip {
                     self.command_collector.add_command(DawCommand::DeselectAll);
                 }
@@ -786,7 +928,7 @@ impl Timeline {
                 self.draw_clip(ui, track_rect, clip, state);
             }
         }
-        
+
         // Restore original clip rect
         ui.set_clip_rect(original_clip_rect);
     }
@@ -941,9 +1083,15 @@ impl Timeline {
             egui::FontId::proportional(12.0),
             ui.visuals().extreme_bg_color,
         );
-        
+
         // Draw MIDI preview for MIDI clips
-        if let Clip::Midi { midi_data, start_time: clip_start, length: clip_length, .. } = clip {
+        if let Clip::Midi {
+            midi_data,
+            start_time: clip_start,
+            length: clip_length,
+            ..
+        } = clip
+        {
             if let Some(midi_store) = midi_data {
                 self.draw_midi_preview(ui, clip_rect, midi_store, *clip_start, *clip_length);
             }
@@ -980,18 +1128,20 @@ impl Timeline {
 
         // Handle resizing from left edge
         let left_response = ui.allocate_rect(left_handle, egui::Sense::drag());
-        
+
         if left_response.drag_started() {
             self.resize_initial_values = Some((start_time, length));
             self.resize_snap_handler.reset();
         }
-        
+
         if left_response.dragged() {
             if let Some((initial_start, initial_length)) = self.resize_initial_values {
                 // Accumulate drag delta
-                self.resize_snap_handler.add_delta(left_response.drag_delta().x);
-                let accumulated_time_delta = self.resize_snap_handler.get_accumulated() / self.pixels_per_second;
-                
+                self.resize_snap_handler
+                    .add_delta(left_response.drag_delta().x);
+                let accumulated_time_delta =
+                    self.resize_snap_handler.get_accumulated() / self.pixels_per_second;
+
                 // Apply snapping if enabled (disable with Shift key)
                 let snap = self.snap_enabled && !ui.input(|i| i.modifiers.shift);
                 let new_start = self.resize_snap_handler.snap_time_accumulated(
@@ -1001,7 +1151,7 @@ impl Timeline {
                     state.snap_mode,
                     snap,
                 ) as f32;
-                
+
                 let new_length = (initial_length + (initial_start - new_start)).max(0.1);
 
                 // Move the clip
@@ -1028,7 +1178,7 @@ impl Timeline {
                 });
             }
         }
-        
+
         if left_response.drag_stopped() {
             self.resize_initial_values = None;
             self.resize_snap_handler.reset();
@@ -1036,28 +1186,28 @@ impl Timeline {
 
         // Handle resizing from right edge (only change length as clip doesn't move)
         let right_response = ui.allocate_rect(right_handle, egui::Sense::drag());
-        
+
         if right_response.drag_started() {
             self.resize_initial_values = Some((start_time, length));
             self.resize_snap_handler.reset();
         }
-        
+
         if right_response.dragged() {
             if let Some((initial_start, initial_length)) = self.resize_initial_values {
                 // Accumulate drag delta
-                self.resize_snap_handler.add_delta(right_response.drag_delta().x);
-                let accumulated_time_delta = self.resize_snap_handler.get_accumulated() / self.pixels_per_second;
+                self.resize_snap_handler
+                    .add_delta(right_response.drag_delta().x);
+                let accumulated_time_delta =
+                    self.resize_snap_handler.get_accumulated() / self.pixels_per_second;
                 let proposed_length = (initial_length + accumulated_time_delta).max(0.1);
-                
+
                 // Apply snapping if enabled (disable with Shift key)
                 let snap = self.snap_enabled && !ui.input(|i| i.modifiers.shift);
                 let new_length = if snap && self.resize_snap_handler.should_snap() {
                     let end_time = initial_start + proposed_length;
-                    let snapped_end = TimeUtils::snap_time(
-                        end_time as f64,
-                        state.project.bpm,
-                        state.snap_mode,
-                    ) as f32;
+                    let snapped_end =
+                        TimeUtils::snap_time(end_time as f64, state.project.bpm, state.snap_mode)
+                            as f32;
                     (snapped_end - initial_start).max(0.1)
                 } else {
                     proposed_length
@@ -1071,7 +1221,7 @@ impl Timeline {
                 });
             }
         }
-        
+
         if right_response.drag_stopped() {
             self.resize_initial_values = None;
             self.resize_snap_handler.reset();
@@ -1096,13 +1246,14 @@ impl Timeline {
         let preview_rect = egui::Rect::from_min_size(
             clip_rect.left_top() + egui::vec2(0.0, 20.0),
             egui::vec2(clip_rect.width(), clip_rect.height() - 20.0),
-        ).shrink2(egui::vec2(2.0, vertical_padding));
-        
+        )
+        .shrink2(egui::vec2(2.0, vertical_padding));
+
         // Only draw if we have enough space
         if preview_rect.height() < 10.0 {
             return;
         }
-        
+
         // Draw a subtle background for the preview area (before padding)
         let preview_bg_rect = egui::Rect::from_min_size(
             clip_rect.left_top() + egui::vec2(0.0, 20.0),
@@ -1113,7 +1264,7 @@ impl Timeline {
             2.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30),
         );
-        
+
         // Get all notes
         let notes: Vec<_> = midi_store.get_notes().collect();
         if notes.is_empty() {
@@ -1127,56 +1278,52 @@ impl Timeline {
             );
             return;
         }
-        
+
         // Find the pitch range
         let min_pitch = notes.iter().map(|n| n.key).min().unwrap_or(60);
         let max_pitch = notes.iter().map(|n| n.key).max().unwrap_or(72);
         let pitch_range = (max_pitch - min_pitch).max(12) as f32;
-        
+
         // Draw notes as small rectangles
         // Use a lighter color that contrasts with the clip background
         let note_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100);
         let pixels_per_second = clip_rect.width() as f64 / clip_length;
-        
+
         for note in notes {
             // Calculate note position within the clip
             let note_x = preview_rect.left() + (note.start_time * pixels_per_second) as f32;
             let note_width = (note.duration * pixels_per_second) as f32;
-            
+
             // Skip notes outside the visible clip area
             if note_x + note_width < preview_rect.left() || note_x > preview_rect.right() {
                 continue;
             }
-            
+
             // Calculate vertical position (inverted so higher pitches are at top)
             let pitch_normalized = (note.key - min_pitch) as f32 / pitch_range;
             let available_height = preview_rect.height();
             let note_y = preview_rect.bottom() - (pitch_normalized * available_height);
             let note_height = (available_height / pitch_range).max(1.0).min(3.0);
-            
+
             let note_rect = egui::Rect::from_min_size(
                 egui::pos2(note_x.max(preview_rect.left()), note_y - note_height / 2.0),
                 egui::vec2(
                     note_width.min(preview_rect.right() - note_x).max(1.0),
-                    note_height
+                    note_height,
                 ),
             );
-            
+
             // Only draw if the note rect is within the preview area
             if note_rect.intersects(preview_rect) {
                 // Draw note with velocity-based opacity
                 let opacity = (note.velocity as f32 / 127.0 * 150.0 + 50.0) as u8;
                 let velocity_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, opacity);
-                
-                ui.painter().rect_filled(
-                    note_rect,
-                    0.5,
-                    velocity_color,
-                );
+
+                ui.painter().rect_filled(note_rect, 0.5, velocity_color);
             }
         }
     }
-    
+
     fn draw_playhead(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
         let playhead_x = state.current_time * self.pixels_per_second as f64;
         let visible_width = rect.width() as f64;

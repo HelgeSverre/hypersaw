@@ -76,6 +76,16 @@ pub enum DawCommand {
     UnsoloTrack {
         track_id: String,
     },
+    ArmTrack {
+        track_id: String,
+    },
+    UnarmTrack {
+        track_id: String,
+    },
+    SetTrackColor {
+        track_id: String,
+        color: String,
+    },
 
     // Clips
     SelectClip {
@@ -211,6 +221,27 @@ impl Command for DawCommand {
                 Ok(())
             }
             
+            DawCommand::ArmTrack { track_id } => {
+                if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
+                    track.is_armed = true;
+                }
+                Ok(())
+            }
+            
+            DawCommand::UnarmTrack { track_id } => {
+                if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
+                    track.is_armed = false;
+                }
+                Ok(())
+            }
+            
+            DawCommand::SetTrackColor { track_id, color } => {
+                if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
+                    track.color = color.clone();
+                }
+                Ok(())
+            }
+            
             DawCommand::AddTrack { track_type, name } => {
                 let track = Track {
                     id: Uuid::new_v4().to_string(),
@@ -219,6 +250,8 @@ impl Command for DawCommand {
                     clips: Vec::new(),
                     is_muted: false,
                     is_soloed: false,
+                    is_armed: false,
+                    color: "#fde047".to_string(), // Default yellow
                 };
                 state.project.tracks.push(track);
                 Ok(())
@@ -496,6 +529,9 @@ impl Command for DawCommand {
             DawCommand::UnmuteTrack { .. } => "Unmute Track",
             DawCommand::SoloTrack { .. } => "Solo Track",
             DawCommand::UnsoloTrack { .. } => "Unsolo Track",
+            DawCommand::ArmTrack { .. } => "Arm Track",
+            DawCommand::UnarmTrack { .. } => "Unarm Track",
+            DawCommand::SetTrackColor { .. } => "Set Track Color",
             DawCommand::DeselectAll => "Deselect All",
         }
     }

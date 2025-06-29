@@ -1,8 +1,22 @@
 use crate::core::SnapMode;
+use eframe::egui;
 
 pub struct TimeUtils {}
 
 impl TimeUtils {}
+
+pub fn hex_to_color32(hex: &str) -> Option<egui::Color32> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    
+    Some(egui::Color32::from_rgb(r, g, b))
+}
 
 impl TimeUtils {
     pub fn snap_time(time: f64, bpm: f64, snap_mode: SnapMode) -> f64 {
