@@ -87,6 +87,10 @@ pub enum DawCommand {
         track_id: String,
         color: String,
     },
+    ReorderTracks {
+        from_index: usize,
+        to_index: usize,
+    },
 
     // Clips
     SelectClip {
@@ -271,6 +275,15 @@ impl Command for DawCommand {
             DawCommand::SetTrackColor { track_id, color } => {
                 if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
                     track.color = color.clone();
+                }
+                Ok(())
+            }
+            
+            DawCommand::ReorderTracks { from_index, to_index } => {
+                let len = state.project.tracks.len();
+                if *from_index < len && *to_index < len {
+                    let track = state.project.tracks.remove(*from_index);
+                    state.project.tracks.insert(*to_index, track);
                 }
                 Ok(())
             }
@@ -657,6 +670,7 @@ impl Command for DawCommand {
             DawCommand::ArmTrack { .. } => "Arm Track",
             DawCommand::UnarmTrack { .. } => "Unarm Track",
             DawCommand::SetTrackColor { .. } => "Set Track Color",
+            DawCommand::ReorderTracks { .. } => "Reorder Tracks",
             DawCommand::DeselectAll => "Deselect All",
             DawCommand::AddAutomationLane { .. } => "Add Automation Lane",
             DawCommand::RemoveAutomationLane { .. } => "Remove Automation Lane",

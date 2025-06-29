@@ -20,6 +20,8 @@ pub struct Timeline {
     // Resize state
     resize_snap_handler: SnapHandler,
     resize_initial_values: Option<(f32, f32)>, // (start_time, length)
+    // Track reordering state
+    dragging_track: Option<(usize, f32)>, // (track_index, y_offset)
 }
 
 impl Default for Timeline {
@@ -37,6 +39,7 @@ impl Default for Timeline {
             pending_midi_connections: Vec::new(),
             resize_snap_handler: SnapHandler::new(10.0),
             resize_initial_values: None,
+            dragging_track: None,
         }
     }
 }
@@ -503,7 +506,7 @@ impl Timeline {
         ui.set_clip_rect(original_clip_rect);
     }
 
-    fn draw_track_headers(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
+    fn draw_track_headers(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &mut DawState) {
         // Draw header background
         ui.painter()
             .rect_filled(rect, 0.0, ui.visuals().window_fill);
@@ -512,8 +515,13 @@ impl Timeline {
         let original_clip_rect = ui.clip_rect();
         ui.set_clip_rect(rect);
 
+        // Collect track info to avoid borrowing issues
+        let tracks: Vec<_> = state.project.tracks.iter().enumerate().map(|(idx, track)| {
+            (idx, track.clone())
+        }).collect();
+        
         // Draw track headers manually with scroll offset
-        for (track_idx, track) in state.project.tracks.iter().enumerate() {
+        for (track_idx, track) in tracks {
             let track_top = rect.top() + (track_idx as f32 * self.track_height) - self.scroll_y;
             let track_rect = egui::Rect::from_min_size(
                 egui::pos2(rect.left(), track_top),
@@ -526,7 +534,7 @@ impl Timeline {
             }
 
             // Draw track header
-            self.draw_track_header(ui, track_rect, track, track_idx, state);
+            self.draw_track_header(ui, track_rect, &track, track_idx, state);
         }
 
         // Draw "Add Track" button at the bottom
@@ -569,6 +577,31 @@ impl Timeline {
                 style.text_color(),
             );
         }
+        
+        // Draw drop indicator when dragging
+        if let Some((from_index, offset)) = self.dragging_track {
+            let tracks_moved = (offset / self.track_height).round() as i32;
+            let target_index = (from_index as i32 + tracks_moved).max(0) as usize;
+            let target_index = target_index.min(state.project.tracks.len().saturating_sub(1));
+            
+            if target_index != from_index {
+                let indicator_y = rect.top() + (target_index as f32 * self.track_height) - self.scroll_y;
+                let indicator_y = if target_index > from_index {
+                    indicator_y + self.track_height // Show below the target track
+                } else {
+                    indicator_y // Show above the target track
+                };
+                
+                // Draw insertion line
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.left() + 10.0, indicator_y),
+                        egui::pos2(rect.right() - 10.0, indicator_y),
+                    ],
+                    (3.0, ui.visuals().selection.stroke.color),
+                );
+            }
+        }
 
         // Restore original clip rect
         ui.set_clip_rect(original_clip_rect);
@@ -580,20 +613,72 @@ impl Timeline {
         rect: egui::Rect,
         track: &Track,
         index: usize,
-        state: &DawState,
+        state: &mut DawState,
     ) {
         let is_selected = state.selected_track == Some(track.id.clone());
 
         // Draw background
-        let bg_color = if is_selected {
+        let mut bg_color = if is_selected {
             ui.visuals().selection.bg_fill
         } else if index % 2 == 0 {
             ui.visuals().faint_bg_color
         } else {
             ui.visuals().extreme_bg_color
         };
+        
+        // Make dragged track semi-transparent
+        if let Some((drag_index, _)) = self.dragging_track {
+            if drag_index == index {
+                bg_color = bg_color.gamma_multiply(0.5);
+            }
+        }
 
         ui.painter().rect_filled(rect, 0.0, bg_color);
+        
+        // Add drag handle area (entire header is draggable)
+        let drag_response = ui.allocate_rect(rect, egui::Sense::drag());
+        
+        // Handle drag start
+        if drag_response.drag_started() {
+            self.dragging_track = Some((index, 0.0));
+        }
+        
+        // Handle dragging
+        if let Some((drag_index, _)) = self.dragging_track {
+            if drag_index == index && drag_response.dragged() {
+                let delta_y = drag_response.drag_delta().y;
+                if let Some((_, ref mut offset)) = self.dragging_track {
+                    *offset += delta_y;
+                }
+                
+                // Change cursor to indicate dragging
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+        }
+        
+        // Handle drag end
+        if drag_response.drag_stopped() {
+            if let Some((from_index, offset)) = self.dragging_track {
+                // Calculate target index based on drag offset
+                let tracks_moved = (offset / self.track_height).round() as i32;
+                let to_index = (from_index as i32 + tracks_moved).max(0) as usize;
+                let to_index = to_index.min(state.project.tracks.len().saturating_sub(1));
+                
+                if from_index != to_index {
+                    self.command_collector.add_command(DawCommand::ReorderTracks {
+                        from_index,
+                        to_index,
+                    });
+                }
+                
+                self.dragging_track = None;
+            }
+        }
+        
+        // Show hover cursor
+        if drag_response.hovered() && self.dragging_track.is_none() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
 
         // Draw track color stripe on the left (like Bitwig)
         let stripe_rect = egui::Rect::from_min_size(rect.min, egui::vec2(4.0, rect.height()));
