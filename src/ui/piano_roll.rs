@@ -966,8 +966,8 @@ impl PianoRoll {
 
         // Only draw if playhead is within view
         if playhead_x >= grid_rect.left() && playhead_x <= grid_rect.right() {
-            // Draw playhead line
-            let playhead_color = ui.visuals().selection.stroke.color;
+            // Draw playhead line - use same soft red color as timeline
+            let playhead_color = egui::Color32::from_rgb(220, 80, 80);
             ui.painter().line_segment(
                 [
                     egui::pos2(playhead_x, grid_rect.top()),
@@ -975,19 +975,6 @@ impl PianoRoll {
                 ],
                 (2.0, playhead_color),
             );
-
-            // Draw playhead head (triangle)
-            let triangle_size = 8.0;
-            let points = vec![
-                egui::pos2(playhead_x - triangle_size / 2.0, grid_rect.top()),
-                egui::pos2(playhead_x + triangle_size / 2.0, grid_rect.top()),
-                egui::pos2(playhead_x, grid_rect.top() + triangle_size),
-            ];
-            ui.painter().add(egui::Shape::convex_polygon(
-                points,
-                playhead_color,
-                (1.0, playhead_color),
-            ));
         }
     }
 
@@ -1659,9 +1646,11 @@ impl PianoRoll {
         let playhead_x = rect.left() + (current_time as f32 * self.zoom) - self.scroll_x;
         
         if playhead_x >= rect.left() && playhead_x <= rect.right() {
+            // Use same soft red color as timeline and piano roll
+            let playhead_color = egui::Color32::from_rgb(220, 80, 80);
             ui.painter().line_segment(
                 [egui::pos2(playhead_x, rect.top()), egui::pos2(playhead_x, rect.bottom())],
-                (1.0, ui.visuals().selection.stroke.color),
+                (2.0, playhead_color),
             );
         }
     }

@@ -123,7 +123,7 @@ impl Timeline {
         self.draw_tracks(ui, tracks_rect, state);
         self.draw_ruler(ui, ruler_rect, state);
         self.handle_loop_region(ui, tracks_rect, state);
-        self.draw_playhead(ui, tracks_rect, state);
+        self.draw_playhead(ui, timeline_rect, state);
 
         self.command_collector.take_commands()
     }
@@ -1325,6 +1325,10 @@ impl Timeline {
     }
 
     fn draw_playhead(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
+        // Store and set the clip rect to prevent overflow
+        let original_clip_rect = ui.clip_rect();
+        ui.set_clip_rect(rect);
+        
         let playhead_x = state.current_time * self.pixels_per_second as f64;
         let visible_width = rect.width() as f64;
         let visible_width_threshold = visible_width * 0.8;
@@ -1340,12 +1344,19 @@ impl Timeline {
         }
 
         let playhead_x = rect.left() as f64 + playhead_x - self.scroll_offset as f64;
+        
+        // Use a soft red color for the playhead
+        let playhead_color = egui::Color32::from_rgb(220, 80, 80);
+        
         ui.painter().line_segment(
             [
                 egui::pos2(playhead_x as f32, rect.top()),
                 egui::pos2(playhead_x as f32, rect.bottom()),
             ],
-            (1.0, ui.visuals().text_color()),
+            (2.0, playhead_color),
         );
+        
+        // Restore original clip rect
+        ui.set_clip_rect(original_clip_rect);
     }
 }
