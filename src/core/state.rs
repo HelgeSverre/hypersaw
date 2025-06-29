@@ -18,6 +18,9 @@ pub struct DawState {
     pub current_view: EditorView,
     pub status: StatusManager,
     // pub plugin_manager: PluginManager,
+    
+    // Shared UI state
+    pub track_scroll_y: f32,
 }
 
 impl DawState {
@@ -37,6 +40,7 @@ impl DawState {
             loop_end: 4.0,
             current_view: EditorView::default(),
             status: StatusManager::new(),
+            track_scroll_y: 0.0,
         }
     }
 

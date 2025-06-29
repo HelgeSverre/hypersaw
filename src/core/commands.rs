@@ -60,6 +60,10 @@ pub enum DawCommand {
     DeleteTrack {
         track_id: String,
     },
+    SetTrackMidiChannel {
+        track_id: String,
+        channel: u8,
+    },
 
     // Clips
     SelectClip {
@@ -146,6 +150,15 @@ impl Command for DawCommand {
                 Ok(())
             }
 
+            DawCommand::SetTrackMidiChannel { track_id, channel } => {
+                if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
+                    if let TrackType::Midi { channel: ch, .. } = &mut track.track_type {
+                        *ch = *channel;
+                    }
+                }
+                Ok(())
+            }
+            
             DawCommand::AddTrack { track_type, name } => {
                 let track = Track {
                     id: Uuid::new_v4().to_string(),
@@ -193,7 +206,6 @@ impl Command for DawCommand {
                             start_offset: 0.0,
                             end_offset: *length,
                         },
-                        _ => return Err("Invalid track type for clip".into()),
                     };
                     track.clips.push(clip);
                 }
@@ -427,6 +439,7 @@ impl Command for DawCommand {
             DawCommand::StopPlayback => "Stop Playback",
             DawCommand::StartPlayback => "Start Playback",
             DawCommand::PausePlayback => "Pause Playback",
+            DawCommand::SetTrackMidiChannel { .. } => "Set Track MIDI Channel",
         }
     }
 }

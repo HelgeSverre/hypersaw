@@ -137,13 +137,17 @@ impl SupersawApp {
         let midi_out: Option<midir::MidiOutputConnection> = None;
 
         // Create the app instance
+        let midi_ports = Self::scan_midi_ports();
+        let mut timeline = Timeline::default();
+        timeline.update_midi_ports(midi_ports.clone());
+        
         let mut app = Self {
             // TODO: reconsider where this should "live"
             state: DawState::new(),
             midi_output: None,
-            midi_ports: Self::scan_midi_ports(),
+            midi_ports,
             file_dialog: None,
-            timeline: Timeline::default(),
+            timeline,
             piano_roll: PianoRoll::default(),
             command_manager: CommandManager::default(),
             plugin_browser: PluginBrowser::default(),
@@ -299,199 +303,20 @@ impl SupersawApp {
             if ui.button("Arrangement").clicked() {
                 self.state.current_view = EditorView::Arrangement;
             }
-        });
-    }
-
-    fn draw_track_list(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Collect all track IDs that need connections
-            let mut tracks_to_connect = Vec::new();
-
-            for track in &mut self.state.project.tracks {
-                ui.with_layout(egui::Layout::top_down_justified(Align::Max), |ui| {
-                    egui::Frame::new()
-                        .inner_margin(4.0)
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(5)))
-                        .fill(egui::Color32::from_black_alpha(20))
-                        .show(ui, |ui| {
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    let track_label = format!(
-                                        "{} ({})",
-                                        track.name,
-                                        match track.track_type {
-                                            TrackType::Midi { .. } => "MIDI",
-                                            TrackType::Audio => "Audio",
-                                        }
-                                    );
-
-                                    // Mute and Solo buttons
-                                    ui.checkbox(&mut track.is_muted, "M");
-                                    ui.checkbox(&mut track.is_soloed, "S");
-                                    ui.add_space(8.0);
-
-                                    let is_selected =
-                                        self.state.selected_track == Some(track.id.clone());
-                                    if ui.selectable_label(is_selected, track_label).clicked() {
-                                        self.state.selected_track = Some(track.id.clone());
-
-                                        // Add to connection list if MIDI track with device
-                                        if let TrackType::Midi {
-                                            ref device_name, ..
-                                        } = track.track_type
-                                        {
-                                            if let Some(dev_name) = device_name {
-                                                if !dev_name.is_empty() {
-                                                    tracks_to_connect
-                                                        .push((track.id.clone(), dev_name.clone()));
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    // Add MIDI port and channel selection for MIDI tracks
-                                    if let TrackType::Midi {
-                                        ref mut channel,
-                                        ref mut device_name,
-                                    } = &mut track.track_type
-                                    {
-                                        // MIDI channel dropdown (1-16)
-                                        egui::ComboBox::new(
-                                            format!("midi_channel_{}", track.id),
-                                            "Ch",
-                                        )
-                                        .width(42.0)
-                                        .selected_text(channel.to_string())
-                                        .show_ui(
-                                            ui,
-                                            |ui| {
-                                                for ch in 1..=16 {
-                                                    ui.selectable_value(
-                                                        channel,
-                                                        ch,
-                                                        ch.to_string(),
-                                                    );
-                                                }
-                                            },
-                                        );
-
-                                        // MIDI port dropdown
-                                        ui.add_space(4.0);
-
-                                        // Clone midi_ports for the closure
-                                        let midi_ports = self.midi_ports.clone();
-                                        let current_device = device_name.clone();
-                                        let track_id = track.id.clone();
-
-                                        let display_text = match device_name {
-                                            Some(dev) if !dev.is_empty() => dev.as_str(),
-                                            _ => "None",
-                                        };
-
-                                        egui::ComboBox::new(
-                                            format!("midi_port_{}", track.id),
-                                            "Port",
-                                        )
-                                        .selected_text(display_text)
-                                        .show_ui(
-                                            ui,
-                                            |ui| {
-                                                if ui
-                                                    .selectable_value(device_name, None, "None")
-                                                    .clicked()
-                                                {
-                                                    // We'll handle disconnection outside the closure
-                                                    tracks_to_connect
-                                                        .push((track_id.clone(), String::new()));
-                                                }
-
-                                                for port in midi_ports {
-                                                    if ui
-                                                        .selectable_value(
-                                                            device_name,
-                                                            Some(port.clone()),
-                                                            &port,
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        // Add to connection list - we'll handle connection outside closure
-                                                        tracks_to_connect
-                                                            .push((track_id.clone(), port.clone()));
-                                                    }
-                                                }
-                                            },
-                                        );
-                                    }
-                                });
-                            });
-                        })
-                });
-            }
-
-            // Handle MIDI connections outside the UI callback
-            for (track_id, device_name) in tracks_to_connect {
-                if device_name.is_empty() {
-                    // Disconnect
-                    self.midi_output = None;
-                    self.state
-                        .status
-                        .info("MIDI output disconnected".to_string());
-                } else {
-                    // Connect to the port
-                    if let Err(e) = self.connect_midi_port(&device_name) {
-                        self.state
-                            .status
-                            .error(format!("Failed to connect to MIDI port: {}", e));
-                    } else {
-                        self.state
-                            .status
-                            .success(format!("Connected to MIDI port: {}", device_name));
-                    }
-                }
-            }
-
-            ui.add_space(8.0);
-
-            if ui.button("+ Add Track").clicked() {
-                self.show_add_track_menu();
-            }
-
-            ui.add_space(4.0);
-
-            // Display available MIDI ports section
+            
             ui.separator();
-            ui.collapsing("MIDI Ports", |ui| {
+            
+            // MIDI settings menu
+            ui.menu_button("MIDI", |ui| {
                 if ui.button("Refresh MIDI Ports").clicked() {
                     self.midi_ports = Self::scan_midi_ports();
-                }
-
-                for port in &self.midi_ports {
-                    ui.label(port);
-                }
-
-                if self.midi_ports.is_empty() {
-                    ui.label("No MIDI ports found. Click 'Refresh MIDI Ports' to scan again.");
+                    self.timeline.update_midi_ports(self.midi_ports.clone());
+                    ui.close_menu();
                 }
             });
         });
     }
 
-    fn show_add_track_menu(&mut self) {
-        let track_id = Uuid::new_v4().to_string();
-        self.state.project.tracks.push(Track {
-            id: track_id.clone(),
-            name: format!("Track {}", self.state.project.tracks.len() + 1),
-            track_type: TrackType::Midi {
-                channel: 1,
-                device_name: None,
-            },
-            clips: Vec::new(),
-            is_muted: false,
-            is_soloed: false,
-        });
-        self.state.selected_track = Some(track_id);
-    }
 
     fn import_midi_file(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(file_path) = rfd::FileDialog::new()
@@ -645,12 +470,8 @@ impl eframe::App for SupersawApp {
             self.draw_transport(ui);
         });
 
-        egui::SidePanel::left("tracks")
-            .default_width(200.0)
-            .resizable(false)
-            .show(ctx, |ui| {
-                self.draw_track_list(ui);
-            });
+        // Update timeline with current MIDI ports
+        self.timeline.update_midi_ports(self.midi_ports.clone());
 
         // Draw the main content area
         egui::CentralPanel::default().show(ctx, |ui| match &self.state.current_view {
@@ -660,6 +481,43 @@ impl eframe::App for SupersawApp {
                     if let Err(e) = self.command_manager.execute(command, &mut self.state) {
                         eprintln!("timeline: Command failed: {}", e);
                         self.state.status.error(format!("Command failed: {}", e));
+                    }
+                }
+                
+                // Handle pending MIDI connections from timeline
+                let pending_connections = self.timeline.take_pending_midi_connections();
+                for (track_id, device_name) in pending_connections {
+                    if device_name.is_empty() {
+                        // Disconnect
+                        self.midi_output = None;
+                        self.state
+                            .status
+                            .info("MIDI output disconnected".to_string());
+                            
+                        // Update track device name
+                        if let Some(track) = self.state.project.tracks.iter_mut().find(|t| t.id == track_id) {
+                            if let TrackType::Midi { device_name: ref mut dev_name, .. } = &mut track.track_type {
+                                *dev_name = None;
+                            }
+                        }
+                    } else {
+                        // Connect to the port
+                        if let Err(e) = self.connect_midi_port(&device_name) {
+                            self.state
+                                .status
+                                .error(format!("Failed to connect to MIDI port: {}", e));
+                        } else {
+                            self.state
+                                .status
+                                .success(format!("Connected to MIDI port: {}", device_name));
+                                
+                            // Update track device name
+                            if let Some(track) = self.state.project.tracks.iter_mut().find(|t| t.id == track_id) {
+                                if let TrackType::Midi { device_name: ref mut dev_name, .. } = &mut track.track_type {
+                                    *dev_name = Some(device_name);
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -8,10 +8,14 @@ use eframe::epaint::StrokeKind;
 pub struct Timeline {
     pixels_per_second: f32,
     scroll_offset: f32,
+    scroll_y: f32,
     snap_enabled: bool,
     track_height: f32,
+    track_header_width: f32,
     drag_start: Option<(egui::Pos2, f32)>, // (pointer_pos, clip_start_time)
     command_collector: CommandCollector,
+    midi_ports: Vec<String>,
+    pending_midi_connections: Vec<(String, String)>, // (track_id, device_name)
 }
 
 impl Default for Timeline {
@@ -19,29 +23,74 @@ impl Default for Timeline {
         Self {
             pixels_per_second: 100.0,
             scroll_offset: 0.0,
+            scroll_y: 0.0,
             snap_enabled: true, // TODO: add toggle in UI
             track_height: 80.0,
+            track_header_width: 200.0,
             drag_start: None,
             command_collector: CommandCollector::new(),
+            midi_ports: Vec::new(),
+            pending_midi_connections: Vec::new(),
         }
     }
 }
 
 impl Timeline {
+    pub fn update_midi_ports(&mut self, ports: Vec<String>) {
+        self.midi_ports = ports;
+    }
+    
+    pub fn take_pending_midi_connections(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_midi_connections)
+    }
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) -> Vec<DawCommand> {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+        let (full_rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+        
+        let ruler_height = 20.0;
+        
+        // Split into regions
+        let header_width = self.track_header_width;
+        
+        // Header area (left side, below ruler)
+        let header_rect = egui::Rect::from_min_size(
+            egui::pos2(full_rect.left(), full_rect.top() + ruler_height),
+            egui::vec2(header_width, full_rect.height() - ruler_height),
+        );
+        
+        // Timeline area (right side, including ruler)
+        let timeline_rect = egui::Rect::from_min_size(
+            egui::pos2(full_rect.left() + header_width, full_rect.top()),
+            egui::vec2(full_rect.width() - header_width, full_rect.height()),
+        );
+        
+        // Tracks area (timeline minus ruler)
+        let tracks_rect = egui::Rect::from_min_size(
+            egui::pos2(timeline_rect.left(), timeline_rect.top() + ruler_height),
+            egui::vec2(timeline_rect.width(), timeline_rect.height() - ruler_height),
+        );
+        
+        // Ruler area (only above timeline)
+        let ruler_rect = egui::Rect::from_min_size(
+            timeline_rect.min,
+            egui::vec2(timeline_rect.width(), ruler_height),
+        );
 
-        self.draw_background(ui, rect);
-        self.draw_grid(ui, rect, state);
-        self.handle_zooming(ui, rect);
+        // Draw timeline background and grid
+        self.draw_background(ui, tracks_rect);
+        self.draw_grid(ui, tracks_rect, state);
+        
+        // Handle interactions
+        self.handle_zooming(ui, timeline_rect);
         self.handle_scrolling(ui, &response);
         self.handle_file_drops(ui, state);
         self.handle_delete_clip(ui, state);
 
-        self.draw_ruler(ui, rect, state);
-        self.draw_tracks(ui, rect.shrink2(egui::vec2(0.0, 20.0)), state);
-        self.handle_loop_region(ui, rect, state);
-        self.draw_playhead(ui, rect, state);
+        // Draw components
+        self.draw_track_headers(ui, header_rect, state);
+        self.draw_tracks(ui, tracks_rect, state);
+        self.draw_ruler(ui, ruler_rect, state);
+        self.handle_loop_region(ui, tracks_rect, state);
+        self.draw_playhead(ui, tracks_rect, state);
 
         self.command_collector.take_commands()
     }
@@ -152,11 +201,16 @@ impl Timeline {
             self.scroll_offset = (self.scroll_offset + delta.x * invert).max(0.0);
         }
 
-        // Support mouse wheel scrolling too
+        // Support mouse wheel scrolling
         ui.input(|i| {
             if i.modifiers.shift {
+                // Horizontal scroll with shift
                 let scroll_delta = i.raw_scroll_delta.x;
                 self.scroll_offset = (self.scroll_offset + scroll_delta).max(0.0);
+            } else if !i.modifiers.ctrl {
+                // Vertical scroll (when not zooming)
+                let scroll_delta = i.raw_scroll_delta.y;
+                self.scroll_y = (self.scroll_y - scroll_delta).max(0.0);
             }
         });
     }
@@ -328,15 +382,15 @@ impl Timeline {
     }
 
     fn draw_ruler(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
-        let ruler_height = 20.0;
-        let ruler_rect =
-            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), ruler_height));
-
+        // Store and set the clip rect for ruler area
+        let original_clip_rect = ui.clip_rect();
+        ui.set_clip_rect(rect);
+        
         // Fill the ruler background to prevent grid line bleeding
         let ruler_bg_color = ui.visuals().extreme_bg_color.linear_multiply(1.2);
-        ui.painter().rect_filled(ruler_rect, 0.0, ruler_bg_color);
+        ui.painter().rect_filled(rect, 0.0, ruler_bg_color);
 
-        let response = ui.allocate_rect(ruler_rect, egui::Sense::click_and_drag());
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
         const EDGE_SCROLL_MARGIN: f32 = 50.0; // Pixels from edge where scrolling starts
         const EDGE_SCROLL_SPEED: f32 = 10.0; // Pixels per frame when scrolling
@@ -387,8 +441,8 @@ impl Timeline {
             // Draw major marker
             ui.painter().line_segment(
                 [
-                    egui::pos2(x, ruler_rect.top()),
-                    egui::pos2(x, ruler_rect.bottom()),
+                    egui::pos2(x, rect.top()),
+                    egui::pos2(x, rect.bottom()),
                 ],
                 (1.0, ui.visuals().text_color()),
             );
@@ -401,29 +455,263 @@ impl Timeline {
             );
 
             ui.painter().text(
-                egui::pos2(x + 5.0, ruler_rect.top() + 5.0),
+                egui::pos2(x + 5.0, rect.top() + 5.0),
                 egui::Align2::LEFT_TOP,
                 time_str,
                 egui::FontId::monospace(10.0),
                 ui.visuals().text_color(),
             );
         }
+        
+        // Restore original clip rect
+        ui.set_clip_rect(original_clip_rect);
+    }
+
+    fn draw_track_headers(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
+        // Draw header background
+        ui.painter().rect_filled(rect, 0.0, ui.visuals().window_fill);
+        
+        // Store original clip rect and set header clip rect
+        let original_clip_rect = ui.clip_rect();
+        ui.set_clip_rect(rect);
+        
+        // Draw track headers manually with scroll offset
+        for (track_idx, track) in state.project.tracks.iter().enumerate() {
+            let track_top = rect.top() + (track_idx as f32 * self.track_height) - self.scroll_y;
+            let track_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.left(), track_top),
+                egui::vec2(rect.width(), self.track_height),
+            );
+            
+            // Skip if not visible
+            if track_rect.bottom() < rect.top() || track_rect.top() > rect.bottom() {
+                continue;
+            }
+            
+            // Draw track header
+            self.draw_track_header(ui, track_rect, track, track_idx, state);
+        }
+        
+        // Draw "Add Track" button at the bottom
+        let total_height = state.project.tracks.len() as f32 * self.track_height;
+        let add_track_y = rect.top() + total_height - self.scroll_y;
+        if add_track_y > rect.top() && add_track_y < rect.bottom() {
+            let button_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 10.0, add_track_y + 10.0),
+                egui::vec2(rect.width() - 20.0, 30.0),
+            );
+            
+            let response = ui.allocate_rect(button_rect, egui::Sense::click());
+            if response.clicked() {
+                self.command_collector.add_command(DawCommand::AddTrack {
+                    track_type: TrackType::Midi { channel: 1, device_name: None },
+                    name: format!("Track {}", state.project.tracks.len() + 1),
+                });
+            }
+            
+            // Draw button
+            let style = if response.hovered() {
+                ui.visuals().widgets.hovered
+            } else {
+                ui.visuals().widgets.inactive
+            };
+            
+            ui.painter().rect_filled(button_rect, 4.0, style.weak_bg_fill);
+            ui.painter().text(
+                button_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "➕ Add Track",
+                egui::FontId::proportional(12.0),
+                style.text_color(),
+            );
+        }
+        
+        // Restore original clip rect
+        ui.set_clip_rect(original_clip_rect);
+    }
+    
+    fn draw_track_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        track: &Track,
+        index: usize,
+        state: &DawState,
+    ) {
+        let is_selected = state.selected_track == Some(track.id.clone());
+        
+        // Draw background
+        let bg_color = if is_selected {
+            ui.visuals().selection.bg_fill
+        } else if index % 2 == 0 {
+            ui.visuals().faint_bg_color
+        } else {
+            ui.visuals().extreme_bg_color
+        };
+        
+        ui.painter().rect_filled(rect, 0.0, bg_color);
+        
+        // Draw separator line at bottom
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            (1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        );
+        
+        // Draw right border to separate from timeline
+        ui.painter().line_segment(
+            [rect.right_top(), rect.right_bottom()],
+            (1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        );
+        
+        // Content area with padding
+        let content_rect = rect.shrink(4.0);
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+            ui.vertical(|ui| {
+                // First row: Track info and controls
+                ui.horizontal(|ui| {
+                    // Track number with icon
+                    let track_icon = match &track.track_type {
+                        TrackType::Midi { .. } => "🎹",
+                        TrackType::Audio => "🎵",
+                    };
+                    
+                    ui.label(
+                        egui::RichText::new(format!("{:02} {}", index + 1, track_icon))
+                            .monospace()
+                            .size(11.0)
+                            .color(ui.visuals().text_color().linear_multiply(0.6))
+                    );
+                    
+                    // Mute and Solo buttons
+                    let mute_style = if track.is_muted {
+                        ui.visuals().widgets.active
+                    } else {
+                        ui.visuals().widgets.inactive
+                    };
+                    
+                    let mute_text = if track.is_muted { "[M]" } else { "M" };
+                    if ui.add(egui::Button::new(mute_text).small()).clicked() {
+                        // TODO: Add command for mute/unmute
+                    }
+                    
+                    let solo_text = if track.is_soloed { "[S]" } else { "S" };
+                    if ui.add(egui::Button::new(solo_text).small()).clicked() {
+                        // TODO: Add command for solo/unsolo
+                    }
+                });
+                
+                // Second row: Track name
+                ui.horizontal(|ui| {
+                    let name_response = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&track.name)
+                                .size(12.0)
+                        )
+                        .sense(egui::Sense::click())
+                    );
+                    
+                    if name_response.clicked() {
+                        self.command_collector.add_command(DawCommand::SelectTrack {
+                            track_id: track.id.clone(),
+                        });
+                    }
+                });
+                
+                // Third row: Track-specific controls
+                if self.track_height > 60.0 {
+                    match &track.track_type {
+                        TrackType::Midi { channel, device_name } => {
+                            ui.horizontal(|ui| {
+                                // MIDI channel dropdown
+                                let mut channel_changed = false;
+                                let mut new_channel = *channel;
+                                
+                                egui::ComboBox::new(
+                                    format!("midi_channel_{}", track.id),
+                                    "",
+                                )
+                                .width(40.0)
+                                .selected_text(format!("Ch{}", channel))
+                                .show_ui(ui, |ui| {
+                                    for ch in 1..=16 {
+                                        if ui.selectable_value(&mut new_channel, ch, format!("Ch{}", ch)).clicked() {
+                                            channel_changed = true;
+                                        }
+                                    }
+                                });
+                                
+                                if channel_changed {
+                                    self.command_collector.add_command(DawCommand::SetTrackMidiChannel {
+                                        track_id: track.id.clone(),
+                                        channel: new_channel,
+                                    });
+                                }
+                                
+                                // MIDI port dropdown
+                                let display_text = match device_name {
+                                    Some(dev) if !dev.is_empty() => dev.as_str(),
+                                    _ => "None",
+                                };
+                                
+                                egui::ComboBox::new(
+                                    format!("midi_port_{}", track.id),
+                                    "",
+                                )
+                                .width(100.0)
+                                .selected_text(display_text)
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(device_name.is_none(), "None").clicked() {
+                                        self.pending_midi_connections.push((track.id.clone(), String::new()));
+                                    }
+                                    
+                                    for port in &self.midi_ports {
+                                        let is_selected = device_name.as_ref() == Some(port);
+                                        if ui.selectable_label(is_selected, port).clicked() {
+                                            self.pending_midi_connections.push((track.id.clone(), port.clone()));
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                        TrackType::Audio => {
+                            ui.label(
+                                egui::RichText::new("Audio Track")
+                                    .size(10.0)
+                                    .color(ui.visuals().text_color().linear_multiply(0.7))
+                            );
+                        }
+                    }
+                }
+            });
+        });
+        
+        // Handle full rect click for selection
+        let response = ui.interact(rect, ui.id().with(&track.id), egui::Sense::click());
+        if response.clicked() {
+            self.command_collector.add_command(DawCommand::SelectTrack {
+                track_id: track.id.clone(),
+            });
+        }
     }
 
     fn draw_tracks(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &mut DawState) {
-        let clip_rect = ui.clip_rect();
+        // Store and set the clip rect for tracks area
+        let original_clip_rect = ui.clip_rect();
+        ui.set_clip_rect(rect);
+        
         let start_time = self.scroll_offset / self.pixels_per_second;
         let end_time = (self.scroll_offset + rect.width()) / self.pixels_per_second;
 
+        // Apply vertical scroll offset to tracks
         for (track_idx, track) in state.project.tracks.iter().enumerate() {
-            let track_top = rect.top() + track_idx as f32 * self.track_height;
+            let track_top = rect.top() + track_idx as f32 * self.track_height - self.scroll_y;
             let track_rect = egui::Rect::from_min_max(
                 egui::pos2(rect.left(), track_top),
                 egui::pos2(rect.right(), track_top + self.track_height),
             );
 
             // Skip if track is not visible
-            if track_rect.bottom() < clip_rect.top() || track_rect.top() > clip_rect.bottom() {
+            if track_rect.bottom() < rect.top() || track_rect.top() > rect.bottom() {
                 continue;
             }
 
@@ -451,6 +739,9 @@ impl Timeline {
                 self.draw_clip(ui, track_rect, clip, state);
             }
         }
+        
+        // Restore original clip rect
+        ui.set_clip_rect(original_clip_rect);
     }
 
     fn draw_clip(
