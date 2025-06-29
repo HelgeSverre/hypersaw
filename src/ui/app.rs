@@ -1,15 +1,13 @@
 use crate::core::{
-    Clip, CommandManager, DawCommand, DawState, EditorView, MessageType, MidiMessage, Project,
-    SnapMode, StatusMessage, Track, TrackType,
+    CommandManager, DawCommand, DawState, EditorView, MessageType, MidiMessage, Project, SnapMode,
+    StatusMessage, Track, TrackType,
 };
-use crate::ui::channel_strip::ChannelStripWindow;
 use crate::ui::piano_roll::PianoRoll;
 use crate::ui::plugin_browser::PluginBrowser;
 use crate::ui::Timeline;
 use eframe::egui;
 use eframe::emath::Align;
 use egui::Key;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
@@ -25,8 +23,6 @@ pub struct SupersawApp {
     timeline: Timeline,
     piano_roll: PianoRoll,
     plugin_browser: PluginBrowser,
-
-    channel_strips: HashMap<String, ChannelStripWindow>,
 }
 
 enum FileDialog {
@@ -151,7 +147,6 @@ impl SupersawApp {
             piano_roll: PianoRoll::default(),
             command_manager: CommandManager::default(),
             plugin_browser: PluginBrowser::default(),
-            channel_strips: HashMap::new(),
         };
 
         app.state.status.set_message(
@@ -353,14 +348,6 @@ impl SupersawApp {
                                             }
                                         }
                                     }
-
-                                    // Channel strip button
-                                    // if ui.button("📊").clicked() {
-                                    //     self.channel_strips.insert(
-                                    //         track.id.clone().clone(),
-                                    //         ChannelStripWindow::new(track.id.clone(), track.name.clone()),
-                                    //     );
-                                    // }
                                 });
                                 ui.horizontal(|ui| {
                                     // Add MIDI port and channel selection for MIDI tracks
@@ -435,11 +422,6 @@ impl SupersawApp {
                                                 }
                                             },
                                         );
-                                        
-                                        // MIDI Editor button for MIDI tracks
-                                        if ui.small_button("🎼").on_hover_text("MIDI automation (integrated in piano roll)").clicked() {
-                                            // Automation is now integrated in the piano roll
-                                        }
                                     }
                                 });
                             });
@@ -493,28 +475,6 @@ impl SupersawApp {
                 }
             });
         });
-    }
-
-    fn update_channel_strips(&mut self, ctx: &egui::Context) {
-        // let mut strips_to_remove = Vec::new();
-
-        for (track_id, strip) in &mut self.channel_strips {
-            let commands = strip.show(ctx, &mut self.state);
-
-            // let commands = strip.show(ctx, &mut self.state);
-            //
-            // for command in commands {
-            //     if let Err(e) = self.command_manager.execute(command, &mut self.state) {
-            //         self.state
-            //             .status
-            //             .error(format!("Channel strip command failed: {}", e));
-            //     }
-            // }
-        }
-
-        // for track_id in strips_to_remove {
-        //     self.channel_strips.remove(&track_id);
-        // }
     }
 
     fn show_add_track_menu(&mut self) {
@@ -798,8 +758,6 @@ impl eframe::App for SupersawApp {
                 }
             }
         }
-
-        // self.update_channel_strips(ctx);
 
         // Request continuous repaints while playing
         if self.state.playing {
