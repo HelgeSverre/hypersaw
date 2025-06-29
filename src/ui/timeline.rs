@@ -16,6 +16,9 @@ pub struct Timeline {
     command_collector: CommandCollector,
     midi_ports: Vec<String>,
     pending_midi_connections: Vec<(String, String)>, // (track_id, device_name)
+    // Resize state
+    resize_accumulator: f32,
+    resize_initial_values: Option<(f32, f32)>, // (start_time, length)
 }
 
 impl Default for Timeline {
@@ -31,6 +34,8 @@ impl Default for Timeline {
             command_collector: CommandCollector::new(),
             midi_ports: Vec::new(),
             pending_midi_connections: Vec::new(),
+            resize_accumulator: 0.0,
+            resize_initial_values: None,
         }
     }
 }
@@ -814,8 +819,9 @@ impl Timeline {
 
                 let new_start_time = (clip_start_time + time_delta).max(0.0);
 
-                // Snap to grid if enabled
-                let snapped_time = if self.snap_enabled {
+                // Snap to grid if enabled (disable with Shift key)
+                let snap = self.snap_enabled && !ui.input(|i| i.modifiers.shift);
+                let snapped_time = if snap {
                     TimeUtils::snap_time(new_start_time as f64, state.project.bpm, state.snap_mode)
                         as f32
                 } else {
@@ -959,51 +965,104 @@ impl Timeline {
 
         // Handle resizing from left edge
         let left_response = ui.allocate_rect(left_handle, egui::Sense::drag());
+        
+        if left_response.drag_started() {
+            self.resize_initial_values = Some((start_time, length));
+            self.resize_accumulator = 0.0;
+        }
+        
         if left_response.dragged() {
-            let delta = left_response.drag_delta().x / self.pixels_per_second;
-            let new_start = (start_time + delta).max(0.0);
-            let new_length = (length + (start_time - new_start)).max(0.1);
+            if let Some((initial_start, initial_length)) = self.resize_initial_values {
+                // Accumulate drag delta
+                self.resize_accumulator += left_response.drag_delta().x;
+                let accumulated_time_delta = self.resize_accumulator / self.pixels_per_second;
+                let proposed_start = (initial_start + accumulated_time_delta).max(0.0);
+                
+                // Apply snapping if enabled (disable with Shift key)
+                let snap = self.snap_enabled && !ui.input(|i| i.modifiers.shift);
+                let new_start = if snap && self.resize_accumulator.abs() > 10.0 {
+                    TimeUtils::snap_time(
+                        proposed_start as f64,
+                        state.project.bpm,
+                        state.snap_mode,
+                    ) as f32
+                } else {
+                    proposed_start
+                };
+                
+                let new_length = (initial_length + (initial_start - new_start)).max(0.1);
 
-            // TODO: snapping support when holding key-combo
+                // Move the clip
+                self.command_collector.add_command(DawCommand::MoveClip {
+                    clip_id: match clip {
+                        Clip::Midi { id, .. } | Clip::Audio { id, .. } => id.clone(),
+                    },
+                    track_id: state
+                        .project
+                        .tracks
+                        .iter()
+                        .find(|t| t.clips.contains(clip))
+                        .map(|t| t.id.clone())
+                        .unwrap_or_default(),
+                    new_start_time: new_start as f64,
+                });
 
-            // Move the clip
-            self.command_collector.add_command(DawCommand::MoveClip {
-                clip_id: match clip {
-                    Clip::Midi { id, .. } | Clip::Audio { id, .. } => id.clone(),
-                },
-                track_id: state
-                    .project
-                    .tracks
-                    .iter()
-                    .find(|t| t.clips.contains(clip))
-                    .map(|t| t.id.clone())
-                    .unwrap_or_default(),
-                new_start_time: new_start as f64,
-            });
-
-            // Resize the clip (shrink from left = move start time and change length)
-            self.command_collector.add_command(DawCommand::ResizeClip {
-                clip_id: match clip {
-                    Clip::Midi { id, .. } | Clip::Audio { id, .. } => id.clone(),
-                },
-                new_length: new_length as f64,
-            });
+                // Resize the clip (shrink from left = move start time and change length)
+                self.command_collector.add_command(DawCommand::ResizeClip {
+                    clip_id: match clip {
+                        Clip::Midi { id, .. } | Clip::Audio { id, .. } => id.clone(),
+                    },
+                    new_length: new_length as f64,
+                });
+            }
+        }
+        
+        if left_response.drag_stopped() {
+            self.resize_initial_values = None;
+            self.resize_accumulator = 0.0;
         }
 
         // Handle resizing from right edge (only change length as clip doesn't move)
         let right_response = ui.allocate_rect(right_handle, egui::Sense::drag());
+        
+        if right_response.drag_started() {
+            self.resize_initial_values = Some((start_time, length));
+            self.resize_accumulator = 0.0;
+        }
+        
         if right_response.dragged() {
-            let delta = right_response.drag_delta().x / self.pixels_per_second;
-            let new_length = (length + delta).max(0.1);
+            if let Some((initial_start, initial_length)) = self.resize_initial_values {
+                // Accumulate drag delta
+                self.resize_accumulator += right_response.drag_delta().x;
+                let accumulated_time_delta = self.resize_accumulator / self.pixels_per_second;
+                let proposed_length = (initial_length + accumulated_time_delta).max(0.1);
+                
+                // Apply snapping if enabled (disable with Shift key)
+                let snap = self.snap_enabled && !ui.input(|i| i.modifiers.shift);
+                let new_length = if snap && self.resize_accumulator.abs() > 10.0 {
+                    let end_time = initial_start + proposed_length;
+                    let snapped_end = TimeUtils::snap_time(
+                        end_time as f64,
+                        state.project.bpm,
+                        state.snap_mode,
+                    ) as f32;
+                    (snapped_end - initial_start).max(0.1)
+                } else {
+                    proposed_length
+                };
 
-            // TODO: snapping support when holding key-combo
-
-            self.command_collector.add_command(DawCommand::ResizeClip {
-                clip_id: match clip {
-                    Clip::Midi { id, .. } | Clip::Audio { id, .. } => id.clone(),
-                },
-                new_length: new_length as f64,
-            });
+                self.command_collector.add_command(DawCommand::ResizeClip {
+                    clip_id: match clip {
+                        Clip::Midi { id, .. } | Clip::Audio { id, .. } => id.clone(),
+                    },
+                    new_length: new_length as f64,
+                });
+            }
+        }
+        
+        if right_response.drag_stopped() {
+            self.resize_initial_values = None;
+            self.resize_accumulator = 0.0;
         }
 
         // Change cursor when hovering over resize handles
