@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
-use crate::core::{MidiEvent, MidiEventStore};
+use crate::core::{MidiEvent, MidiEventStore, AutomationLane};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
@@ -123,6 +123,8 @@ pub enum Clip {
         file_path: PathBuf,
         midi_data: Option<MidiEventStore>,
         loaded: bool,
+        #[serde(default)]
+        automation_lanes: Vec<AutomationLane>,
     },
     Audio {
         id: ClipId,
@@ -322,6 +324,7 @@ impl Project {
             file_path: file_path.to_path_buf(),
             midi_data: None,
             loaded: false,
+            automation_lanes: Vec::new(),
         };
 
         // Load the MIDI data

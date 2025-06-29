@@ -1,5 +1,6 @@
 // src/core/commands.rs
 use super::*;
+use crate::core::{AutomationParameter, AutomationLane};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -112,6 +113,38 @@ pub enum DawCommand {
         new_length: f64,
     },
 
+    // Automation
+    AddAutomationLane {
+        clip_id: String,
+        parameter: AutomationParameter,
+    },
+    RemoveAutomationLane {
+        clip_id: String,
+        lane_id: String,
+    },
+    SetAutomationLaneVisibility {
+        clip_id: String,
+        lane_id: String,
+        visible: bool,
+    },
+    AddAutomationPoint {
+        clip_id: String,
+        lane_id: String,
+        time: f64,
+        value: f64,
+    },
+    DeleteAutomationPoints {
+        clip_id: String,
+        points: Vec<(String, String)>, // (lane_id, point_id)
+    },
+    UpdateAutomationPoint {
+        clip_id: String,
+        lane_id: String,
+        point_id: String,
+        time: Option<f64>,
+        value: Option<f64>,
+    },
+    
     // Transport
     EnableMetronome,
     DisableMetronome,
@@ -282,6 +315,7 @@ impl Command for DawCommand {
                             file_path: file_path.clone(),
                             midi_data: None,
                             loaded: false,
+                            automation_lanes: Vec::new(),
                         },
                         TrackType::Audio => Clip::Audio {
                             id: Uuid::new_v4().to_string(),
@@ -490,6 +524,97 @@ impl Command for DawCommand {
                 }
                 Ok(())
             }
+            
+            // Automation commands
+            DawCommand::AddAutomationLane { clip_id, parameter } => {
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { automation_lanes, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        let mut lane = AutomationLane::new(parameter.clone());
+                        lane.visible = true;
+                        automation_lanes.push(lane);
+                    }
+                }
+                Ok(())
+            }
+            
+            DawCommand::RemoveAutomationLane { clip_id, lane_id } => {
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { automation_lanes, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        automation_lanes.retain(|lane| lane.id != *lane_id);
+                    }
+                }
+                Ok(())
+            }
+            
+            DawCommand::SetAutomationLaneVisibility { clip_id, lane_id, visible } => {
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { automation_lanes, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        if let Some(lane) = automation_lanes.iter_mut().find(|l| l.id == *lane_id) {
+                            lane.visible = *visible;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            
+            DawCommand::AddAutomationPoint { clip_id, lane_id, time, value } => {
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { automation_lanes, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        if let Some(lane) = automation_lanes.iter_mut().find(|l| l.id == *lane_id) {
+                            lane.add_point(*time, *value);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            
+            DawCommand::DeleteAutomationPoints { clip_id, points } => {
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { automation_lanes, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        for (lane_id, point_id) in points {
+                            if let Some(lane) = automation_lanes.iter_mut().find(|l| &l.id == lane_id) {
+                                lane.remove_point(point_id);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            
+            DawCommand::UpdateAutomationPoint { clip_id, lane_id, point_id, time, value } => {
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { automation_lanes, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        if let Some(lane) = automation_lanes.iter_mut().find(|l| l.id == *lane_id) {
+                            lane.update_point(point_id, *time, *value);
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -533,6 +658,12 @@ impl Command for DawCommand {
             DawCommand::UnarmTrack { .. } => "Unarm Track",
             DawCommand::SetTrackColor { .. } => "Set Track Color",
             DawCommand::DeselectAll => "Deselect All",
+            DawCommand::AddAutomationLane { .. } => "Add Automation Lane",
+            DawCommand::RemoveAutomationLane { .. } => "Remove Automation Lane",
+            DawCommand::SetAutomationLaneVisibility { .. } => "Set Automation Lane Visibility",
+            DawCommand::AddAutomationPoint { .. } => "Add Automation Point",
+            DawCommand::DeleteAutomationPoints { .. } => "Delete Automation Points",
+            DawCommand::UpdateAutomationPoint { .. } => "Update Automation Point",
         }
     }
 }

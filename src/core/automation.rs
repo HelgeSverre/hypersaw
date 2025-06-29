@@ -20,7 +20,7 @@ pub enum CurveType {
     Logarithmic,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AutomationLane {
     pub id: String,
     pub parameter: AutomationParameter,
