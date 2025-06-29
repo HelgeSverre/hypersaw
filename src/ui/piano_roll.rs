@@ -1684,34 +1684,55 @@ impl PianoRoll {
                     let point_id = point.id.clone();
                     let lane_id = lane.id.clone();
                     
-                    if point_response.clicked() {
+                    // Handle drag start - select immediately on mouse down if not already selected
+                    if point_response.drag_started() {
+                        if !is_selected {
+                            if ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+                                // Add to selection
+                                self.selected_automation_points.push((lane_id.clone(), point_id.clone()));
+                            } else {
+                                // Single select
+                                self.selected_automation_points.clear();
+                                self.selected_automation_points.push((lane_id.clone(), point_id.clone()));
+                            }
+                        }
+                    }
+                    
+                    // Handle click without drag (for toggle selection)
+                    if point_response.clicked() && !point_response.dragged() {
                         if ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
-                            // Multi-select
+                            // Toggle selection
                             let selection = (lane_id.clone(), point_id.clone());
                             if is_selected {
                                 self.selected_automation_points.retain(|s| s != &selection);
                             } else {
                                 self.selected_automation_points.push(selection);
                             }
-                        } else {
-                            // Single select
+                        } else if !is_selected {
+                            // Single select if not already selected
                             self.selected_automation_points.clear();
                             self.selected_automation_points.push((lane_id.clone(), point_id.clone()));
                         }
                     }
                     
-                    // Handle dragging
-                    if point_response.dragged() && is_selected {
-                        let delta_x = point_response.drag_delta().x / self.zoom;
-                        let delta_y = -point_response.drag_delta().y / rect.height();
-                        
-                        let new_time = (point.time + delta_x as f64).max(0.0);
-                        let delta_value = delta_y as f64 * (lane.max_value - lane.min_value);
-                        let new_value = (point.value + delta_value).clamp(lane.min_value, lane.max_value);
-                        
-                        // Update the point
-                        if let Some(lane) = self.automation_lanes.iter_mut().find(|l| l.id == lane_id) {
-                            lane.update_point(&point_id, Some(new_time), Some(new_value));
+                    // Handle dragging - now works immediately since we select on drag_started
+                    if point_response.dragged() {
+                        // Check if this point is selected (it should be after drag_started)
+                        let is_selected_now = self.selected_automation_points.iter()
+                            .any(|(lid, pid)| lid == &lane_id && pid == &point_id);
+                            
+                        if is_selected_now {
+                            let delta_x = point_response.drag_delta().x / self.zoom;
+                            let delta_y = -point_response.drag_delta().y / rect.height();
+                            
+                            let new_time = (point.time + delta_x as f64).max(0.0);
+                            let delta_value = delta_y as f64 * (lane.max_value - lane.min_value);
+                            let new_value = (point.value + delta_value).clamp(lane.min_value, lane.max_value);
+                            
+                            // Update the point
+                            if let Some(lane) = self.automation_lanes.iter_mut().find(|l| l.id == lane_id) {
+                                lane.update_point(&point_id, Some(new_time), Some(new_value));
+                            }
                         }
                     }
                 }
