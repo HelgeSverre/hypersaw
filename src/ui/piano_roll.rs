@@ -25,6 +25,14 @@ pub struct PianoRoll {
     resizing_divider: bool,
     // UI state
     show_automation: bool,
+    // Drag state
+    drag_accumulator: f32,
+    resize_initial_values: Option<(f64, f64)>, // (start_time, duration)
+    drag_initial_positions: Option<Vec<(String, f64, u8)>>, // Vec<(note_id, start_time, pitch)>
+    drag_accumulator_x: f32,
+    drag_accumulator_y: f32,
+    last_applied_delta_time: f64,
+    last_applied_delta_pitch: i8,
 }
 
 #[derive(Debug)]
@@ -40,6 +48,37 @@ enum DragOperation {
 enum ResizeEdge {
     Left,
     Right,
+}
+
+// Helper struct for note positioning calculations
+struct NotePositioning {
+    zoom: f32,
+    key_height: f32,
+    scroll_x: f32,
+    scroll_y: f32,
+    note_area: egui::Rect,
+}
+
+impl NotePositioning {
+    fn new(zoom: f32, key_height: f32, scroll_x: f32, scroll_y: f32, note_area: egui::Rect) -> Self {
+        Self { zoom, key_height, scroll_x, scroll_y, note_area }
+    }
+    
+    fn note_to_rect(&self, start_time: f64, key: u8, duration: f64) -> egui::Rect {
+        let x_start = self.note_area.left() + (start_time as f32 * self.zoom) - self.scroll_x;
+        let x_end = self.note_area.left() + ((start_time + duration) as f32 * self.zoom) - self.scroll_x;
+        let y = self.note_area.bottom() - (key as f32 + 1.0) * self.key_height + self.scroll_y;
+        
+        egui::Rect::from_min_max(
+            egui::pos2(x_start, y),
+            egui::pos2(x_end, y + self.key_height),
+        )
+    }
+    
+    fn is_note_visible(&self, start_time: f64, key: u8, duration: f64) -> bool {
+        let note_rect = self.note_to_rect(start_time, key, duration);
+        note_rect.intersects(self.note_area)
+    }
 }
 
 impl PianoRoll {
@@ -78,6 +117,13 @@ impl PianoRoll {
             automation_scroll_y: 0.0,
             resizing_divider: false,
             show_automation: true,
+            drag_accumulator: 0.0,
+            resize_initial_values: None,
+            drag_initial_positions: None,
+            drag_accumulator_x: 0.0,
+            drag_accumulator_y: 0.0,
+            last_applied_delta_time: 0.0,
+            last_applied_delta_pitch: 0,
         }
     }
     fn get_active_notes(
@@ -195,6 +241,10 @@ impl PianoRoll {
 
                 self.center_on_middle_c(rect.height());
                 self.draw_grid(ui, rect, state);
+                
+                // Handle note area interactions before drawing notes
+                self.handle_note_area_interaction(ui, rect, clip_id, track_id, state, &response);
+                
                 self.draw_notes(ui, rect, clip_id, track_id, state);
                 self.draw_piano_keys(ui, rect, state, clip_id, track_id);
 
@@ -206,15 +256,18 @@ impl PianoRoll {
 
                 // Handle middle-button dragging for panning
                 if response.dragged() && !self.resizing_divider {
-                    // Horizontal scroll
-                    let invert = -1.0;
-                    let delta = response.drag_delta();
-                    self.scroll_x = (self.scroll_x + delta.x * invert).max(0.0);
+                    // Only pan if we're not drawing or have another drag operation
+                    if self.dragging.is_none() {
+                        // Horizontal scroll
+                        let invert = -1.0;
+                        let delta = response.drag_delta();
+                        self.scroll_x = (self.scroll_x + delta.x * invert).max(0.0);
 
-                    // Vertical scroll
-                    let new_scroll_y = (self.scroll_y + delta.y).max(0.0);
-                    self.scroll_y =
-                        new_scroll_y.clamp(0.0, self.get_total_height() - self.viewport_height);
+                        // Vertical scroll
+                        let new_scroll_y = (self.scroll_y + delta.y).max(0.0);
+                        self.scroll_y =
+                            new_scroll_y.clamp(0.0, self.get_total_height() - self.viewport_height);
+                    }
                 }
             });
 
@@ -230,18 +283,44 @@ impl PianoRoll {
                 });
             }
 
-            // Handle delete key
-            if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
-                if !self.selected_notes.is_empty() {
-                    self.command_collector.add_command(DawCommand::DeleteNotes {
-                        clip_id: clip_id.to_string(),
-                        note_ids: self.selected_notes.clone(),
-                    });
-                    self.selected_notes.clear();
+            // Handle keyboard shortcuts
+            ui.input(|i| {
+                // Delete key - delete selected notes
+                if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
+                    if !self.selected_notes.is_empty() {
+                        self.command_collector.add_command(DawCommand::DeleteNotes {
+                            clip_id: clip_id.to_string(),
+                            note_ids: self.selected_notes.clone(),
+                        });
+                        self.selected_notes.clear();
+                    }
+                    
+                    // TODO: Also handle deleting automation points
                 }
                 
-                // TODO: Also handle deleting automation points
-            }
+                // Ctrl+A - Select all notes
+                if i.key_pressed(egui::Key::A) && (i.modifiers.ctrl || i.modifiers.command) {
+                    self.selected_notes.clear();
+                    // Get all notes in the clip
+                    if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id) {
+                        if let Some(Clip::Midi { midi_data, .. }) = track.clips.iter()
+                            .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                        {
+                            if let Some(store) = midi_data {
+                                for note in store.get_notes() {
+                                    self.selected_notes.push(note.id.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Escape - Clear selection
+                if i.key_pressed(egui::Key::Escape) {
+                    self.selected_notes.clear();
+                    self.selected_automation_points.clear();
+                }
+            });
 
             // Auto-scroll to follow playhead if it's outside view
             // self.handle_playhead_autoscroll(rect, clip_start, state.current_time);
@@ -296,34 +375,114 @@ impl PianoRoll {
         clip_id: &str,
         state: &DawState,
     ) {
-        if response.dragged() {
+        const DRAG_THRESHOLD: f32 = 3.0;  // Pixels before drag starts
+        const PITCH_DRAG_THRESHOLD: f32 = 0.5;  // Half a key height before pitch changes
+
+        // Initialize drag state when starting
+        if response.drag_started() {
             // Ensure the note being dragged is selected
             if !self.selected_notes.contains(&note.id) {
                 self.selected_notes.push(note.id.clone());
             }
 
-            // Calculate deltas from last frame
-            let delta_x = response.drag_delta().x / self.zoom;
-            let delta_y = -(response.drag_delta().y / self.key_height) as i8;
-
-            // Apply snapping if enabled
-            let actual_delta_time = if self.grid_snap {
-                let new_time = TimeUtils::snap_time(
-                    note.start_time + delta_x as f64,
-                    state.project.bpm,
-                    state.snap_mode,
-                );
-                new_time - note.start_time
-            } else {
-                delta_x as f64
-            };
-
-            self.command_collector.add_command(DawCommand::MoveNotes {
-                clip_id: clip_id.to_string(),
-                note_ids: self.selected_notes.clone(),
-                delta_time: actual_delta_time,
-                delta_pitch: delta_y,
+            // Store initial positions of all selected notes
+            let mut initial_positions = Vec::new();
+            if let Some(track) = state.project.tracks.iter().find(|t| 
+                t.clips.iter().any(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+            ) {
+                if let Some(Clip::Midi { midi_data, .. }) = track.clips.iter()
+                    .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                {
+                    if let Some(store) = midi_data {
+                        for selected_id in &self.selected_notes {
+                            // Find the note by iterating through all notes
+                            for note in store.get_notes() {
+                                if &note.id == selected_id {
+                                    initial_positions.push((
+                                        selected_id.clone(),
+                                        note.start_time,
+                                        note.key,
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            self.drag_initial_positions = Some(initial_positions);
+            self.drag_accumulator_x = 0.0;
+            self.drag_accumulator_y = 0.0;
+            self.last_applied_delta_time = 0.0;
+            self.last_applied_delta_pitch = 0;
+            self.dragging = Some(DragOperation::MovingNotes {
+                start_x: response.interact_pointer_pos().unwrap_or_default().x,
+                start_y: response.interact_pointer_pos().unwrap_or_default().y,
             });
+        }
+
+        // Handle dragging
+        if response.dragged() {
+            if let Some(ref initial_positions) = self.drag_initial_positions {
+                // Accumulate drag deltas
+                self.drag_accumulator_x += response.drag_delta().x;
+                self.drag_accumulator_y += response.drag_delta().y;
+
+                // Only process if we've exceeded the threshold
+                if self.drag_accumulator_x.abs() >= DRAG_THRESHOLD || 
+                   (self.drag_accumulator_y.abs() / self.key_height) >= PITCH_DRAG_THRESHOLD {
+                    
+                    // Convert accumulated pixel delta to time and pitch deltas from initial position
+                    let accumulated_time_delta = self.drag_accumulator_x / self.zoom;
+                    let accumulated_pitch_delta = -(self.drag_accumulator_y / self.key_height).round() as i8;
+
+                    // Apply snapping less aggressively (only when accumulated drag is significant)
+                    let total_delta_time = if self.grid_snap && self.drag_accumulator_x.abs() > 10.0 {
+                        // Find the first note's initial position to use as reference
+                        if let Some((_, initial_time, _)) = initial_positions.first() {
+                            let new_time = TimeUtils::snap_time(
+                                initial_time + accumulated_time_delta as f64,
+                                state.project.bpm,
+                                state.snap_mode,
+                            );
+                            new_time - initial_time
+                        } else {
+                            accumulated_time_delta as f64
+                        }
+                    } else {
+                        accumulated_time_delta as f64
+                    };
+
+                    // Calculate incremental delta from last applied position
+                    let incremental_delta_time = total_delta_time - self.last_applied_delta_time;
+                    let incremental_delta_pitch = accumulated_pitch_delta - self.last_applied_delta_pitch;
+
+                    // Only send command if there's an actual change
+                    if incremental_delta_time.abs() > 0.001 || incremental_delta_pitch != 0 {
+                        self.command_collector.add_command(DawCommand::MoveNotes {
+                            clip_id: clip_id.to_string(),
+                            note_ids: self.selected_notes.clone(),
+                            delta_time: incremental_delta_time,
+                            delta_pitch: incremental_delta_pitch,
+                        });
+
+                        // Update last applied deltas
+                        self.last_applied_delta_time = total_delta_time;
+                        self.last_applied_delta_pitch = accumulated_pitch_delta;
+                    }
+                }
+            }
+        }
+
+        // Clean up when drag ends
+        if response.drag_stopped() {
+            self.drag_initial_positions = None;
+            self.drag_accumulator_x = 0.0;
+            self.drag_accumulator_y = 0.0;
+            self.last_applied_delta_time = 0.0;
+            self.last_applied_delta_pitch = 0;
+            self.dragging = None;
         }
     }
 
@@ -621,7 +780,8 @@ impl PianoRoll {
         state: &DawState,
         note_response: &egui::Response,
     ) {
-        let handle_width = 4.0;
+        let handle_width = 6.0;  // Made wider for easier grabbing
+        const DRAG_THRESHOLD: f32 = 3.0;  // Pixels before resize starts
 
         // Create resize handles
         let left_handle = egui::Rect::from_min_size(
@@ -645,6 +805,18 @@ impl PianoRoll {
         let left_response = ui.allocate_rect(left_handle, egui::Sense::drag());
         let right_response = ui.allocate_rect(right_handle, egui::Sense::drag());
 
+        // Initialize resize state when drag starts
+        if left_response.drag_started() || right_response.drag_started() {
+            self.resize_initial_values = Some((note.start_time, note.duration));
+            self.drag_accumulator = 0.0;
+        }
+
+        // Reset state when drag stops
+        if left_response.drag_stopped() || right_response.drag_stopped() {
+            self.resize_initial_values = None;
+            self.drag_accumulator = 0.0;
+        }
+
         if (left_response.dragged() || right_response.dragged())
             && !matches!(self.dragging, Some(DragOperation::MovingNotes { .. }))
         {
@@ -654,54 +826,63 @@ impl PianoRoll {
                 (ResizeEdge::Right, right_response.drag_delta().x)
             };
 
-            // Convert pixel delta to time delta
-            let delta_time = delta / self.zoom;
+            // Accumulate drag delta
+            self.drag_accumulator += delta;
 
-            // Calculate new times based on the delta
-            let (new_start_time, new_duration) = match edge {
-                ResizeEdge::Left => {
-                    let note_end = note.start_time + note.duration;
-                    let proposed_start = note.start_time - delta_time as f64;
+            // Only process if we've exceeded the threshold
+            if self.drag_accumulator.abs() >= DRAG_THRESHOLD {
+                if let Some((initial_start, initial_duration)) = self.resize_initial_values {
+                    // Convert accumulated pixel delta to time delta
+                    let accumulated_time_delta = self.drag_accumulator / self.zoom;
 
-                    // Clamp the start time to not go beyond the note end
-                    let new_start = if self.grid_snap {
-                        TimeUtils::snap_time(
-                            proposed_start.min(note_end - 0.1),
-                            state.project.bpm,
-                            state.snap_mode,
-                        )
-                    } else {
-                        proposed_start.min(note_end - 0.1)
+                    // Calculate new times based on the accumulated delta
+                    let (new_start_time, new_duration) = match edge {
+                        ResizeEdge::Left => {
+                            let note_end = initial_start + initial_duration;
+                            let proposed_start = initial_start - accumulated_time_delta as f64;
+
+                            // Apply snapping less aggressively
+                            let new_start = if self.grid_snap && self.drag_accumulator.abs() > 10.0 {
+                                TimeUtils::snap_time(
+                                    proposed_start.max(0.0).min(note_end - 0.1),
+                                    state.project.bpm,
+                                    state.snap_mode,
+                                )
+                            } else {
+                                proposed_start.max(0.0).min(note_end - 0.1)
+                            };
+
+                            let new_duration = note_end - new_start;
+                            (new_start, new_duration)
+                        }
+                        ResizeEdge::Right => {
+                            let proposed_duration = initial_duration + accumulated_time_delta as f64;
+
+                            // Apply snapping less aggressively
+                            let new_duration = if self.grid_snap && self.drag_accumulator.abs() > 10.0 {
+                                let end_time = initial_start + proposed_duration;
+                                let snapped_end = TimeUtils::snap_time(
+                                    end_time.max(initial_start + 0.1),
+                                    state.project.bpm,
+                                    state.snap_mode,
+                                );
+                                snapped_end - initial_start
+                            } else {
+                                proposed_duration.max(0.1)
+                            };
+
+                            (initial_start, new_duration)
+                        }
                     };
 
-                    // Duration is always end - start
-                    let new_duration = note_end - new_start;
-                    (new_start, new_duration)
+                    self.command_collector.add_command(DawCommand::ResizeNote {
+                        clip_id: clip_id.to_string(),
+                        note_id: note.id.clone(),
+                        new_start_time,
+                        new_duration,
+                    });
                 }
-                ResizeEdge::Right => {
-                    let proposed_duration = note.duration + delta_time as f64;
-
-                    // Clamp the duration to be positive
-                    let new_duration = if self.grid_snap {
-                        TimeUtils::snap_time(
-                            proposed_duration.max(0.1),
-                            state.project.bpm,
-                            state.snap_mode,
-                        )
-                    } else {
-                        proposed_duration.max(0.1)
-                    };
-
-                    (note.start_time, new_duration)
-                }
-            };
-
-            self.command_collector.add_command(DawCommand::ResizeNote {
-                clip_id: clip_id.to_string(),
-                note_id: note.id.clone(),
-                new_start_time,
-                new_duration,
-            });
+            }
         }
 
         // Update cursor
@@ -722,10 +903,22 @@ impl PianoRoll {
 
         // Handle selection
         if response.clicked() {
-            if self.selected_notes.contains(&note.id) {
-                // Deselect note if already selected
-                self.selected_notes.retain(|id| id != &note.id);
+            if ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+                // Ctrl+Click: Toggle selection
+                if self.selected_notes.contains(&note.id) {
+                    self.selected_notes.retain(|id| id != &note.id);
+                } else {
+                    self.selected_notes.push(note.id.clone());
+                }
+            } else if ui.input(|i| i.modifiers.shift) && !self.selected_notes.is_empty() {
+                // Shift+Click: Range selection (to be implemented later)
+                // For now, just add to selection
+                if !self.selected_notes.contains(&note.id) {
+                    self.selected_notes.push(note.id.clone());
+                }
             } else {
+                // Regular click: Single selection
+                self.selected_notes.clear();
                 self.selected_notes.push(note.id.clone());
             }
         }
@@ -854,6 +1047,121 @@ impl PianoRoll {
 
     fn get_total_height(&self) -> f32 {
         (DEFAULT_OCTAVES * NOTES_PER_OCTAVE) as f32 * self.key_height
+    }
+
+    fn handle_note_area_interaction(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        clip_id: &str,
+        track_id: &str,
+        state: &DawState,
+        response: &egui::Response,
+    ) {
+        let note_area = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + self.key_width, rect.top()),
+            rect.max,
+        );
+
+        // Only handle clicks in the note area (not on piano keys)
+        if let Some(pos) = response.interact_pointer_pos() {
+            if pos.x > rect.left() + self.key_width {
+                // Start drawing operation on click
+                if response.clicked() && !ui.input(|i| i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift) {
+                    // Check if we clicked on empty space (not on a note)
+                    let clicked_on_note = self.get_visible_notes(note_area, track_id, clip_id, state)
+                        .iter()
+                        .any(|note| {
+                            let note_rect = NotePositioning::new(
+                                self.zoom,
+                                self.key_height,
+                                self.scroll_x,
+                                self.scroll_y,
+                                note_area,
+                            ).note_to_rect(note.start_time, note.key, note.duration);
+                            note_rect.contains(pos)
+                        });
+
+                    if !clicked_on_note {
+                        // Clear selection when clicking empty space
+                        self.selected_notes.clear();
+                        
+                        // Calculate note position from click
+                        let time = ((pos.x - note_area.left() + self.scroll_x) / self.zoom) as f64;
+                        let pitch_float = (rect.bottom() - pos.y + self.scroll_y) / self.key_height;
+                        let pitch = pitch_float.floor() as u8;
+                        
+                        // Snap time to grid if enabled
+                        let snapped_time = if self.grid_snap {
+                            TimeUtils::snap_time(time, state.project.bpm, state.snap_mode)
+                        } else {
+                            time
+                        };
+                        
+                        // Calculate default duration (1 beat)
+                        let beat_duration = 60.0 / state.project.bpm;
+                        let default_duration = if self.grid_snap {
+                            state.snap_mode.get_division(state.project.bpm)
+                        } else {
+                            beat_duration
+                        };
+                        
+                        // Create the note
+                        self.command_collector.add_command(DawCommand::AddNote {
+                            clip_id: clip_id.to_string(),
+                            start_time: snapped_time,
+                            duration: default_duration,
+                            pitch,
+                            velocity: 100, // Default velocity
+                        });
+                        
+                        // Start drawing operation for potential drag-to-extend
+                        self.dragging = Some(DragOperation::Drawing { 
+                            start_x: pos.x,
+                            start_y: pos.y,
+                        });
+                    }
+                }
+                
+                // Handle drag to extend note duration
+                if response.dragged() {
+                    if let Some(DragOperation::Drawing { start_x, start_y }) = self.dragging {
+                        // Visual feedback could be added here
+                        // For now, we'll handle the duration on release
+                    }
+                }
+                
+                // Complete drawing operation on release
+                if response.drag_stopped() {
+                    if let Some(DragOperation::Drawing { start_x, start_y }) = self.dragging {
+                        if let Some(end_pos) = response.interact_pointer_pos() {
+                            let drag_distance = (end_pos.x - start_x).abs();
+                            
+                            // Only extend duration if we dragged significantly
+                            if drag_distance > 5.0 {
+                                // Calculate the duration from drag
+                                let start_time = ((start_x - note_area.left() + self.scroll_x) / self.zoom) as f64;
+                                let end_time = ((end_pos.x - note_area.left() + self.scroll_x) / self.zoom) as f64;
+                                
+                                if end_time > start_time {
+                                    let duration = end_time - start_time;
+                                    let snapped_duration = if self.grid_snap {
+                                        TimeUtils::snap_time(duration, state.project.bpm, state.snap_mode)
+                                    } else {
+                                        duration
+                                    };
+                                    
+                                    // We already created the note with default duration,
+                                    // so we'd need to update it here. For now, this is a TODO.
+                                    // TODO: Track the created note ID and update its duration
+                                }
+                            }
+                        }
+                        self.dragging = None;
+                    }
+                }
+            }
+        }
     }
 
     //todo move into utils/midi module
