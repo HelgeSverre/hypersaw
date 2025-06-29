@@ -19,7 +19,6 @@ pub struct PianoRoll {
     command_collector: CommandCollector,
     // Automation panel
     automation_panel_height: f32,
-    automation_lanes: Vec<AutomationLane>,
     selected_automation_points: Vec<(String, String)>, // (lane_id, point_id)
     automation_scroll_y: f32,
     resizing_divider: bool,
@@ -86,23 +85,6 @@ impl NotePositioning {
 
 impl PianoRoll {
     pub fn default() -> Self {
-        let mut automation_lanes = Vec::new();
-        
-        // Add default velocity lane
-        let mut velocity_lane = AutomationLane::new(AutomationParameter::Velocity);
-        velocity_lane.visible = true;
-        automation_lanes.push(velocity_lane);
-        
-        // Add common MIDI CC lanes (hidden by default)
-        for (cc, name) in common_midi_cc().into_iter().take(4) {
-            let mut lane = AutomationLane::new(AutomationParameter::MidiCC {
-                cc_number: cc,
-                name: name.to_string(),
-            });
-            lane.visible = false;
-            automation_lanes.push(lane);
-        }
-        
         Self {
             key_width: 80.0,
             key_height: 20.0,
@@ -115,7 +97,6 @@ impl PianoRoll {
             dragging: None,
             command_collector: CommandCollector::new(),
             automation_panel_height: 200.0,
-            automation_lanes,
             selected_automation_points: Vec::new(),
             automation_scroll_y: 0.0,
             resizing_divider: false,
@@ -130,6 +111,16 @@ impl PianoRoll {
             cc_search_query: String::new(),
         }
     }
+    fn ensure_default_automation_lanes(&mut self, clip_id: &str) {
+        // This method ensures a clip has default automation lanes
+        // In a real implementation, this would use commands to modify the clip
+        // For now, we'll add a command to add velocity lane if it doesn't exist
+        self.command_collector.add_command(DawCommand::AddAutomationLane {
+            clip_id: clip_id.to_string(),
+            parameter: AutomationParameter::Velocity,
+        });
+    }
+    
     fn get_active_notes(
         &self,
         state: &DawState,
@@ -167,17 +158,22 @@ impl PianoRoll {
         active_notes
     }
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut DawState) -> Vec<DawCommand> {
-        if let EditorView::PianoRoll {
+        let (clip_id, track_id) = if let EditorView::PianoRoll {
             clip_id, track_id, ..
         } = &state.current_view
         {
-            // TODO: move into the project.rs - track struct
-            // Load MIDI data if needed
-            if let Some(track) = state.project.tracks.iter_mut().find(|t| &t.id == track_id) {
-                if let Some(clip @ Clip::Midi { loaded: false, .. }) = track
-                    .clips
-                    .iter_mut()
-                    .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+            (clip_id.clone(), track_id.clone())
+        } else {
+            return Vec::new();
+        };
+        
+        // TODO: move into the project.rs - track struct
+        // Load MIDI data if needed
+        if let Some(track) = state.project.tracks.iter_mut().find(|t| &t.id == &track_id) {
+            if let Some(clip @ Clip::Midi { loaded: false, .. }) = track
+                .clips
+                .iter_mut()
+                .find(|c| matches!(c, Clip::Midi { id, .. } if id == &clip_id))
                 {
                     if let Err(e) = clip.load_midi() {
                         state
@@ -187,23 +183,23 @@ impl PianoRoll {
                 }
             }
 
-            // Get clip start time
-            let clip_start =
-                if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id) {
-                    if let Some(Clip::Midi { start_time, .. }) = track
-                        .clips
-                        .iter()
-                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
-                    {
-                        *start_time
-                    } else {
-                        0.0
-                    }
+        // Get clip start time
+        let clip_start =
+            if let Some(track) = state.project.tracks.iter().find(|t| &t.id == &track_id) {
+                if let Some(Clip::Midi { start_time, .. }) = track
+                    .clips
+                    .iter()
+                    .find(|c| matches!(c, Clip::Midi { id, .. } if id == &clip_id))
+                {
+                    *start_time
                 } else {
                     0.0
-                };
+                }
+            } else {
+                0.0
+            };
 
-            let full_rect = ui.available_rect_before_wrap();
+        let full_rect = ui.available_rect_before_wrap();
             
             // Calculate rects for piano roll and automation
             let divider_height = 4.0;
@@ -247,10 +243,10 @@ impl PianoRoll {
                 self.draw_grid(ui, rect, state);
                 
                 // Handle note area interactions before drawing notes
-                self.handle_note_area_interaction(ui, rect, clip_id, track_id, state, &response);
+                self.handle_note_area_interaction(ui, rect, &clip_id, &track_id, state, &response);
                 
-                self.draw_notes(ui, rect, clip_id, track_id, state);
-                self.draw_piano_keys(ui, rect, state, clip_id, track_id);
+                self.draw_notes(ui, rect, &clip_id, &track_id, state);
+                self.draw_piano_keys(ui, rect, state, &clip_id, &track_id);
 
                 // Draw playhead after everything else
                 self.draw_playhead(ui, rect, clip_start, state.current_time);
@@ -303,8 +299,10 @@ impl PianoRoll {
                 // Fill background to prevent bleed-through
                 ui.painter().rect_filled(automation_rect, 0.0, ui.visuals().window_fill);
                 
+                let clip_id_clone = clip_id.clone();
+                let track_id_clone = track_id.clone();
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(automation_rect), |ui| {
-                    self.draw_automation_panel(ui, automation_rect, clip_id, track_id, state);
+                    self.draw_automation_panel(ui, automation_rect, &clip_id_clone, &track_id_clone, state);
                 });
             }
 
@@ -322,11 +320,10 @@ impl PianoRoll {
                     
                     // Handle deleting automation points
                     if !self.selected_automation_points.is_empty() {
-                        for (lane_id, point_id) in &self.selected_automation_points {
-                            if let Some(lane) = self.automation_lanes.iter_mut().find(|l| &l.id == lane_id) {
-                                lane.remove_point(point_id);
-                            }
-                        }
+                        self.command_collector.add_command(DawCommand::DeleteAutomationPoints {
+                            clip_id: clip_id.to_string(),
+                            points: self.selected_automation_points.clone(),
+                        });
                         self.selected_automation_points.clear();
                     }
                 }
@@ -335,9 +332,9 @@ impl PianoRoll {
                 if i.key_pressed(egui::Key::A) && (i.modifiers.ctrl || i.modifiers.command) {
                     self.selected_notes.clear();
                     // Get all notes in the clip
-                    if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id) {
+                    if let Some(track) = state.project.tracks.iter().find(|t| &t.id == &track_id) {
                         if let Some(Clip::Midi { midi_data, .. }) = track.clips.iter()
-                            .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                            .find(|c| matches!(c, Clip::Midi { id, .. } if id == &clip_id))
                         {
                             if let Some(store) = midi_data {
                                 for note in store.get_notes() {
@@ -357,7 +354,6 @@ impl PianoRoll {
 
             // Auto-scroll to follow playhead if it's outside view
             // self.handle_playhead_autoscroll(rect, clip_start, state.current_time);
-        }
 
         self.command_collector.take_commands()
     }
@@ -1336,9 +1332,23 @@ impl PianoRoll {
         }
     }
 
-    fn draw_automation_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect, clip_id: &str, track_id: &str, state: &DawState) {
+    fn draw_automation_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect, clip_id: &str, track_id: &str, state: &mut DawState) {
         let header_height = 30.0;
         let lane_gap = 2.0;
+        
+        // Get the clip's automation lanes
+        let (has_velocity_lane, automation_lanes) = if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id) {
+            if let Some(Clip::Midi { automation_lanes, .. }) = track.clips.iter()
+                .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+            {
+                let has_velocity = automation_lanes.iter().any(|l| matches!(l.parameter, AutomationParameter::Velocity));
+                (has_velocity, Some(automation_lanes))
+            } else {
+                (false, None)
+            }
+        } else {
+            (false, None)
+        };
         
         // Header with lane selection
         let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_height));
@@ -1367,11 +1377,21 @@ impl PianoRoll {
                 ui.menu_button("➕ Add Lane", |ui| {
                     // Show available automation parameters
                     if ui.button("Velocity").clicked() {
-                        // Find velocity lane and make it visible
-                        for lane in &mut self.automation_lanes {
-                            if matches!(lane.parameter, AutomationParameter::Velocity) {
-                                lane.visible = true;
-                                break;
+                        if !has_velocity_lane {
+                            self.command_collector.add_command(DawCommand::AddAutomationLane {
+                                clip_id: clip_id.to_string(),
+                                parameter: AutomationParameter::Velocity,
+                            });
+                        } else {
+                            // Find velocity lane and toggle visibility
+                            if let Some(lanes) = automation_lanes {
+                                if let Some(lane) = lanes.iter().find(|l| matches!(l.parameter, AutomationParameter::Velocity)) {
+                                    self.command_collector.add_command(DawCommand::SetAutomationLaneVisibility {
+                                        clip_id: clip_id.to_string(),
+                                        lane_id: lane.id.clone(),
+                                        visible: !lane.visible,
+                                    });
+                                }
                             }
                         }
                         ui.close_menu();
@@ -1416,7 +1436,7 @@ impl PianoRoll {
                                 ui.label("Common:");
                                 for (cc, name) in common_midi_cc() {
                                     if ui.button(format!("CC{} - {}", cc, name)).clicked() {
-                                        self.add_or_show_cc_lane(cc, name);
+                                        self.add_or_show_cc_lane(clip_id, cc, name, automation_lanes);
                                         self.cc_search_query.clear();
                                         ui.close_menu();
                                     }
@@ -1428,7 +1448,7 @@ impl PianoRoll {
                             // Show filtered CCs
                             for (cc, name) in filtered_ccs {
                                 if ui.button(format!("CC{} - {}", cc, name)).clicked() {
-                                    self.add_or_show_cc_lane(*cc, name);
+                                    self.add_or_show_cc_lane(clip_id, *cc, name, automation_lanes);
                                     self.cc_search_query.clear();
                                     ui.close_menu();
                                 }
@@ -1439,14 +1459,20 @@ impl PianoRoll {
                 ui.separator();
                 
                 // Quick toggle buttons for existing lanes
-                for lane in &mut self.automation_lanes {
-                    let label = format!("{} {}", 
-                        if lane.visible { "👁" } else { "👁‍🗨" },
-                        lane.parameter.display_name()
-                    );
-                    
-                    if ui.selectable_label(lane.visible, label).clicked() {
-                        lane.visible = !lane.visible;
+                if let Some(lanes) = automation_lanes {
+                    for lane in lanes {
+                        let label = format!("{} {}", 
+                            if lane.visible { "👁" } else { "👁‍🗨" },
+                            lane.parameter.display_name()
+                        );
+                        
+                        if ui.selectable_label(lane.visible, label).clicked() {
+                            self.command_collector.add_command(DawCommand::SetAutomationLaneVisibility {
+                                clip_id: clip_id.to_string(),
+                                lane_id: lane.id.clone(),
+                                visible: !lane.visible,
+                            });
+                        }
                     }
                 }
             });
@@ -1459,10 +1485,13 @@ impl PianoRoll {
         );
         
         // Draw visible lanes
-        let visible_lanes: Vec<_> = self.automation_lanes
-            .iter()
-            .filter(|lane| lane.visible)
-            .collect();
+        let visible_lanes: Vec<_> = if let Some(lanes) = automation_lanes {
+            lanes.iter()
+                .filter(|lane| lane.visible)
+                .collect()
+        } else {
+            Vec::new()
+        };
         
         if visible_lanes.is_empty() {
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
@@ -1481,19 +1510,15 @@ impl PianoRoll {
         // Draw each visible lane
         let mut current_y = content_rect.top() - self.automation_scroll_y;
         
-        for i in 0..self.automation_lanes.len() {
-            if !self.automation_lanes[i].visible {
-                continue;
-            }
-            
-            let lane_height = self.automation_lanes[i].height;
+        for lane in &visible_lanes {
+            let lane_height = lane.height;
             let lane_rect = egui::Rect::from_min_size(
                 egui::pos2(content_rect.left(), current_y),
                 egui::vec2(content_rect.width(), lane_height),
             );
             
             if lane_rect.bottom() > content_rect.top() && lane_rect.top() < content_rect.bottom() {
-                let lane_id = self.automation_lanes[i].id.clone();
+                let lane_id = lane.id.clone();
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(lane_rect.intersect(content_rect)), |ui| {
                     self.draw_automation_lane(ui, lane_rect, lane_id, clip_id, state);
                 });
@@ -1503,9 +1528,8 @@ impl PianoRoll {
         }
         
         // Handle scrolling
-        let total_height = self.automation_lanes
+        let total_height = visible_lanes
             .iter()
-            .filter(|l| l.visible)
             .map(|l| l.height)
             .sum::<f32>() + total_gaps;
         
@@ -1531,10 +1555,24 @@ impl PianoRoll {
             egui::vec2(label_width - margin * 2.0, rect.height() - margin * 2.0),
         );
         
-        // Get lane info
-        let lane = self.automation_lanes.iter().find(|l| l.id == lane_id).unwrap();
-        let param_name = lane.parameter.display_name();
-        let current_value = lane.get_value_at_time(state.current_time);
+        // Get lane info from clip
+        let (param_name, current_value) = if let Some(track) = state.project.tracks.iter()
+            .find(|t| t.clips.iter().any(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))) 
+        {
+            if let Some(Clip::Midi { automation_lanes, .. }) = track.clips.iter()
+                .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+            {
+                if let Some(lane) = automation_lanes.iter().find(|l| l.id == lane_id) {
+                    (lane.parameter.display_name(), lane.get_value_at_time(state.current_time))
+                } else {
+                    ("Unknown".to_string(), 0.0)
+                }
+            } else {
+                ("Unknown".to_string(), 0.0)
+            }
+        } else {
+            ("Unknown".to_string(), 0.0)
+        };
         
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(label_rect), |ui| {
             ui.vertical(|ui| {
@@ -1551,16 +1589,29 @@ impl PianoRoll {
             egui::vec2(rect.width() - label_width, rect.height()),
         );
         
-        self.draw_automation_curve(ui, curve_rect, &lane_id, state);
+        self.draw_automation_curve(ui, curve_rect, &lane_id, clip_id, state);
     }
 
-    fn draw_automation_curve(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: &str, state: &DawState) {
+    fn draw_automation_curve(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: &str, clip_id: &str, state: &DawState) {
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         
-        // Get lane data for drawing
-        let lane = match self.automation_lanes.iter().find(|l| l.id == lane_id) {
-            Some(l) => l.clone(),
-            None => return,
+        // Get lane data from clip
+        let lane = if let Some(track) = state.project.tracks.iter()
+            .find(|t| t.clips.iter().any(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))) 
+        {
+            if let Some(Clip::Midi { automation_lanes, .. }) = track.clips.iter()
+                .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+            {
+                if let Some(lane) = automation_lanes.iter().find(|l| l.id == lane_id) {
+                    lane.clone()
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+        } else {
+            return;
         };
         
         // Check if this is a velocity lane
@@ -1594,7 +1645,7 @@ impl PianoRoll {
         
         // Draw velocity bars or automation curve
         if is_velocity_lane {
-            self.draw_velocity_bars(ui, rect, lane_id, state);
+            self.draw_velocity_bars(ui, rect, lane_id, clip_id, state);
         } else if !lane.points.is_empty() {
             let mut path = Vec::new();
             
@@ -1754,10 +1805,14 @@ impl PianoRoll {
                             let delta_value = delta_y as f64 * (lane.max_value - lane.min_value);
                             let new_value = (point.value + delta_value).clamp(lane.min_value, lane.max_value);
                             
-                            // Update the point
-                            if let Some(lane) = self.automation_lanes.iter_mut().find(|l| l.id == lane_id) {
-                                lane.update_point(&point_id, Some(new_time), Some(new_value));
-                            }
+                            // Update the point using command
+                            self.command_collector.add_command(DawCommand::UpdateAutomationPoint {
+                                clip_id: clip_id.to_string(),
+                                lane_id: lane_id.clone(),
+                                point_id: point_id.clone(),
+                                time: Some(new_time),
+                                value: Some(new_value),
+                            });
                         }
                     }
                 }
@@ -1770,14 +1825,18 @@ impl PianoRoll {
             let time = ((click_pos.x - rect.left() + self.scroll_x) / self.zoom) as f64;
             let normalized_value = (rect.bottom() - click_pos.y) / rect.height();
             
-            if let Some(lane) = self.automation_lanes.iter_mut().find(|l| l.id == lane_id) {
-                let value = lane.min_value + normalized_value as f64 * (lane.max_value - lane.min_value);
-                
-                if time >= 0.0 {
-                    let point_id = lane.add_point(time, value);
-                    self.selected_automation_points.clear();
-                    self.selected_automation_points.push((lane_id.to_string(), point_id));
-                }
+            let value = lane.min_value + normalized_value as f64 * (lane.max_value - lane.min_value);
+            
+            if time >= 0.0 {
+                self.command_collector.add_command(DawCommand::AddAutomationPoint {
+                    clip_id: clip_id.to_string(),
+                    lane_id: lane_id.to_string(),
+                    time,
+                    value,
+                });
+                self.selected_automation_points.clear();
+                // Note: We can't immediately add to selection since we don't know the new point's ID
+                // This would need to be handled by the command response system
             }
         }
         
@@ -1785,7 +1844,7 @@ impl PianoRoll {
         self.draw_automation_playhead(ui, rect, state.current_time);
     }
 
-    fn draw_velocity_bars(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: &str, state: &DawState) {
+    fn draw_velocity_bars(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: &str, clip_id: &str, state: &DawState) {
         // Get the current clip's MIDI data
         if let EditorView::PianoRoll { clip_id, track_id, .. } = &state.current_view {
             if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id) {
@@ -1877,27 +1936,39 @@ impl PianoRoll {
         }
     }
     
-    fn add_or_show_cc_lane(&mut self, cc: u8, name: &str) {
+    fn add_or_show_cc_lane(&mut self, clip_id: &str, cc: u8, name: &str, automation_lanes: Option<&Vec<AutomationLane>>) {
         // Check if lane already exists
         let mut found = false;
-        for lane in &mut self.automation_lanes {
-            if let AutomationParameter::MidiCC { cc_number, .. } = &lane.parameter {
-                if *cc_number == cc {
-                    lane.visible = true;
-                    found = true;
-                    break;
+        let mut lane_id = String::new();
+        
+        if let Some(lanes) = automation_lanes {
+            for lane in lanes {
+                if let AutomationParameter::MidiCC { cc_number, .. } = &lane.parameter {
+                    if *cc_number == cc {
+                        found = true;
+                        lane_id = lane.id.clone();
+                        break;
+                    }
                 }
             }
         }
         
-        // If not found, create new lane
-        if !found {
-            let mut new_lane = AutomationLane::new(AutomationParameter::MidiCC {
-                cc_number: cc,
-                name: name.to_string(),
+        if found {
+            // Toggle visibility of existing lane
+            self.command_collector.add_command(DawCommand::SetAutomationLaneVisibility {
+                clip_id: clip_id.to_string(),
+                lane_id,
+                visible: true,
             });
-            new_lane.visible = true;
-            self.automation_lanes.push(new_lane);
+        } else {
+            // Create new lane
+            self.command_collector.add_command(DawCommand::AddAutomationLane {
+                clip_id: clip_id.to_string(),
+                parameter: AutomationParameter::MidiCC {
+                    cc_number: cc,
+                    name: name.to_string(),
+                },
+            });
         }
     }
 }
