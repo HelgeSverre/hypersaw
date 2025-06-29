@@ -84,6 +84,7 @@ impl Timeline {
         self.handle_scrolling(ui, &response);
         self.handle_file_drops(ui, state);
         self.handle_delete_clip(ui, state);
+        self.handle_escape_key(ui);
 
         // Draw components
         self.draw_track_headers(ui, header_rect, state);
@@ -284,6 +285,12 @@ impl Timeline {
                     }
                 }
             }
+        }
+    }
+    
+    fn handle_escape_key(&mut self, ui: &mut egui::Ui) {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.command_collector.add_command(DawCommand::DeselectAll);
         }
     }
 
@@ -733,6 +740,26 @@ impl Timeline {
                 [track_rect.left_bottom(), track_rect.right_bottom()],
                 (1.0, ui.visuals().window_stroke.color),
             );
+            
+            // Handle click on empty track area for deselection
+            let response = ui.interact(track_rect, ui.id().with(format!("track_{}", track_idx)), egui::Sense::click());
+            if response.clicked() {
+                // Check if click was on empty area (not on a clip)
+                let click_pos = response.hover_pos().unwrap_or_default();
+                let click_time = (click_pos.x - track_rect.left() + self.scroll_offset) / self.pixels_per_second;
+                
+                let clicked_on_clip = track.clips.iter().any(|clip| {
+                    let (start, length) = match clip {
+                        Clip::Midi { start_time, length, .. } => (*start_time as f32, *length as f32),
+                        Clip::Audio { start_time, length, .. } => (*start_time as f32, *length as f32),
+                    };
+                    click_time >= start && click_time <= start + length
+                });
+                
+                if !clicked_on_clip {
+                    self.command_collector.add_command(DawCommand::DeselectAll);
+                }
+            }
 
             // Draw clips
             for clip in &track.clips {
@@ -855,7 +882,7 @@ impl Timeline {
             Clip::Audio { .. } => egui::Color32::from_rgb(128, 255, 64),
         };
 
-        ui.painter().rect_filled(clip_rect, 4.0, clip_color);
+        ui.painter().rect_filled(clip_rect, 2.0, clip_color);
 
         // Draw clip border
         let is_selected = match clip {
@@ -868,9 +895,9 @@ impl Timeline {
         if is_selected || response.hovered() {
             ui.painter().rect_stroke(
                 clip_rect,
-                4.0,
-                egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
-                StrokeKind::Outside,
+                2.0,
+                egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+                StrokeKind::Inside,
             );
         }
 
@@ -893,6 +920,13 @@ impl Timeline {
             egui::FontId::proportional(12.0),
             ui.visuals().extreme_bg_color,
         );
+        
+        // Draw MIDI preview for MIDI clips
+        if let Clip::Midi { midi_data, start_time: clip_start, length: clip_length, .. } = clip {
+            if let Some(midi_store) = midi_data {
+                self.draw_midi_preview(ui, clip_rect, midi_store, *clip_start, *clip_length);
+            }
+        }
 
         // Handle clip dragging
         let (start_time, length) = match clip {
@@ -978,6 +1012,100 @@ impl Timeline {
         }
     }
 
+    fn draw_midi_preview(
+        &self,
+        ui: &mut egui::Ui,
+        clip_rect: egui::Rect,
+        midi_store: &MidiEventStore,
+        clip_start_time: f64,
+        clip_length: f64,
+    ) {
+        // Create a content area below the clip name with padding
+        let vertical_padding = 3.0;
+        let preview_rect = egui::Rect::from_min_size(
+            clip_rect.left_top() + egui::vec2(0.0, 20.0),
+            egui::vec2(clip_rect.width(), clip_rect.height() - 20.0),
+        ).shrink2(egui::vec2(2.0, vertical_padding));
+        
+        // Only draw if we have enough space
+        if preview_rect.height() < 10.0 {
+            return;
+        }
+        
+        // Draw a subtle background for the preview area (before padding)
+        let preview_bg_rect = egui::Rect::from_min_size(
+            clip_rect.left_top() + egui::vec2(0.0, 20.0),
+            egui::vec2(clip_rect.width(), clip_rect.height() - 20.0),
+        );
+        ui.painter().rect_filled(
+            preview_bg_rect,
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30),
+        );
+        
+        // Get all notes
+        let notes: Vec<_> = midi_store.get_notes().collect();
+        if notes.is_empty() {
+            // Draw "Empty" text if no notes
+            ui.painter().text(
+                preview_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Empty",
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
+            );
+            return;
+        }
+        
+        // Find the pitch range
+        let min_pitch = notes.iter().map(|n| n.key).min().unwrap_or(60);
+        let max_pitch = notes.iter().map(|n| n.key).max().unwrap_or(72);
+        let pitch_range = (max_pitch - min_pitch).max(12) as f32;
+        
+        // Draw notes as small rectangles
+        // Use a lighter color that contrasts with the clip background
+        let note_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100);
+        let pixels_per_second = clip_rect.width() as f64 / clip_length;
+        
+        for note in notes {
+            // Calculate note position within the clip
+            let note_x = preview_rect.left() + (note.start_time * pixels_per_second) as f32;
+            let note_width = (note.duration * pixels_per_second) as f32;
+            
+            // Skip notes outside the visible clip area
+            if note_x + note_width < preview_rect.left() || note_x > preview_rect.right() {
+                continue;
+            }
+            
+            // Calculate vertical position (inverted so higher pitches are at top)
+            let pitch_normalized = (note.key - min_pitch) as f32 / pitch_range;
+            let available_height = preview_rect.height();
+            let note_y = preview_rect.bottom() - (pitch_normalized * available_height);
+            let note_height = (available_height / pitch_range).max(1.0).min(3.0);
+            
+            let note_rect = egui::Rect::from_min_size(
+                egui::pos2(note_x.max(preview_rect.left()), note_y - note_height / 2.0),
+                egui::vec2(
+                    note_width.min(preview_rect.right() - note_x).max(1.0),
+                    note_height
+                ),
+            );
+            
+            // Only draw if the note rect is within the preview area
+            if note_rect.intersects(preview_rect) {
+                // Draw note with velocity-based opacity
+                let opacity = (note.velocity as f32 / 127.0 * 150.0 + 50.0) as u8;
+                let velocity_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, opacity);
+                
+                ui.painter().rect_filled(
+                    note_rect,
+                    0.5,
+                    velocity_color,
+                );
+            }
+        }
+    }
+    
     fn draw_playhead(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &DawState) {
         let playhead_x = state.current_time * self.pixels_per_second as f64;
         let visible_width = rect.width() as f64;

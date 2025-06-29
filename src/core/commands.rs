@@ -69,6 +69,7 @@ pub enum DawCommand {
     SelectClip {
         clip_id: String,
     },
+    DeselectAll,
     AddClip {
         track_id: String,
         start_time: f64,
@@ -142,6 +143,12 @@ impl Command for DawCommand {
 
             DawCommand::SelectClip { clip_id } => {
                 state.selected_clip = Some(clip_id.clone());
+                Ok(())
+            }
+            
+            DawCommand::DeselectAll => {
+                state.selected_clip = None;
+                state.selected_track = None;
                 Ok(())
             }
 
@@ -440,6 +447,7 @@ impl Command for DawCommand {
             DawCommand::StartPlayback => "Start Playback",
             DawCommand::PausePlayback => "Pause Playback",
             DawCommand::SetTrackMidiChannel { .. } => "Set Track MIDI Channel",
+            DawCommand::DeselectAll => "Deselect All",
         }
     }
 }
