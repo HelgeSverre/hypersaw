@@ -40,6 +40,7 @@ enum DragOperation {
     MovingNotes { start_x: f32, start_y: f32 },
     ResizingNotes { edge: ResizeEdge, start_x: f32 },
     Drawing { start_x: f32, start_y: f32 },
+    SelectionBox { start_x: f32, start_y: f32 },
     MovingAutomationPoint { lane_id: String, point_id: String, start_x: f32, start_y: f32 },
     DrawingAutomation { lane_id: String, start_x: f32, start_y: f32 },
 }
@@ -250,6 +251,24 @@ impl PianoRoll {
 
                 // Draw playhead after everything else
                 self.draw_playhead(ui, rect, clip_start, state.current_time);
+                
+                // Draw selection box on top of everything
+                if let Some(DragOperation::SelectionBox { start_x, start_y }) = self.dragging {
+                    if let Some(current_pos) = response.interact_pointer_pos() {
+                        let selection_rect = egui::Rect::from_two_pos(
+                            egui::pos2(start_x, start_y),
+                            current_pos,
+                        );
+                        
+                        // Draw the selection box
+                        ui.painter().rect_stroke(
+                            selection_rect,
+                            0.0,
+                            egui::Stroke::new(1.0, ui.visuals().selection.stroke.color),
+                            StrokeKind::Outside,
+                        );
+                    }
+                }
 
                 // Handle zoom and scrolling
                 self.handle_zoom(ui, rect);
@@ -278,6 +297,9 @@ impl PianoRoll {
 
             // Draw automation panel
             if self.show_automation {
+                // Fill background to prevent bleed-through
+                ui.painter().rect_filled(automation_rect, 0.0, ui.visuals().window_fill);
+                
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(automation_rect), |ui| {
                     self.draw_automation_panel(ui, automation_rect, clip_id, track_id, state);
                 });
@@ -945,10 +967,49 @@ impl PianoRoll {
                     self.selected_notes.push(note.id.clone());
                 }
             } else if ui.input(|i| i.modifiers.shift) && !self.selected_notes.is_empty() {
-                // Shift+Click: Range selection (to be implemented later)
-                // For now, just add to selection
-                if !self.selected_notes.contains(&note.id) {
-                    self.selected_notes.push(note.id.clone());
+                // Shift+Click: Range selection
+                // Find the bounds of current selection and clicked note
+                if let Some(track) = state.project.tracks.iter().find(|t| 
+                    t.clips.iter().any(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                ) {
+                    if let Some(Clip::Midi { midi_data, .. }) = track.clips.iter()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        if let Some(store) = midi_data {
+                            // Get all notes as a vec
+                            let all_notes: Vec<_> = store.get_notes().collect();
+                            
+                            // Find min/max time of current selection
+                            let mut min_time = f64::MAX;
+                            let mut max_time = f64::MIN;
+                            let mut min_pitch = u8::MAX;
+                            let mut max_pitch = u8::MIN;
+                            
+                            for selected_id in &self.selected_notes {
+                                if let Some(selected_note) = all_notes.iter().find(|n| &n.id == selected_id) {
+                                    min_time = min_time.min(selected_note.start_time);
+                                    max_time = max_time.max(selected_note.start_time);
+                                    min_pitch = min_pitch.min(selected_note.key);
+                                    max_pitch = max_pitch.max(selected_note.key);
+                                }
+                            }
+                            
+                            // Extend range to include clicked note
+                            min_time = min_time.min(note.start_time);
+                            max_time = max_time.max(note.start_time);
+                            min_pitch = min_pitch.min(note.key);
+                            max_pitch = max_pitch.max(note.key);
+                            
+                            // Clear and select all notes in range
+                            self.selected_notes.clear();
+                            for n in &all_notes {
+                                if n.start_time >= min_time && n.start_time <= max_time &&
+                                   n.key >= min_pitch && n.key <= max_pitch {
+                                    self.selected_notes.push(n.id.clone());
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 // Regular click: Single selection
@@ -1087,8 +1148,8 @@ impl PianoRoll {
         // Only handle clicks in the note area (not on piano keys)
         if let Some(pos) = response.interact_pointer_pos() {
             if pos.x > rect.left() + self.key_width {
-                // Start drawing operation on click
-                if response.clicked() && !ui.input(|i| i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift) {
+                // Handle clicks
+                if response.clicked() {
                     // Check if we clicked on empty space (not on a note)
                     let clicked_on_note = self.get_visible_notes(note_area, track_id, clip_id, state)
                         .iter()
@@ -1104,82 +1165,106 @@ impl PianoRoll {
                         });
 
                     if !clicked_on_note {
-                        // Clear selection when clicking empty space
-                        self.selected_notes.clear();
-                        
-                        // Calculate note position from click
-                        let time = ((pos.x - note_area.left() + self.scroll_x) / self.zoom) as f64;
-                        let pitch_float = (rect.bottom() - pos.y + self.scroll_y) / self.key_height;
-                        let pitch = pitch_float.floor() as u8;
-                        
-                        // Snap time to grid if enabled
-                        let snapped_time = if self.grid_snap {
-                            TimeUtils::snap_time(time, state.project.bpm, state.snap_mode)
-                        } else {
-                            time
-                        };
-                        
-                        // Calculate default duration (1 beat)
-                        let beat_duration = 60.0 / state.project.bpm;
-                        let default_duration = if self.grid_snap {
-                            state.snap_mode.get_division(state.project.bpm)
-                        } else {
-                            beat_duration
-                        };
-                        
-                        // Create the note
-                        self.command_collector.add_command(DawCommand::AddNote {
-                            clip_id: clip_id.to_string(),
-                            start_time: snapped_time,
-                            duration: default_duration,
-                            pitch,
-                            velocity: 100, // Default velocity
-                        });
-                        
-                        // Start drawing operation for potential drag-to-extend
-                        self.dragging = Some(DragOperation::Drawing { 
+                        // Clear selection when clicking empty space (unless Ctrl/Shift is held)
+                        if !ui.input(|i| i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift) {
+                            // If we have selected notes, just clear selection
+                            if !self.selected_notes.is_empty() {
+                                self.selected_notes.clear();
+                            } else {
+                                // Only create a note if nothing was selected
+                                // Calculate note position from click
+                                let time = ((pos.x - note_area.left() + self.scroll_x) / self.zoom) as f64;
+                                let pitch_float = (rect.bottom() - pos.y + self.scroll_y) / self.key_height;
+                                let pitch = pitch_float.floor() as u8;
+                                
+                                // Snap time to grid if enabled
+                                let snapped_time = if self.grid_snap {
+                                    TimeUtils::snap_time(time, state.project.bpm, state.snap_mode)
+                                } else {
+                                    time
+                                };
+                                
+                                // Calculate default duration (quarter note = 1 beat)
+                                let beat_duration = 60.0 / state.project.bpm;
+                                let default_duration = beat_duration; // Quarter note
+                                
+                                // Create the note
+                                self.command_collector.add_command(DawCommand::AddNote {
+                                    clip_id: clip_id.to_string(),
+                                    start_time: snapped_time,
+                                    duration: default_duration,
+                                    pitch,
+                                    velocity: 100, // Default velocity
+                                });
+                            }
+                        }
+                    }
+                }
+                
+                // Start selection box on drag with shift
+                if response.drag_started() && ui.input(|i| i.modifiers.shift) {
+                    if self.dragging.is_none() {
+                        self.dragging = Some(DragOperation::SelectionBox {
                             start_x: pos.x,
                             start_y: pos.y,
                         });
                     }
                 }
                 
-                // Handle drag to extend note duration
+                // Handle drag operations
                 if response.dragged() {
-                    if let Some(DragOperation::Drawing { start_x, start_y }) = self.dragging {
-                        // Visual feedback could be added here
-                        // For now, we'll handle the duration on release
+                    match self.dragging {
+                        Some(DragOperation::SelectionBox { start_x, start_y }) => {
+                            // Selection box visual is drawn in the main draw code
+                        }
+                        _ => {}
                     }
                 }
                 
-                // Complete drawing operation on release
+                // Complete drag operations on release
                 if response.drag_stopped() {
-                    if let Some(DragOperation::Drawing { start_x, start_y }) = self.dragging {
-                        if let Some(end_pos) = response.interact_pointer_pos() {
-                            let drag_distance = (end_pos.x - start_x).abs();
-                            
-                            // Only extend duration if we dragged significantly
-                            if drag_distance > 5.0 {
-                                // Calculate the duration from drag
-                                let start_time = ((start_x - note_area.left() + self.scroll_x) / self.zoom) as f64;
-                                let end_time = ((end_pos.x - note_area.left() + self.scroll_x) / self.zoom) as f64;
+                    match self.dragging {
+                        Some(DragOperation::SelectionBox { start_x, start_y }) => {
+                            if let Some(end_pos) = response.interact_pointer_pos() {
+                                let selection_rect = egui::Rect::from_two_pos(
+                                    egui::pos2(start_x, start_y),
+                                    end_pos,
+                                );
                                 
-                                if end_time > start_time {
-                                    let duration = end_time - start_time;
-                                    let snapped_duration = if self.grid_snap {
-                                        TimeUtils::snap_time(duration, state.project.bpm, state.snap_mode)
-                                    } else {
-                                        duration
-                                    };
-                                    
-                                    // We already created the note with default duration,
-                                    // so we'd need to update it here. For now, this is a TODO.
-                                    // TODO: Track the created note ID and update its duration
+                                // Convert selection rect to time/pitch ranges
+                                let start_time = ((selection_rect.left() - note_area.left() + self.scroll_x) / self.zoom) as f64;
+                                let end_time = ((selection_rect.right() - note_area.left() + self.scroll_x) / self.zoom) as f64;
+                                let top_pitch = ((rect.bottom() - selection_rect.top() + self.scroll_y) / self.key_height).ceil() as u8;
+                                let bottom_pitch = ((rect.bottom() - selection_rect.bottom() + self.scroll_y) / self.key_height).floor() as u8;
+                                
+                                // Clear selection if not holding Ctrl
+                                if !ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+                                    self.selected_notes.clear();
+                                }
+                                
+                                // Select all notes within the box
+                                let notes_in_box = self.get_visible_notes(note_area, track_id, clip_id, state)
+                                    .into_iter()
+                                    .filter(|note| {
+                                        note.start_time < end_time && 
+                                        (note.start_time + note.duration) > start_time &&
+                                        note.key >= bottom_pitch && 
+                                        note.key <= top_pitch
+                                    })
+                                    .map(|note| note.id.clone())
+                                    .collect::<Vec<_>>();
+                                
+                                // Add to selection
+                                for note_id in notes_in_box {
+                                    if !self.selected_notes.contains(&note_id) {
+                                        self.selected_notes.push(note_id);
+                                    }
                                 }
                             }
                         }
-                        self.dragging = None;
+                        _ => {}
                     }
+                    self.dragging = None;
                 }
             }
         }
@@ -1247,12 +1332,15 @@ impl PianoRoll {
         // Header with lane selection
         let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_height));
         
-        // Draw background for the piano key area equivalent
+        // Draw opaque background for the entire header to prevent bleed-through
+        ui.painter().rect_filled(header_rect, 0.0, ui.visuals().window_fill);
+        
+        // Draw slightly different background for the piano key area equivalent
         let key_area_rect = egui::Rect::from_min_size(
             header_rect.min,
             egui::vec2(self.key_width, header_height),
         );
-        ui.painter().rect_filled(key_area_rect, 0.0, ui.visuals().window_fill);
+        ui.painter().rect_filled(key_area_rect, 0.0, ui.visuals().extreme_bg_color);
         
         // Draw the header content offset by key_width
         let header_content_rect = egui::Rect::from_min_size(
@@ -1264,10 +1352,64 @@ impl PianoRoll {
             ui.horizontal(|ui| {
                 ui.label("Automation:");
                 
-                // Toggle automation visibility button
-                if ui.button("➕ Add Lane").clicked() {
-                    // TODO: Show lane selection popup
-                }
+                // Add lane button with popup menu
+                ui.menu_button("➕ Add Lane", |ui| {
+                    // Show available automation parameters
+                    if ui.button("Velocity").clicked() {
+                        // Find velocity lane and make it visible
+                        for lane in &mut self.automation_lanes {
+                            if matches!(lane.parameter, AutomationParameter::Velocity) {
+                                lane.visible = true;
+                                break;
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    
+                    ui.separator();
+                    ui.label("MIDI CC:");
+                    
+                    // Common MIDI CCs
+                    let cc_options = vec![
+                        (1, "Mod Wheel"),
+                        (7, "Volume"),
+                        (10, "Pan"),
+                        (11, "Expression"),
+                        (64, "Sustain Pedal"),
+                        (74, "Cutoff"),
+                        (71, "Resonance"),
+                        (91, "Reverb"),
+                        (93, "Chorus"),
+                    ];
+                    
+                    for (cc, name) in cc_options {
+                        if ui.button(format!("CC{} - {}", cc, name)).clicked() {
+                            // Check if lane already exists
+                            let mut found = false;
+                            for lane in &mut self.automation_lanes {
+                                if let AutomationParameter::MidiCC { cc_number, .. } = &lane.parameter {
+                                    if *cc_number == cc {
+                                        lane.visible = true;
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            // If not found, create new lane
+                            if !found {
+                                let mut new_lane = AutomationLane::new(AutomationParameter::MidiCC {
+                                    cc_number: cc,
+                                    name: name.to_string(),
+                                });
+                                new_lane.visible = true;
+                                self.automation_lanes.push(new_lane);
+                            }
+                            
+                            ui.close_menu();
+                        }
+                    }
+                });
                 
                 ui.separator();
                 
