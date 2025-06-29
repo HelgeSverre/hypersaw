@@ -917,7 +917,21 @@ impl PianoRoll {
         
         // Header with lane selection
         let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_height));
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_rect), |ui| {
+        
+        // Draw background for the piano key area equivalent
+        let key_area_rect = egui::Rect::from_min_size(
+            header_rect.min,
+            egui::vec2(self.key_width, header_height),
+        );
+        ui.painter().rect_filled(key_area_rect, 0.0, ui.visuals().window_fill);
+        
+        // Draw the header content offset by key_width
+        let header_content_rect = egui::Rect::from_min_size(
+            egui::pos2(header_rect.left() + self.key_width, header_rect.top()),
+            egui::vec2(header_rect.width() - self.key_width, header_height),
+        );
+        
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_content_rect), |ui| {
             ui.horizontal(|ui| {
                 ui.label("Automation:");
                 
@@ -1005,7 +1019,7 @@ impl PianoRoll {
     }
 
     fn draw_automation_lane(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: String, clip_id: &str, state: &DawState) {
-        let label_width = 100.0;
+        let label_width = self.key_width;
         let margin = 4.0;
         
         // Background
@@ -1333,6 +1347,7 @@ impl PianoRoll {
     }
 
     fn draw_automation_playhead(&self, ui: &mut egui::Ui, rect: egui::Rect, current_time: f64) {
+        // Use the same calculation as the piano roll playhead
         let playhead_x = rect.left() + (current_time as f32 * self.zoom) - self.scroll_x;
         
         if playhead_x >= rect.left() && playhead_x <= rect.right() {
