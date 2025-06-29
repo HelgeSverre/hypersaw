@@ -435,6 +435,11 @@ impl SupersawApp {
                                                 }
                                             },
                                         );
+                                        
+                                        // MIDI Editor button for MIDI tracks
+                                        if ui.small_button("🎼").on_hover_text("MIDI automation (integrated in piano roll)").clicked() {
+                                            // Automation is now integrated in the piano roll
+                                        }
                                     }
                                 });
                             });
@@ -723,6 +728,8 @@ impl eframe::App for SupersawApp {
                     .error(format!("Plugin browser command failed: {}", e));
             }
         }
+
+        // MIDI editor functionality is now integrated into the piano roll
 
         // Handle file dialogs
         if let Some(dialog_type) = &self.file_dialog {

@@ -29,6 +29,11 @@ pub enum DawCommand {
         clip_id: String,
         note_ids: Vec<EventID>,
     },
+    UpdateNoteVelocity {
+        clip_id: String,
+        note_id: EventID,
+        velocity: u8,
+    },
 
     ResizeNote {
         clip_id: String,
@@ -372,6 +377,22 @@ impl Command for DawCommand {
                 }
                 Ok(())
             }
+            
+            DawCommand::UpdateNoteVelocity { clip_id, note_id, velocity } => {
+                // Find the clip and update note velocity
+                for track in &mut state.project.tracks {
+                    if let Some(Clip::Midi { midi_data, .. }) = track
+                        .clips
+                        .iter_mut()
+                        .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                    {
+                        if let Some(store) = midi_data {
+                            store.update_note_velocity(note_id, *velocity);
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -386,6 +407,7 @@ impl Command for DawCommand {
             DawCommand::ResizeNote { .. } => "Resize Note",
             DawCommand::MoveNotes { .. } => "Move Notes",
             DawCommand::DeleteNotes { .. } => "Delete Notes",
+            DawCommand::UpdateNoteVelocity { .. } => "Update Note Velocity",
             DawCommand::AddNote { .. } => "Add Note",
             DawCommand::SetSnapMode { .. } => "Set Snap Mode",
             DawCommand::SeekTime { .. } => "Seek Time",

@@ -17,6 +17,14 @@ pub struct PianoRoll {
     selected_notes: Vec<EventID>,
     dragging: Option<DragOperation>,
     command_collector: CommandCollector,
+    // Automation panel
+    automation_panel_height: f32,
+    automation_lanes: Vec<AutomationLane>,
+    selected_automation_points: Vec<(String, String)>, // (lane_id, point_id)
+    automation_scroll_y: f32,
+    resizing_divider: bool,
+    // UI state
+    show_automation: bool,
 }
 
 #[derive(Debug)]
@@ -24,6 +32,8 @@ enum DragOperation {
     MovingNotes { start_x: f32, start_y: f32 },
     ResizingNotes { edge: ResizeEdge, start_x: f32 },
     Drawing { start_x: f32, start_y: f32 },
+    MovingAutomationPoint { lane_id: String, point_id: String, start_x: f32, start_y: f32 },
+    DrawingAutomation { lane_id: String, start_x: f32, start_y: f32 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +44,23 @@ enum ResizeEdge {
 
 impl PianoRoll {
     pub fn default() -> Self {
+        let mut automation_lanes = Vec::new();
+        
+        // Add default velocity lane
+        let mut velocity_lane = AutomationLane::new(AutomationParameter::Velocity);
+        velocity_lane.visible = true;
+        automation_lanes.push(velocity_lane);
+        
+        // Add common MIDI CC lanes (hidden by default)
+        for (cc, name) in common_midi_cc().into_iter().take(4) {
+            let mut lane = AutomationLane::new(AutomationParameter::MidiCC {
+                cc_number: cc,
+                name: name.to_string(),
+            });
+            lane.visible = false;
+            automation_lanes.push(lane);
+        }
+        
         Self {
             key_width: 80.0,
             key_height: 20.0,
@@ -45,6 +72,12 @@ impl PianoRoll {
             selected_notes: Vec::new(),
             dragging: None,
             command_collector: CommandCollector::new(),
+            automation_panel_height: 200.0,
+            automation_lanes,
+            selected_automation_points: Vec::new(),
+            automation_scroll_y: 0.0,
+            resizing_divider: false,
+            show_automation: true,
         }
     }
     fn get_active_notes(
@@ -120,41 +153,94 @@ impl PianoRoll {
                     0.0
                 };
 
-            let (rect, response) =
-                ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+            let full_rect = ui.available_rect_before_wrap();
+            
+            // Calculate rects for piano roll and automation
+            let divider_height = 4.0;
+            let min_panel_height = 50.0;
+            
+            let effective_automation_height = if self.show_automation {
+                self.automation_panel_height.clamp(min_panel_height, full_rect.height() - min_panel_height - divider_height)
+            } else {
+                0.0
+            };
+            
+            let piano_roll_rect = egui::Rect::from_min_size(
+                full_rect.min,
+                egui::vec2(full_rect.width(), full_rect.height() - effective_automation_height - (if self.show_automation { divider_height } else { 0.0 })),
+            );
+            
+            let divider_rect = if self.show_automation {
+                egui::Rect::from_min_size(
+                    egui::pos2(full_rect.left(), piano_roll_rect.bottom()),
+                    egui::vec2(full_rect.width(), divider_height),
+                )
+            } else {
+                egui::Rect::NOTHING
+            };
+            
+            let automation_rect = if self.show_automation {
+                egui::Rect::from_min_size(
+                    egui::pos2(full_rect.left(), divider_rect.bottom()),
+                    egui::vec2(full_rect.width(), effective_automation_height),
+                )
+            } else {
+                egui::Rect::NOTHING
+            };
 
-            self.center_on_middle_c(rect.height());
-            self.draw_grid(ui, rect, state);
-            self.draw_notes(ui, rect, clip_id, track_id, state);
-            self.draw_piano_keys(ui, rect, state, clip_id, track_id);
+            // Draw piano roll in its rect
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(piano_roll_rect), |ui| {
+                let (rect, response) =
+                    ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
-            // Draw playhead after everything else
-            self.draw_playhead(ui, rect, clip_start, state.current_time);
+                self.center_on_middle_c(rect.height());
+                self.draw_grid(ui, rect, state);
+                self.draw_notes(ui, rect, clip_id, track_id, state);
+                self.draw_piano_keys(ui, rect, state, clip_id, track_id);
 
-            // Handle zoom and scrolling
-            self.handle_zoom(ui, rect);
+                // Draw playhead after everything else
+                self.draw_playhead(ui, rect, clip_start, state.current_time);
 
-            // Handle middle-button dragging for panning
-            if response.dragged() {
-                // Horizontal scroll
-                let invert = -1.0;
-                let delta = response.drag_delta();
-                self.scroll_x = (self.scroll_x + delta.x * invert).max(0.0);
+                // Handle zoom and scrolling
+                self.handle_zoom(ui, rect);
 
-                // Vertical scroll
-                let new_scroll_y = (self.scroll_y + delta.y).max(0.0);
-                self.scroll_y =
-                    new_scroll_y.clamp(0.0, self.get_total_height() - self.viewport_height);
+                // Handle middle-button dragging for panning
+                if response.dragged() && !self.resizing_divider {
+                    // Horizontal scroll
+                    let invert = -1.0;
+                    let delta = response.drag_delta();
+                    self.scroll_x = (self.scroll_x + delta.x * invert).max(0.0);
+
+                    // Vertical scroll
+                    let new_scroll_y = (self.scroll_y + delta.y).max(0.0);
+                    self.scroll_y =
+                        new_scroll_y.clamp(0.0, self.get_total_height() - self.viewport_height);
+                }
+            });
+
+            // Draw resizable divider
+            if self.show_automation {
+                self.draw_divider(ui, divider_rect);
             }
 
-            // If pressing delete, delete selected notes
-
-            if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
-                self.command_collector.add_command(DawCommand::DeleteNotes {
-                    clip_id: clip_id.to_string(),
-                    note_ids: self.selected_notes.clone(),
+            // Draw automation panel
+            if self.show_automation {
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(automation_rect), |ui| {
+                    self.draw_automation_panel(ui, automation_rect, clip_id, track_id, state);
                 });
-                self.selected_notes.clear();
+            }
+
+            // Handle delete key
+            if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+                if !self.selected_notes.is_empty() {
+                    self.command_collector.add_command(DawCommand::DeleteNotes {
+                        clip_id: clip_id.to_string(),
+                        note_ids: self.selected_notes.clone(),
+                    });
+                    self.selected_notes.clear();
+                }
+                
+                // TODO: Also handle deleting automation points
             }
 
             // Auto-scroll to follow playhead if it's outside view
@@ -790,6 +876,470 @@ impl PianoRoll {
 
             // Clamp scroll position to keep piano roll in view
             self.scroll_y = self.scroll_y.clamp(0.0, total_height - viewport_height);
+        }
+    }
+
+    fn draw_divider(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        
+        // Draw divider line
+        let color = if response.hovered() || self.resizing_divider {
+            ui.visuals().selection.stroke.color
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke.color
+        };
+        
+        ui.painter().rect_filled(rect, 0.0, color);
+        
+        // Update cursor
+        if response.hovered() || self.resizing_divider {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
+        }
+        
+        // Handle dragging
+        if response.drag_started() {
+            self.resizing_divider = true;
+        }
+        
+        if self.resizing_divider {
+            let delta = response.drag_delta().y;
+            self.automation_panel_height = (self.automation_panel_height - delta).clamp(50.0, 500.0);
+        }
+        
+        if response.drag_stopped() {
+            self.resizing_divider = false;
+        }
+    }
+
+    fn draw_automation_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect, clip_id: &str, track_id: &str, state: &DawState) {
+        let header_height = 30.0;
+        let lane_gap = 2.0;
+        
+        // Header with lane selection
+        let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_height));
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_rect), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Automation:");
+                
+                // Toggle automation visibility button
+                if ui.button("➕ Add Lane").clicked() {
+                    // TODO: Show lane selection popup
+                }
+                
+                ui.separator();
+                
+                // Quick toggle buttons for existing lanes
+                for lane in &mut self.automation_lanes {
+                    let label = format!("{} {}", 
+                        if lane.visible { "👁" } else { "👁‍🗨" },
+                        lane.parameter.display_name()
+                    );
+                    
+                    if ui.selectable_label(lane.visible, label).clicked() {
+                        lane.visible = !lane.visible;
+                    }
+                }
+            });
+        });
+        
+        // Calculate content area
+        let content_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), header_rect.bottom()),
+            egui::vec2(rect.width(), rect.height() - header_height),
+        );
+        
+        // Draw visible lanes
+        let visible_lanes: Vec<_> = self.automation_lanes
+            .iter()
+            .filter(|lane| lane.visible)
+            .collect();
+        
+        if visible_lanes.is_empty() {
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label("No automation lanes visible. Click '➕ Add Lane' to add automation.");
+                });
+            });
+            return;
+        }
+        
+        // Calculate lane heights
+        let total_gaps = (visible_lanes.len() - 1) as f32 * lane_gap;
+        let available_height = content_rect.height() - total_gaps - self.automation_scroll_y;
+        let default_lane_height = (available_height / visible_lanes.len() as f32).max(60.0);
+        
+        // Draw each visible lane
+        let mut current_y = content_rect.top() - self.automation_scroll_y;
+        
+        for i in 0..self.automation_lanes.len() {
+            if !self.automation_lanes[i].visible {
+                continue;
+            }
+            
+            let lane_height = self.automation_lanes[i].height;
+            let lane_rect = egui::Rect::from_min_size(
+                egui::pos2(content_rect.left(), current_y),
+                egui::vec2(content_rect.width(), lane_height),
+            );
+            
+            if lane_rect.bottom() > content_rect.top() && lane_rect.top() < content_rect.bottom() {
+                let lane_id = self.automation_lanes[i].id.clone();
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(lane_rect.intersect(content_rect)), |ui| {
+                    self.draw_automation_lane(ui, lane_rect, lane_id, clip_id, state);
+                });
+            }
+            
+            current_y += lane_height + lane_gap;
+        }
+        
+        // Handle scrolling
+        let total_height = self.automation_lanes
+            .iter()
+            .filter(|l| l.visible)
+            .map(|l| l.height)
+            .sum::<f32>() + total_gaps;
+        
+        if total_height > content_rect.height() {
+            // TODO: Add scroll bar
+        }
+    }
+
+    fn draw_automation_lane(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: String, clip_id: &str, state: &DawState) {
+        let label_width = 100.0;
+        let margin = 4.0;
+        
+        // Background
+        ui.painter().rect_filled(
+            rect,
+            4.0,
+            ui.visuals().extreme_bg_color,
+        );
+        
+        // Label area
+        let label_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + margin, rect.top() + margin),
+            egui::vec2(label_width - margin * 2.0, rect.height() - margin * 2.0),
+        );
+        
+        // Get lane info
+        let lane = self.automation_lanes.iter().find(|l| l.id == lane_id).unwrap();
+        let param_name = lane.parameter.display_name();
+        let current_value = lane.get_value_at_time(state.current_time);
+        
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(label_rect), |ui| {
+            ui.vertical(|ui| {
+                ui.label(&param_name);
+                
+                // Value display
+                ui.small(format!("{:.1}", current_value));
+            });
+        });
+        
+        // Automation curve area
+        let curve_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + label_width, rect.top()),
+            egui::vec2(rect.width() - label_width, rect.height()),
+        );
+        
+        self.draw_automation_curve(ui, curve_rect, &lane_id, state);
+    }
+
+    fn draw_automation_curve(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: &str, state: &DawState) {
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        
+        // Get lane data for drawing
+        let lane = match self.automation_lanes.iter().find(|l| l.id == lane_id) {
+            Some(l) => l.clone(),
+            None => return,
+        };
+        
+        // Check if this is a velocity lane
+        let is_velocity_lane = matches!(lane.parameter, AutomationParameter::Velocity);
+        
+        // Grid alignment with piano roll
+        let grid_rect = rect;
+        
+        // Draw grid lines (aligned with piano roll)
+        let bpm = state.project.bpm;
+        let beat_duration = 60.0 / bpm;
+        let pixels_per_beat = self.zoom;
+        let pixels_per_bar = pixels_per_beat * 4.0;
+        
+        let start_bar = (self.scroll_x / pixels_per_bar).floor() as i32;
+        let end_bar = ((self.scroll_x + grid_rect.width()) / pixels_per_bar).ceil() as i32;
+        
+        // Draw vertical grid lines
+        for bar in start_bar..=end_bar {
+            let x = grid_rect.left() + bar as f32 * pixels_per_bar - self.scroll_x;
+            
+            if x >= grid_rect.left() && x <= grid_rect.right() {
+                let is_bar_line = true;
+                let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+                ui.painter().line_segment(
+                    [egui::pos2(x, grid_rect.top()), egui::pos2(x, grid_rect.bottom())],
+                    (0.5, color),
+                );
+            }
+        }
+        
+        // Draw velocity bars or automation curve
+        if is_velocity_lane {
+            self.draw_velocity_bars(ui, rect, lane_id, state);
+        } else if !lane.points.is_empty() {
+            let mut path = Vec::new();
+            
+            // Calculate visible time range
+            let start_time = self.scroll_x / self.zoom;
+            let end_time = (self.scroll_x + rect.width()) / self.zoom;
+            
+            // Get points to draw (including one before and after visible range for continuity)
+            let mut points_to_draw = Vec::new();
+            let mut last_before = None;
+            let mut first_after = None;
+            
+            for point in &lane.points {
+                if point.time < start_time as f64 {
+                    last_before = Some(point);
+                } else if point.time > end_time as f64 && first_after.is_none() {
+                    first_after = Some(point);
+                    break;
+                } else {
+                    points_to_draw.push(point);
+                }
+            }
+            
+            // Add boundary points if they exist
+            if let Some(point) = last_before {
+                points_to_draw.insert(0, point);
+            }
+            if let Some(point) = first_after {
+                points_to_draw.push(point);
+            }
+            
+            // Generate curve path
+            for i in 0..points_to_draw.len() {
+                let point = points_to_draw[i];
+                let x = rect.left() + (point.time as f32 * self.zoom) - self.scroll_x;
+                let normalized_value = (point.value - lane.min_value) / (lane.max_value - lane.min_value);
+                let y = rect.bottom() - (normalized_value as f32 * rect.height());
+                
+                if i == 0 {
+                    path.push(egui::pos2(x, y));
+                } else {
+                    // Interpolate between points based on curve type
+                    let prev_point = points_to_draw[i - 1];
+                    let steps = ((point.time - prev_point.time) * self.zoom as f64 / 2.0).ceil() as usize;
+                    
+                    for step in 1..=steps {
+                        let t = step as f64 / steps as f64;
+                        let time = prev_point.time + (point.time - prev_point.time) * t;
+                        let value = lane.get_value_at_time(time);
+                        
+                        let x = rect.left() + (time as f32 * self.zoom) - self.scroll_x;
+                        let normalized_value = (value - lane.min_value) / (lane.max_value - lane.min_value);
+                        let y = rect.bottom() - (normalized_value as f32 * rect.height());
+                        
+                        if x >= rect.left() && x <= rect.right() {
+                            path.push(egui::pos2(x, y));
+                        }
+                    }
+                }
+            }
+            
+            // Draw the curve
+            if path.len() > 1 {
+                let color = egui::Color32::from_rgb(
+                    (lane.color[0] * 255.0) as u8,
+                    (lane.color[1] * 255.0) as u8,
+                    (lane.color[2] * 255.0) as u8,
+                );
+                
+                ui.painter().add(egui::Shape::line(
+                    path,
+                    egui::Stroke::new(2.0, color),
+                ));
+            }
+            
+            // Draw points
+            let points_to_draw: Vec<_> = lane.points.iter().enumerate().collect();
+            
+            for (point_idx, point) in points_to_draw {
+                let x = rect.left() + (point.time as f32 * self.zoom) - self.scroll_x;
+                
+                if x >= rect.left() - 10.0 && x <= rect.right() + 10.0 {
+                    let normalized_value = (point.value - lane.min_value) / (lane.max_value - lane.min_value);
+                    let y = rect.bottom() - (normalized_value as f32 * rect.height());
+                    
+                    let point_rect = egui::Rect::from_center_size(
+                        egui::pos2(x, y),
+                        egui::vec2(8.0, 8.0),
+                    );
+                    
+                    let is_selected = self.selected_automation_points.iter()
+                        .any(|(lid, pid)| lid == &lane.id && pid == &point.id);
+                    
+                    let color = if is_selected {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        egui::Color32::from_rgb(
+                            (lane.color[0] * 255.0) as u8,
+                            (lane.color[1] * 255.0) as u8,
+                            (lane.color[2] * 255.0) as u8,
+                        )
+                    };
+                    
+                    ui.painter().circle_filled(
+                        point_rect.center(),
+                        4.0,
+                        color,
+                    );
+                    
+                    // Handle point interaction
+                    let point_response = ui.allocate_rect(point_rect, egui::Sense::click_and_drag());
+                    let point_id = point.id.clone();
+                    let lane_id = lane.id.clone();
+                    
+                    if point_response.clicked() {
+                        if ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+                            // Multi-select
+                            let selection = (lane_id.clone(), point_id.clone());
+                            if is_selected {
+                                self.selected_automation_points.retain(|s| s != &selection);
+                            } else {
+                                self.selected_automation_points.push(selection);
+                            }
+                        } else {
+                            // Single select
+                            self.selected_automation_points.clear();
+                            self.selected_automation_points.push((lane_id.clone(), point_id.clone()));
+                        }
+                    }
+                    
+                    // Handle dragging
+                    if point_response.dragged() && is_selected {
+                        let delta_x = point_response.drag_delta().x / self.zoom;
+                        let delta_y = -point_response.drag_delta().y / rect.height();
+                        
+                        let new_time = (point.time + delta_x as f64).max(0.0);
+                        let delta_value = delta_y as f64 * (lane.max_value - lane.min_value);
+                        let new_value = (point.value + delta_value).clamp(lane.min_value, lane.max_value);
+                        
+                        // Update the point
+                        if let Some(lane) = self.automation_lanes.iter_mut().find(|l| l.id == lane_id) {
+                            lane.update_point(&point_id, Some(new_time), Some(new_value));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Handle creating new points
+        if response.clicked() && !response.dragged() {
+            let click_pos = response.interact_pointer_pos().unwrap();
+            let time = ((click_pos.x - rect.left() + self.scroll_x) / self.zoom) as f64;
+            let normalized_value = (rect.bottom() - click_pos.y) / rect.height();
+            
+            if let Some(lane) = self.automation_lanes.iter_mut().find(|l| l.id == lane_id) {
+                let value = lane.min_value + normalized_value as f64 * (lane.max_value - lane.min_value);
+                
+                if time >= 0.0 {
+                    let point_id = lane.add_point(time, value);
+                    self.selected_automation_points.clear();
+                    self.selected_automation_points.push((lane_id.to_string(), point_id));
+                }
+            }
+        }
+        
+        // Draw playhead
+        self.draw_automation_playhead(ui, rect, state.current_time);
+    }
+
+    fn draw_velocity_bars(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: &str, state: &DawState) {
+        // Get the current clip's MIDI data
+        if let EditorView::PianoRoll { clip_id, track_id, .. } = &state.current_view {
+            if let Some(track) = state.project.tracks.iter().find(|t| &t.id == track_id) {
+                if let Some(Clip::Midi { midi_data, .. }) = track.clips.iter()
+                    .find(|c| matches!(c, Clip::Midi { id, .. } if id == clip_id))
+                {
+                    if let Some(store) = midi_data {
+                        // Get visible notes
+                        let start_time = self.scroll_x / self.zoom;
+                        let end_time = (self.scroll_x + rect.width()) / self.zoom;
+                        let notes = store.get_notes_in_range(start_time as f64, end_time as f64);
+                        
+                        // Draw velocity bar for each note
+                        for note in notes {
+                            let x_start = rect.left() + (note.start_time as f32 * self.zoom) - self.scroll_x;
+                            let x_end = rect.left() + ((note.start_time + note.duration) as f32 * self.zoom) - self.scroll_x;
+                            let bar_width = (x_end - x_start).max(2.0);
+                            
+                            // Calculate bar height based on velocity
+                            let velocity_normalized = note.velocity as f32 / 127.0;
+                            let bar_height = velocity_normalized * rect.height();
+                            
+                            // Draw the velocity bar
+                            let bar_rect = egui::Rect::from_min_size(
+                                egui::pos2(x_start, rect.bottom() - bar_height),
+                                egui::vec2(bar_width, bar_height),
+                            );
+                            
+                            // Color based on velocity
+                            let color = egui::Color32::from_rgb(
+                                (255.0 * velocity_normalized) as u8,
+                                (100.0 + 100.0 * (1.0 - velocity_normalized)) as u8,
+                                (255.0 * (1.0 - velocity_normalized)) as u8,
+                            );
+                            
+                            ui.painter().rect_filled(bar_rect, 2.0, color);
+                            
+                            // Draw outline
+                            ui.painter().rect_stroke(
+                                bar_rect,
+                                2.0,
+                                egui::Stroke::new(1.0, ui.visuals().window_stroke.color),
+                                egui::epaint::StrokeKind::Outside,
+                            );
+                            
+                            // Handle interaction
+                            let bar_response = ui.allocate_rect(bar_rect, egui::Sense::drag());
+                            if bar_response.dragged() {
+                                let delta_y = -bar_response.drag_delta().y;
+                                let new_velocity_normalized = ((bar_height + delta_y) / rect.height()).clamp(0.0, 1.0);
+                                let new_velocity = (new_velocity_normalized * 127.0).max(1.0) as u8;
+                                
+                                // Update note velocity through command system
+                                self.command_collector.add_command(DawCommand::UpdateNoteVelocity {
+                                    clip_id: clip_id.clone(),
+                                    note_id: note.id.clone(),
+                                    velocity: new_velocity,
+                                });
+                            }
+                            
+                            // Show velocity value on hover
+                            if bar_response.hovered() {
+                                ui.painter().text(
+                                    egui::pos2(x_start + bar_width / 2.0, rect.bottom() - bar_height - 10.0),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    format!("{}", note.velocity),
+                                    egui::FontId::proportional(10.0),
+                                    ui.visuals().text_color(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_automation_playhead(&self, ui: &mut egui::Ui, rect: egui::Rect, current_time: f64) {
+        let playhead_x = rect.left() + (current_time as f32 * self.zoom) - self.scroll_x;
+        
+        if playhead_x >= rect.left() && playhead_x <= rect.right() {
+            ui.painter().line_segment(
+                [egui::pos2(playhead_x, rect.top()), egui::pos2(playhead_x, rect.bottom())],
+                (1.0, ui.visuals().selection.stroke.color),
+            );
         }
     }
 }

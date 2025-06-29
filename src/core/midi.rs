@@ -283,6 +283,13 @@ impl MidiEventStore {
         // Add updated note
         self.add_note(updated_note);
     }
+    
+    pub fn update_note_velocity(&mut self, note_id: &str, new_velocity: u8) {
+        if let Some(note) = self.notes.get_mut(note_id) {
+            note.velocity = new_velocity;
+            // TODO: Update the corresponding events in the event stores
+        }
+    }
 
     pub fn move_note(&mut self, note_id: &str, delta_time: f64, delta_pitch: i8) {
         // First get a clone of the note we want to update

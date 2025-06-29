@@ -1,15 +1,18 @@
-mod command_manager;
-mod commands;
-mod midi;
-mod plugins;
-mod project;
-mod state;
-mod status;
-mod utils;
+pub mod automation;
+pub mod command_manager;
+pub mod commands;
+pub mod midi;
+pub mod midi_editing;
+pub mod project;
+pub mod state;
+pub mod status;
+pub mod utils;
 
+pub use automation::*;
 pub use command_manager::*;
 pub use commands::*;
 pub use midi::*;
+pub use midi_editing::*;
 pub use project::*;
 pub use state::*;
 pub use status::*;
