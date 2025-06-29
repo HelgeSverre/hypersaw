@@ -506,9 +506,10 @@ impl PianoRoll {
         // Get currently active notes
         let active_notes = self.get_active_notes(state, clip_id, track_id, state.current_time);
 
-        // Draw background for piano keys
+        // Draw subtle background for piano keys area
+        let piano_bg_color = egui::Color32::from_gray(25); // Very dark background
         ui.painter()
-            .rect_filled(keys_rect, 0.0, ui.visuals().window_fill);
+            .rect_filled(keys_rect, 0.0, piano_bg_color);
 
         // Draw white keys first
         for note_number in visible_notes.clone() {
@@ -552,11 +553,11 @@ impl PianoRoll {
         // Check if note is currently active
         let is_active = active_notes.contains(&note_number);
 
-        // Draw key background with active state
+        // Draw key background with proper piano colors
         let base_color = if is_black {
-            ui.visuals().extreme_bg_color
+            egui::Color32::from_gray(40)  // Dark gray for black keys
         } else {
-            ui.visuals().window_fill
+            egui::Color32::from_gray(240) // Light gray (almost white) for white keys
         };
 
         let color = if is_active {
@@ -572,16 +573,23 @@ impl PianoRoll {
         };
 
         ui.painter().rect_filled(key_rect, 0.0, color);
+        
+        // Draw key border
+        let border_color = if is_black {
+            egui::Color32::from_gray(20)
+        } else {
+            egui::Color32::from_gray(100)
+        };
         ui.painter().rect_stroke(
             key_rect,
             0.0,
-            egui::Stroke::new(1.0, ui.visuals().window_stroke.color),
+            egui::Stroke::new(1.0, border_color),
             StrokeKind::Outside,
         );
 
         let response = ui.allocate_rect(key_rect, egui::Sense::click());
 
-        // Draw note name
+        // Draw note name and MIDI number side by side
         let note = note_number % 12;
         let octave = (note_number / 12) - 1;
         let note_names = [
@@ -589,26 +597,52 @@ impl PianoRoll {
         ];
         let note_name = format!("{}{}", note_names[note as usize], octave);
 
-        if note == 0 || response.hovered() || is_active {
-            let text_color = if is_active {
-                if is_black {
-                    ui.visuals().text_color()
-                } else {
-                    ui.visuals().strong_text_color()
-                }
+        // Always show labels for white keys, show black key labels on hover or when active
+        let show_label = if is_black {
+            response.hovered() || is_active
+        } else {
+            true
+        };
+
+        if show_label {
+            // Note name color
+            let note_color = if is_active {
+                egui::Color32::WHITE
             } else if is_black {
-                ui.visuals().strong_text_color()
+                egui::Color32::from_gray(200)
             } else {
-                ui.visuals().text_color()
+                egui::Color32::from_gray(40)
+            };
+            
+            // MIDI number color (fainter)
+            let midi_color = if is_active {
+                egui::Color32::from_gray(220)
+            } else if is_black {
+                egui::Color32::from_gray(160)
+            } else {
+                egui::Color32::from_gray(100)
             };
 
-            let text_pos = key_rect.center();
+            let font_size = if is_black { 8.0 } else { 9.0 };
+            
+            // Draw note name
+            let note_pos = egui::pos2(key_rect.center().x - 8.0, key_rect.center().y);
             ui.painter().text(
-                text_pos,
-                egui::Align2::CENTER_CENTER,
+                note_pos,
+                egui::Align2::RIGHT_CENTER,
                 &note_name,
-                FontId::monospace(10.0),
-                text_color,
+                FontId::monospace(font_size),
+                note_color,
+            );
+            
+            // Draw MIDI number
+            let midi_pos = egui::pos2(key_rect.center().x + 8.0, key_rect.center().y);
+            ui.painter().text(
+                midi_pos,
+                egui::Align2::LEFT_CENTER,
+                &note_number.to_string(),
+                FontId::monospace(font_size * 0.9),
+                midi_color,
             );
         }
     }
