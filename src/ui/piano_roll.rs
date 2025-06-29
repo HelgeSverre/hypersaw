@@ -33,6 +33,8 @@ pub struct PianoRoll {
     drag_accumulator_y: f32,
     last_applied_delta_time: f64,
     last_applied_delta_pitch: i8,
+    // CC search
+    cc_search_query: String,
 }
 
 #[derive(Debug)]
@@ -125,6 +127,7 @@ impl PianoRoll {
             drag_accumulator_y: 0.0,
             last_applied_delta_time: 0.0,
             last_applied_delta_pitch: 0,
+            cc_search_query: String::new(),
         }
     }
     fn get_active_notes(
@@ -307,7 +310,7 @@ impl PianoRoll {
 
             // Handle keyboard shortcuts
             ui.input(|i| {
-                // Delete key - delete selected notes
+                // Delete key - delete selected notes and automation points
                 if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
                     if !self.selected_notes.is_empty() {
                         self.command_collector.add_command(DawCommand::DeleteNotes {
@@ -317,7 +320,15 @@ impl PianoRoll {
                         self.selected_notes.clear();
                     }
                     
-                    // TODO: Also handle deleting automation points
+                    // Handle deleting automation points
+                    if !self.selected_automation_points.is_empty() {
+                        for (lane_id, point_id) in &self.selected_automation_points {
+                            if let Some(lane) = self.automation_lanes.iter_mut().find(|l| &l.id == lane_id) {
+                                lane.remove_point(point_id);
+                            }
+                        }
+                        self.selected_automation_points.clear();
+                    }
                 }
                 
                 // Ctrl+A - Select all notes
@@ -1369,46 +1380,60 @@ impl PianoRoll {
                     ui.separator();
                     ui.label("MIDI CC:");
                     
-                    // Common MIDI CCs
-                    let cc_options = vec![
-                        (1, "Mod Wheel"),
-                        (7, "Volume"),
-                        (10, "Pan"),
-                        (11, "Expression"),
-                        (64, "Sustain Pedal"),
-                        (74, "Cutoff"),
-                        (71, "Resonance"),
-                        (91, "Reverb"),
-                        (93, "Chorus"),
-                    ];
+                    // Search field
+                    ui.horizontal(|ui| {
+                        ui.label("🔍");
+                        ui.text_edit_singleline(&mut self.cc_search_query);
+                        if ui.button("✕").clicked() {
+                            self.cc_search_query.clear();
+                        }
+                    });
                     
-                    for (cc, name) in cc_options {
-                        if ui.button(format!("CC{} - {}", cc, name)).clicked() {
-                            // Check if lane already exists
-                            let mut found = false;
-                            for lane in &mut self.automation_lanes {
-                                if let AutomationParameter::MidiCC { cc_number, .. } = &lane.parameter {
-                                    if *cc_number == cc {
-                                        lane.visible = true;
-                                        found = true;
-                                        break;
+                    ui.separator();
+                    
+                    // Scrollable area for CC list
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            // Get all CC definitions
+                            let all_ccs = get_all_midi_cc();
+                            
+                            // Filter based on search query
+                            let search_lower = self.cc_search_query.to_lowercase();
+                            let filtered_ccs: Vec<_> = all_ccs.iter()
+                                .filter(|(cc, name)| {
+                                    if search_lower.is_empty() {
+                                        true
+                                    } else {
+                                        cc.to_string().contains(&search_lower) ||
+                                        name.to_lowercase().contains(&search_lower)
+                                    }
+                                })
+                                .collect();
+                            
+                            // Show common CCs first if no search
+                            if search_lower.is_empty() {
+                                ui.label("Common:");
+                                for (cc, name) in common_midi_cc() {
+                                    if ui.button(format!("CC{} - {}", cc, name)).clicked() {
+                                        self.add_or_show_cc_lane(cc, name);
+                                        self.cc_search_query.clear();
+                                        ui.close_menu();
                                     }
                                 }
+                                ui.separator();
+                                ui.label("All CC:");
                             }
                             
-                            // If not found, create new lane
-                            if !found {
-                                let mut new_lane = AutomationLane::new(AutomationParameter::MidiCC {
-                                    cc_number: cc,
-                                    name: name.to_string(),
-                                });
-                                new_lane.visible = true;
-                                self.automation_lanes.push(new_lane);
+                            // Show filtered CCs
+                            for (cc, name) in filtered_ccs {
+                                if ui.button(format!("CC{} - {}", cc, name)).clicked() {
+                                    self.add_or_show_cc_lane(*cc, name);
+                                    self.cc_search_query.clear();
+                                    ui.close_menu();
+                                }
                             }
-                            
-                            ui.close_menu();
-                        }
-                    }
+                        });
                 });
                 
                 ui.separator();
@@ -1849,6 +1874,30 @@ impl PianoRoll {
                 [egui::pos2(playhead_x, rect.top()), egui::pos2(playhead_x, rect.bottom())],
                 (2.0, playhead_color),
             );
+        }
+    }
+    
+    fn add_or_show_cc_lane(&mut self, cc: u8, name: &str) {
+        // Check if lane already exists
+        let mut found = false;
+        for lane in &mut self.automation_lanes {
+            if let AutomationParameter::MidiCC { cc_number, .. } = &lane.parameter {
+                if *cc_number == cc {
+                    lane.visible = true;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        
+        // If not found, create new lane
+        if !found {
+            let mut new_lane = AutomationLane::new(AutomationParameter::MidiCC {
+                cc_number: cc,
+                name: name.to_string(),
+            });
+            new_lane.visible = true;
+            self.automation_lanes.push(new_lane);
         }
     }
 }
