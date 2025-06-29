@@ -64,6 +64,18 @@ pub enum DawCommand {
         track_id: String,
         channel: u8,
     },
+    MuteTrack {
+        track_id: String,
+    },
+    UnmuteTrack {
+        track_id: String,
+    },
+    SoloTrack {
+        track_id: String,
+    },
+    UnsoloTrack {
+        track_id: String,
+    },
 
     // Clips
     SelectClip {
@@ -162,6 +174,39 @@ impl Command for DawCommand {
                     if let TrackType::Midi { channel: ch, .. } = &mut track.track_type {
                         *ch = *channel;
                     }
+                }
+                Ok(())
+            }
+            
+            DawCommand::MuteTrack { track_id } => {
+                if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
+                    track.is_muted = true;
+                }
+                Ok(())
+            }
+            
+            DawCommand::UnmuteTrack { track_id } => {
+                if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
+                    track.is_muted = false;
+                }
+                Ok(())
+            }
+            
+            DawCommand::SoloTrack { track_id } => {
+                // First, unsolo all tracks
+                for track in &mut state.project.tracks {
+                    track.is_soloed = false;
+                }
+                // Then solo the specified track
+                if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
+                    track.is_soloed = true;
+                }
+                Ok(())
+            }
+            
+            DawCommand::UnsoloTrack { track_id } => {
+                if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
+                    track.is_soloed = false;
                 }
                 Ok(())
             }
@@ -447,6 +492,10 @@ impl Command for DawCommand {
             DawCommand::StartPlayback => "Start Playback",
             DawCommand::PausePlayback => "Pause Playback",
             DawCommand::SetTrackMidiChannel { .. } => "Set Track MIDI Channel",
+            DawCommand::MuteTrack { .. } => "Mute Track",
+            DawCommand::UnmuteTrack { .. } => "Unmute Track",
+            DawCommand::SoloTrack { .. } => "Solo Track",
+            DawCommand::UnsoloTrack { .. } => "Unsolo Track",
             DawCommand::DeselectAll => "Deselect All",
         }
     }

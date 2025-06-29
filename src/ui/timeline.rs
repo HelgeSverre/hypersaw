@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 
 use crate::core::*;
+use crate::core::utils::SnapHandler;
 use eframe::egui;
 use eframe::epaint::StrokeKind;
 
@@ -17,7 +18,7 @@ pub struct Timeline {
     midi_ports: Vec<String>,
     pending_midi_connections: Vec<(String, String)>, // (track_id, device_name)
     // Resize state
-    resize_accumulator: f32,
+    resize_snap_handler: SnapHandler,
     resize_initial_values: Option<(f32, f32)>, // (start_time, length)
 }
 
@@ -34,7 +35,7 @@ impl Default for Timeline {
             command_collector: CommandCollector::new(),
             midi_ports: Vec::new(),
             pending_midi_connections: Vec::new(),
-            resize_accumulator: 0.0,
+            resize_snap_handler: SnapHandler::new(10.0),
             resize_initial_values: None,
         }
     }
@@ -595,20 +596,42 @@ impl Timeline {
                     );
                     
                     // Mute and Solo buttons
-                    let mute_style = if track.is_muted {
-                        ui.visuals().widgets.active
+                    let mute_button = egui::Button::new("M").small();
+                    let mute_button = if track.is_muted {
+                        mute_button.fill(egui::Color32::from_rgb(180, 60, 60))
                     } else {
-                        ui.visuals().widgets.inactive
+                        mute_button
                     };
                     
-                    let mute_text = if track.is_muted { "[M]" } else { "M" };
-                    if ui.add(egui::Button::new(mute_text).small()).clicked() {
-                        // TODO: Add command for mute/unmute
+                    if ui.add(mute_button).clicked() {
+                        if track.is_muted {
+                            self.command_collector.add_command(DawCommand::UnmuteTrack {
+                                track_id: track.id.clone(),
+                            });
+                        } else {
+                            self.command_collector.add_command(DawCommand::MuteTrack {
+                                track_id: track.id.clone(),
+                            });
+                        }
                     }
                     
-                    let solo_text = if track.is_soloed { "[S]" } else { "S" };
-                    if ui.add(egui::Button::new(solo_text).small()).clicked() {
-                        // TODO: Add command for solo/unsolo
+                    let solo_button = egui::Button::new("S").small();
+                    let solo_button = if track.is_soloed {
+                        solo_button.fill(egui::Color32::from_rgb(180, 180, 60))
+                    } else {
+                        solo_button
+                    };
+                    
+                    if ui.add(solo_button).clicked() {
+                        if track.is_soloed {
+                            self.command_collector.add_command(DawCommand::UnsoloTrack {
+                                track_id: track.id.clone(),
+                            });
+                        } else {
+                            self.command_collector.add_command(DawCommand::SoloTrack {
+                                track_id: track.id.clone(),
+                            });
+                        }
                     }
                 });
                 
@@ -696,14 +719,6 @@ impl Timeline {
                 }
             });
         });
-        
-        // Handle full rect click for selection
-        let response = ui.interact(rect, ui.id().with(&track.id), egui::Sense::click());
-        if response.clicked() {
-            self.command_collector.add_command(DawCommand::SelectTrack {
-                track_id: track.id.clone(),
-            });
-        }
     }
 
     fn draw_tracks(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &mut DawState) {
@@ -968,27 +983,24 @@ impl Timeline {
         
         if left_response.drag_started() {
             self.resize_initial_values = Some((start_time, length));
-            self.resize_accumulator = 0.0;
+            self.resize_snap_handler.reset();
         }
         
         if left_response.dragged() {
             if let Some((initial_start, initial_length)) = self.resize_initial_values {
                 // Accumulate drag delta
-                self.resize_accumulator += left_response.drag_delta().x;
-                let accumulated_time_delta = self.resize_accumulator / self.pixels_per_second;
-                let proposed_start = (initial_start + accumulated_time_delta).max(0.0);
+                self.resize_snap_handler.add_delta(left_response.drag_delta().x);
+                let accumulated_time_delta = self.resize_snap_handler.get_accumulated() / self.pixels_per_second;
                 
                 // Apply snapping if enabled (disable with Shift key)
                 let snap = self.snap_enabled && !ui.input(|i| i.modifiers.shift);
-                let new_start = if snap && self.resize_accumulator.abs() > 10.0 {
-                    TimeUtils::snap_time(
-                        proposed_start as f64,
-                        state.project.bpm,
-                        state.snap_mode,
-                    ) as f32
-                } else {
-                    proposed_start
-                };
+                let new_start = self.resize_snap_handler.snap_time_accumulated(
+                    initial_start as f64,
+                    accumulated_time_delta as f64,
+                    state.project.bpm,
+                    state.snap_mode,
+                    snap,
+                ) as f32;
                 
                 let new_length = (initial_length + (initial_start - new_start)).max(0.1);
 
@@ -1019,7 +1031,7 @@ impl Timeline {
         
         if left_response.drag_stopped() {
             self.resize_initial_values = None;
-            self.resize_accumulator = 0.0;
+            self.resize_snap_handler.reset();
         }
 
         // Handle resizing from right edge (only change length as clip doesn't move)
@@ -1027,19 +1039,19 @@ impl Timeline {
         
         if right_response.drag_started() {
             self.resize_initial_values = Some((start_time, length));
-            self.resize_accumulator = 0.0;
+            self.resize_snap_handler.reset();
         }
         
         if right_response.dragged() {
             if let Some((initial_start, initial_length)) = self.resize_initial_values {
                 // Accumulate drag delta
-                self.resize_accumulator += right_response.drag_delta().x;
-                let accumulated_time_delta = self.resize_accumulator / self.pixels_per_second;
+                self.resize_snap_handler.add_delta(right_response.drag_delta().x);
+                let accumulated_time_delta = self.resize_snap_handler.get_accumulated() / self.pixels_per_second;
                 let proposed_length = (initial_length + accumulated_time_delta).max(0.1);
                 
                 // Apply snapping if enabled (disable with Shift key)
                 let snap = self.snap_enabled && !ui.input(|i| i.modifiers.shift);
-                let new_length = if snap && self.resize_accumulator.abs() > 10.0 {
+                let new_length = if snap && self.resize_snap_handler.should_snap() {
                     let end_time = initial_start + proposed_length;
                     let snapped_end = TimeUtils::snap_time(
                         end_time as f64,
@@ -1062,7 +1074,7 @@ impl Timeline {
         
         if right_response.drag_stopped() {
             self.resize_initial_values = None;
-            self.resize_accumulator = 0.0;
+            self.resize_snap_handler.reset();
         }
 
         // Change cursor when hovering over resize handles

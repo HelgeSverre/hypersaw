@@ -22,6 +22,59 @@ impl TimeUtils {
     }
 }
 
+/// Handles smooth snapping with accumulator to prevent jumpiness
+pub struct SnapHandler {
+    accumulator: f32,
+    threshold: f32,
+}
+
+impl SnapHandler {
+    pub fn new(threshold: f32) -> Self {
+        Self {
+            accumulator: 0.0,
+            threshold,
+        }
+    }
+    
+    /// Reset the accumulator (call on drag start)
+    pub fn reset(&mut self) {
+        self.accumulator = 0.0;
+    }
+    
+    /// Add delta to accumulator
+    pub fn add_delta(&mut self, delta: f32) {
+        self.accumulator += delta;
+    }
+    
+    /// Get accumulated value
+    pub fn get_accumulated(&self) -> f32 {
+        self.accumulator
+    }
+    
+    /// Check if we should apply snapping based on threshold
+    pub fn should_snap(&self) -> bool {
+        self.accumulator.abs() > self.threshold
+    }
+    
+    /// Apply snapping to a time value with accumulator logic
+    pub fn snap_time_accumulated(
+        &self,
+        initial_time: f64,
+        delta_time: f64,
+        bpm: f64,
+        snap_mode: SnapMode,
+        snap_enabled: bool,
+    ) -> f64 {
+        let proposed_time = initial_time + delta_time;
+        
+        if snap_enabled && self.should_snap() {
+            TimeUtils::snap_time(proposed_time, bpm, snap_mode)
+        } else {
+            proposed_time
+        }
+    }
+}
+
 pub struct NotePositioning {
     /// Pixels per second for time axis
     time_zoom: f32,
