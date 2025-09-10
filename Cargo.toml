@@ -14,3 +14,5 @@ rfd = "0.15.1"
 midly = "0.5.3"
 ordered-float = { version = "4.6.0", features = ["serde"] }
 rand = "0.8"
+quick-xml = { version = "0.30", features = ["serialize"] }
+zip = "0.6"
