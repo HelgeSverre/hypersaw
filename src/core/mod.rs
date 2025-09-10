@@ -5,6 +5,7 @@ pub mod dawproject;
 pub mod midi;
 pub mod midi_editing;
 pub mod project;
+pub mod sample_project;
 pub mod state;
 pub mod status;
 pub mod utils;
