@@ -30,6 +30,8 @@ enum FileDialog {
     LoadProject,
     ImportAudio,
     ImportMidi,
+    ExportDawproject,
+    ImportDawproject,
 }
 
 impl SupersawApp {
@@ -433,6 +435,15 @@ impl eframe::App for SupersawApp {
                         ui.close_menu();
                     }
                     ui.separator();
+                    if ui.button("Export DAWproject...").clicked() {
+                        self.file_dialog = Some(FileDialog::ExportDawproject);
+                        ui.close_menu();
+                    }
+                    if ui.button("Import DAWproject...").clicked() {
+                        self.file_dialog = Some(FileDialog::ImportDawproject);
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Import MIDI...").clicked() {
                         self.file_dialog = Some(FileDialog::ImportMidi);
                         ui.close_menu();
@@ -607,6 +618,51 @@ impl eframe::App for SupersawApp {
                         self.state
                             .status
                             .error(format!("Failed to import MIDI file: {}", e));
+                    }
+                    self.file_dialog = None;
+                }
+
+                FileDialog::ExportDawproject => {
+                    if let Some(file_path) = rfd::FileDialog::new()
+                        .set_title("Export DAWproject")
+                        .add_filter("DAWproject", &["dawproject"])
+                        .set_directory(std::env::current_dir().unwrap())
+                        .save_file()
+                    {
+                        match self.state.project.export_dawproject(&file_path) {
+                            Ok(_) => {
+                                self.state.status.success("DAWproject exported successfully");
+                                println!("DAWproject exported to: {}", file_path.display());
+                            }
+                            Err(e) => {
+                                self.state.status.error("Failed to export DAWproject");
+                                eprintln!("Failed to export DAWproject: {}", file_path.display());
+                                eprintln!("Error: {}", e);
+                            }
+                        }
+                    }
+                    self.file_dialog = None;
+                }
+
+                FileDialog::ImportDawproject => {
+                    if let Some(file_path) = rfd::FileDialog::new()
+                        .set_title("Import DAWproject")
+                        .add_filter("DAWproject", &["dawproject"])
+                        .set_directory(std::env::current_dir().unwrap())
+                        .pick_file()
+                    {
+                        match Project::import_dawproject(&file_path) {
+                            Ok(project) => {
+                                self.state.project = project;
+                                self.state.status.success("DAWproject imported successfully");
+                                println!("DAWproject imported from: {}", file_path.display());
+                            }
+                            Err(e) => {
+                                self.state.status.error("Failed to import DAWproject");
+                                eprintln!("Failed to import DAWproject: {}", file_path.display());
+                                eprintln!("Error: {}", e);
+                            }
+                        }
                     }
                     self.file_dialog = None;
                 }
