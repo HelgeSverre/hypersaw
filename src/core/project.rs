@@ -29,7 +29,7 @@ impl SnapMode {
     pub fn get_division(&self, bpm: f64) -> f64 {
         let beat_duration = 60.0 / bpm; // Duration of one beat in seconds
         match self {
-            SnapMode::None => beat_duration,
+            SnapMode::None => 0.0, // No snapping
             SnapMode::Bar => beat_duration * 4.0, // Full measure
             SnapMode::Beat => beat_duration,      // Quarter note
             SnapMode::Halfbeat => beat_duration / 2.0, // Eighth note
@@ -99,7 +99,20 @@ pub struct Track {
     pub is_muted: bool,
     pub is_soloed: bool,
     pub is_armed: bool,
+    pub input_monitoring: bool,
     pub color: String, // Hex color like "#fde047"
+    pub takes: Vec<Take>, // Recording takes
+    pub active_take: Option<String>, // Currently active take ID
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Take {
+    pub id: String,
+    pub track_id: String,
+    pub clip_id: String,
+    pub name: String,
+    pub timestamp: u64, // Unix timestamp
+    pub is_muted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +122,6 @@ pub enum TrackType {
         channel: u8,
         device_name: Option<String>,
     },
-    Audio,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -125,14 +137,6 @@ pub enum Clip {
         loaded: bool,
         #[serde(default)]
         automation_lanes: Vec<AutomationLane>,
-    },
-    Audio {
-        id: ClipId,
-        start_time: f64,
-        length: f64,
-        file_path: PathBuf, // Relative to project directory
-        start_offset: f64,  // Start point within audio file
-        end_offset: f64,    // End point within audio file
     },
 }
 
@@ -162,30 +166,27 @@ impl Clip {
     }
 
     pub fn get_events_in_time_range(&self, start: f64, end: f64) -> Vec<MidiEvent> {
-        match self {
-            Clip::Midi {
-                midi_data,
-                start_time,
-                ..
-            } => {
-                if let Some(store) = midi_data {
-                    // Adjust time range for clip position
-                    let clip_start = start - start_time;
-                    let clip_end = end - start_time;
+        let Clip::Midi {
+            midi_data,
+            start_time,
+            ..
+        } = self;
 
-                    store
-                        .get_events_in_range(clip_start, clip_end)
-                        .into_iter()
-                        .map(|event| MidiEvent {
-                            time: event.time + start_time,
-                            ..event.clone()
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            }
-            _ => Vec::new(),
+        if let Some(store) = midi_data {
+            // Adjust time range for clip position
+            let clip_start = start - start_time;
+            let clip_end = end - start_time;
+
+            store
+                .get_events_in_range(clip_start, clip_end)
+                .into_iter()
+                .map(|event| MidiEvent {
+                    time: event.time + start_time,
+                    ..event.clone()
+                })
+                .collect()
+        } else {
+            Vec::new()
         }
     }
 }
@@ -193,14 +194,11 @@ impl Clip {
 // Track-level MIDI handling
 impl Track {
     pub fn get_events_in_time_range(&self, start: f64, end: f64) -> Vec<MidiEvent> {
-        match &self.track_type {
-            TrackType::Midi { .. } => self
-                .clips
-                .iter()
-                .flat_map(|clip| clip.get_events_in_time_range(start, end))
-                .collect(),
-            _ => Vec::new(),
-        }
+        let TrackType::Midi { .. } = &self.track_type;
+        self.clips
+            .iter()
+            .flat_map(|clip| clip.get_events_in_time_range(start, end))
+            .collect()
     }
 }
 
@@ -262,30 +260,15 @@ impl Project {
         for track in &mut project.tracks {
             println!("Saving track: {}", track.name);
 
-            match &mut track.track_type {
-                TrackType::Midi { .. } => {
-                    println!("MIDI track detected");
-                }
-
-                TrackType::Audio => {
-                    println!("Audio track detected");
-                }
-            }
+            let TrackType::Midi { .. } = &track.track_type;
+            println!("MIDI track detected");
 
             println!("Saving clips...");
             for clip in &mut track.clips {
-                match clip {
-                    Clip::Audio { file_path, .. } => {
-                        println!("Audio clip file path: {:?}", file_path);
-                        let new_path = copy_to_project_dir(file_path, &samples_dir)?;
-                        *file_path = new_path;
-                    }
-                    Clip::Midi { file_path, .. } => {
-                        println!("MIDI clip file path: {:?}", file_path);
-                        let new_path = copy_to_project_dir(file_path, &midi_dir)?;
-                        *file_path = new_path;
-                    }
-                }
+                let Clip::Midi { file_path, .. } = clip;
+                println!("MIDI clip file path: {:?}", file_path);
+                let new_path = copy_to_project_dir(file_path, &midi_dir)?;
+                *file_path = new_path;
             }
         }
 
@@ -355,7 +338,10 @@ impl Project {
             is_muted: false,
             is_soloed: false,
             is_armed: false,
+            input_monitoring: false,
             color: "#fde047".to_string(), // Default yellow
+            takes: Vec::new(),
+            active_take: None,
         };
 
         // Add the track to the project

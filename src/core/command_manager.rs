@@ -1,10 +1,12 @@
 use super::commands::*;
+use super::undo_data::{UndoData, UndoDataStore};
 use super::DawState;
 use std::time::{Duration, Instant};
 
 pub struct CommandManager {
-    undo_stack: Vec<DawCommand>,
-    redo_stack: Vec<DawCommand>,
+    undo_stack: Vec<(DawCommand, usize)>, // (command, undo_data_id)
+    redo_stack: Vec<(DawCommand, usize)>,
+    undo_data_store: UndoDataStore,
     state_snapshots: Vec<StateSnapshot>,
     max_snapshot_count: usize,
     last_snapshot_time: Instant,
@@ -40,6 +42,7 @@ impl CommandManager {
         Self {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            undo_data_store: UndoDataStore::new(),
             state_snapshots: Vec::new(),
             last_snapshot_time: Instant::now(),
             max_snapshot_count: 50,
@@ -51,6 +54,7 @@ impl CommandManager {
         Self {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            undo_data_store: UndoDataStore::new(),
             state_snapshots: Vec::new(),
             last_snapshot_time: Instant::now(),
             max_snapshot_count,
@@ -71,8 +75,8 @@ impl CommandManager {
         // Execute the command
         command.execute(state)?;
 
-        // Add to undo stack
-        self.undo_stack.push(command);
+        // Add to undo stack with a dummy undo data id (we don't use it yet)
+        self.undo_stack.push((command, 0));
 
         // Clear redo stack as we have a new command
         self.redo_stack.clear();
@@ -81,19 +85,23 @@ impl CommandManager {
     }
 
     pub fn undo(&mut self, state: &mut DawState) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(command) = self.undo_stack.pop() {
-            // Restore the previous state
-            if let Some(snapshot) = self.state_snapshots.pop() {
-                *state = snapshot.state;
-            }
-
-            self.redo_stack.push(command);
+        if let Some((command, _undo_data_id)) = self.undo_stack.pop() {
+            // Call the command's undo method
+            command.undo(state)?;
+            
+            // Log the undo action
+            state.status.info(format!("Undo: {}", command.name()));
+            
+            // Add to redo stack (with invalid undo data id since we'll recalculate on redo)
+            self.redo_stack.push((command, 0));
+        } else {
+            state.status.info("Nothing to undo".to_string());
         }
         Ok(())
     }
 
     pub fn redo(&mut self, state: &mut DawState) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(command) = self.redo_stack.pop() {
+        if let Some((command, _)) = self.redo_stack.pop() {
             // Save current state before re-executing the command
             self.save_snapshot(state);
 
@@ -101,9 +109,11 @@ impl CommandManager {
             command.execute(state)?;
 
             // Log the redo action
-            println!("Redo: {}", command.name());
+            state.status.info(format!("Redo: {}", command.name()));
 
-            self.undo_stack.push(command);
+            self.undo_stack.push((command, 0));
+        } else {
+            state.status.info("Nothing to redo".to_string());
         }
         Ok(())
     }
@@ -124,9 +134,10 @@ impl CommandManager {
                 self.state_snapshots.remove(0);
             }
 
-            let snapshot = StateSnapshot::from_state(state.clone());
+            // TODO: Implement state snapshots without cloning the entire DawState
+            // For now, we'll skip snapshots since DawState contains the MIDI engine handle
+            // which can't be cloned. We should serialize only the necessary parts.
             self.last_snapshot_time = now;
-            self.state_snapshots.push(snapshot);
         }
     }
 }

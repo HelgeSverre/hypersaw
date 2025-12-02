@@ -15,6 +15,7 @@ pub struct PianoRoll {
     scroll_y: f32,
     viewport_height: f32,
     selected_notes: Vec<EventID>,
+    clipboard: Vec<Note>, // Clipboard for copy/paste
     dragging: Option<DragOperation>,
     command_collector: CommandCollector,
     // Automation panel
@@ -94,6 +95,7 @@ impl PianoRoll {
             scroll_y: 0.0,
             viewport_height: 0.0,
             selected_notes: Vec::new(),
+            clipboard: Vec::new(),
             dragging: None,
             command_collector: CommandCollector::new(),
             automation_panel_height: 200.0,
@@ -111,14 +113,19 @@ impl PianoRoll {
             cc_search_query: String::new(),
         }
     }
-    fn ensure_default_automation_lanes(&mut self, clip_id: &str) {
-        // This method ensures a clip has default automation lanes
-        // In a real implementation, this would use commands to modify the clip
-        // For now, we'll add a command to add velocity lane if it doesn't exist
-        self.command_collector.add_command(DawCommand::AddAutomationLane {
-            clip_id: clip_id.to_string(),
-            parameter: AutomationParameter::Velocity,
+    fn ensure_default_automation_lanes(&mut self, clip_id: &str, automation_lanes: &[AutomationLane]) {
+        // Check if velocity lane already exists
+        let has_velocity = automation_lanes.iter().any(|lane| {
+            matches!(lane.parameter, AutomationParameter::Velocity)
         });
+
+        // Add velocity lane if not present
+        if !has_velocity {
+            self.command_collector.add_command(DawCommand::AddAutomationLane {
+                clip_id: clip_id.to_string(),
+                parameter: AutomationParameter::Velocity,
+            });
+        }
     }
     
     fn get_active_notes(
@@ -182,6 +189,17 @@ impl PianoRoll {
                     }
                 }
             }
+
+        // Ensure velocity lane exists for this clip
+        if let Some(track) = state.project.tracks.iter().find(|t| &t.id == &track_id) {
+            if let Some(Clip::Midi { automation_lanes, .. }) = track
+                .clips
+                .iter()
+                .find(|c| matches!(c, Clip::Midi { id, .. } if id == &clip_id))
+            {
+                self.ensure_default_automation_lanes(&clip_id, automation_lanes);
+            }
+        }
 
         // Get clip start time
         let clip_start =
@@ -302,18 +320,41 @@ impl PianoRoll {
                 let clip_id_clone = clip_id.clone();
                 let track_id_clone = track_id.clone();
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(automation_rect), |ui| {
-                    self.draw_automation_panel(ui, automation_rect, &clip_id_clone, &track_id_clone, state);
+                    self.draw_automation_panel(ui, automation_rect, &clip_id_clone, &track_id_clone, clip_start, state);
                 });
             }
 
-            // Handle keyboard shortcuts
+            // Handle keyboard shortcuts  
+            let deleted_notes: Vec<Note> = if !self.selected_notes.is_empty() {
+                // Collect notes for undo before deleting
+                state.project.tracks.iter()
+                    .flat_map(|track| &track.clips)
+                    .find_map(|c| {
+                        if let Clip::Midi { id, midi_data, .. } = c {
+                            if id == &clip_id {
+                                return midi_data.as_ref().map(|store| {
+                                    self.selected_notes.iter()
+                                        .filter_map(|note_id| store.get_note(note_id).cloned())
+                                        .collect()
+                                });
+                            }
+                        }
+                        None
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            
             ui.input(|i| {
                 // Delete key - delete selected notes and automation points
                 if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
                     if !self.selected_notes.is_empty() {
+                        
                         self.command_collector.add_command(DawCommand::DeleteNotes {
                             clip_id: clip_id.to_string(),
                             note_ids: self.selected_notes.clone(),
+                            deleted_notes: Some(deleted_notes),
                         });
                         self.selected_notes.clear();
                     }
@@ -345,10 +386,111 @@ impl PianoRoll {
                     }
                 }
                 
+                // Ctrl+C - Copy selected notes
+                if i.key_pressed(egui::Key::C) && (i.modifiers.ctrl || i.modifiers.command) {
+                    if !self.selected_notes.is_empty() {
+                        self.clipboard.clear();
+                        // Copy selected notes to clipboard
+                        if let Some(track) = state.project.tracks.iter().find(|t| &t.id == &track_id) {
+                            if let Some(Clip::Midi { midi_data, .. }) = track.clips.iter()
+                                .find(|c| matches!(c, Clip::Midi { id, .. } if id == &clip_id))
+                            {
+                                if let Some(store) = midi_data {
+                                    for note_id in &self.selected_notes {
+                                        if let Some(note) = store.get_note(note_id) {
+                                            self.clipboard.push(note.clone());
+                                        }
+                                    }
+                                    state.status.info(format!("Copied {} notes", self.clipboard.len()));
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Ctrl+V - Paste notes
+                if i.key_pressed(egui::Key::V) && (i.modifiers.ctrl || i.modifiers.command) {
+                    if !self.clipboard.is_empty() {
+                        // Find the earliest note in clipboard to use as reference
+                        let min_time = self.clipboard.iter()
+                            .map(|n| n.start_time)
+                            .min_by(|a, b| a.partial_cmp(b).unwrap())
+                            .unwrap_or(0.0);
+                        
+                        // Paste at current playback position or beginning
+                        let paste_time = state.current_time;
+                        let time_offset = paste_time - min_time;
+                        
+                        // Create AddNote commands for each clipboard note
+                        for note in &self.clipboard {
+                            self.command_collector.add_command(DawCommand::AddNote {
+                                clip_id: clip_id.to_string(),
+                                start_time: note.start_time + time_offset,
+                                duration: note.duration,
+                                pitch: note.key,
+                                velocity: note.velocity,
+                            });
+                        }
+                        state.status.success(format!("Pasted {} notes", self.clipboard.len()));
+                    }
+                }
+                
+                // Ctrl+D - Duplicate selected notes
+                if i.key_pressed(egui::Key::D) && (i.modifiers.ctrl || i.modifiers.command) {
+                    if !self.selected_notes.is_empty() {
+                        // Collect notes to duplicate
+                        let mut notes_to_duplicate = Vec::new();
+                        if let Some(track) = state.project.tracks.iter().find(|t| &t.id == &track_id) {
+                            if let Some(Clip::Midi { midi_data, .. }) = track.clips.iter()
+                                .find(|c| matches!(c, Clip::Midi { id, .. } if id == &clip_id))
+                            {
+                                if let Some(store) = midi_data {
+                                    for note_id in &self.selected_notes {
+                                        if let Some(note) = store.get_note(note_id) {
+                                            notes_to_duplicate.push(note.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Find the maximum end time to offset duplicates
+                        let max_end = notes_to_duplicate.iter()
+                            .map(|n| n.start_time + n.duration)
+                            .max_by(|a, b| a.partial_cmp(b).unwrap())
+                            .unwrap_or(0.0);
+                        
+                        let count = notes_to_duplicate.len();
+                        
+                        // Duplicate notes immediately after the originals
+                        for note in notes_to_duplicate {
+                            let time_offset = max_end - note.start_time;
+                            self.command_collector.add_command(DawCommand::AddNote {
+                                clip_id: clip_id.to_string(),
+                                start_time: note.start_time + time_offset,
+                                duration: note.duration,
+                                pitch: note.key,
+                                velocity: note.velocity,
+                            });
+                        }
+                        state.status.success(format!("Duplicated {} notes", count));
+                    }
+                }
+                
                 // Escape - Clear selection
                 if i.key_pressed(egui::Key::Escape) {
                     self.selected_notes.clear();
                     self.selected_automation_points.clear();
+                }
+                
+                // Q - Quantize selected notes
+                if i.key_pressed(egui::Key::Q) && !self.selected_notes.is_empty() {
+                    self.command_collector.add_command(DawCommand::QuantizeNotes {
+                        clip_id: clip_id.to_string(),
+                        note_ids: self.selected_notes.clone(),
+                        strength: 1.0, // Full quantization
+                        grid: state.snap_mode,
+                    });
                 }
             });
 
@@ -943,6 +1085,8 @@ impl PianoRoll {
                         note_id: note.id.clone(),
                         new_start_time,
                         new_duration,
+                        old_start_time: Some(initial_start),
+                        old_duration: Some(initial_duration),
                     });
                 }
             }
@@ -1332,7 +1476,7 @@ impl PianoRoll {
         }
     }
 
-    fn draw_automation_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect, clip_id: &str, track_id: &str, state: &mut DawState) {
+    fn draw_automation_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect, clip_id: &str, track_id: &str, clip_start: f64, state: &mut DawState) {
         let header_height = 30.0;
         let lane_gap = 2.0;
         
@@ -1520,7 +1664,7 @@ impl PianoRoll {
             if lane_rect.bottom() > content_rect.top() && lane_rect.top() < content_rect.bottom() {
                 let lane_id = lane.id.clone();
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(lane_rect.intersect(content_rect)), |ui| {
-                    self.draw_automation_lane(ui, lane_rect, lane_id, clip_id, state);
+                    self.draw_automation_lane(ui, lane_rect, lane_id, clip_id, clip_start, state);
                 });
             }
             
@@ -1538,7 +1682,7 @@ impl PianoRoll {
         }
     }
 
-    fn draw_automation_lane(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: String, clip_id: &str, state: &DawState) {
+    fn draw_automation_lane(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: String, clip_id: &str, clip_start: f64, state: &DawState) {
         let label_width = self.key_width;
         let margin = 4.0;
         
@@ -1589,10 +1733,10 @@ impl PianoRoll {
             egui::vec2(rect.width() - label_width, rect.height()),
         );
         
-        self.draw_automation_curve(ui, curve_rect, &lane_id, clip_id, state);
+        self.draw_automation_curve(ui, curve_rect, &lane_id, clip_id, clip_start, state);
     }
 
-    fn draw_automation_curve(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: &str, clip_id: &str, state: &DawState) {
+    fn draw_automation_curve(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: &str, clip_id: &str, clip_start: f64, state: &DawState) {
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         
         // Get lane data from clip
@@ -1841,7 +1985,7 @@ impl PianoRoll {
         }
         
         // Draw playhead
-        self.draw_automation_playhead(ui, rect, state.current_time);
+        self.draw_automation_playhead(ui, rect, clip_start, state.current_time);
     }
 
     fn draw_velocity_bars(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lane_id: &str, clip_id: &str, state: &DawState) {
@@ -1902,6 +2046,7 @@ impl PianoRoll {
                                     clip_id: clip_id.clone(),
                                     note_id: note.id.clone(),
                                     velocity: new_velocity,
+                                    old_velocity: Some(note.velocity),
                                 });
                             }
                             
@@ -1922,9 +2067,10 @@ impl PianoRoll {
         }
     }
 
-    fn draw_automation_playhead(&self, ui: &mut egui::Ui, rect: egui::Rect, current_time: f64) {
-        // Use the same calculation as the piano roll playhead
-        let playhead_x = rect.left() + (current_time as f32 * self.zoom) - self.scroll_x;
+    fn draw_automation_playhead(&self, ui: &mut egui::Ui, rect: egui::Rect, clip_start: f64, current_time: f64) {
+        // Calculate relative time within the clip (same as piano roll playhead)
+        let relative_time = current_time - clip_start;
+        let playhead_x = rect.left() + (relative_time as f32 * self.zoom) - self.scroll_x;
         
         if playhead_x >= rect.left() && playhead_x <= rect.right() {
             // Use same soft red color as timeline and piano roll
