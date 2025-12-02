@@ -210,26 +210,99 @@ impl MidiEventStore {
     pub fn get_notes(&self) -> impl Iterator<Item = &Note> {
         self.notes.values()
     }
+    
+    pub fn get_note(&self, note_id: &str) -> Option<&Note> {
+        self.notes.get(note_id)
+    }
+    
+    pub fn get_note_mut(&mut self, note_id: &str) -> Option<&mut Note> {
+        self.notes.get_mut(note_id)
+    }
+    
+    pub fn rebuild_note_maps(&mut self) {
+        // Clear the existing maps
+        self.events_by_time.clear();
+        self.events_by_tick.clear();
+        self.event_data.clear();
+        
+        // Rebuild from notes
+        let notes: Vec<Note> = self.notes.values().cloned().collect();
+        for note in notes {
+            self.add_note(note);
+        }
+    }
 
     // Time conversion methods
     pub fn tick_to_time(&self, tick: u32) -> f64 {
-        let tempo_change = self
-            .tempo_map
-            .iter()
-            .rev()
-            .find(|tc| tc.tick <= tick)
-            .unwrap_or(&self.tempo_map[0]);
-
-        let tick_delta = tick - tempo_change.tick;
-        let seconds_per_tick = tempo_change.tempo as f64 / (self.ppq as f64 * 1_000_000.0);
-        tick_delta as f64 * seconds_per_tick
+        // Accumulate time across all tempo segments up to the target tick
+        let mut accumulated_time = 0.0;
+        let mut current_tick = 0u32;
+        
+        for i in 0..self.tempo_map.len() {
+            let current_tempo = &self.tempo_map[i];
+            let next_tick = if i + 1 < self.tempo_map.len() {
+                self.tempo_map[i + 1].tick.min(tick)
+            } else {
+                tick
+            };
+            
+            if next_tick <= current_tick {
+                break;
+            }
+            
+            // Calculate time for this segment
+            let tick_delta = next_tick - current_tick;
+            let seconds_per_tick = current_tempo.tempo as f64 / (self.ppq as f64 * 1_000_000.0);
+            accumulated_time += tick_delta as f64 * seconds_per_tick;
+            
+            current_tick = next_tick;
+            
+            if current_tick >= tick {
+                break;
+            }
+        }
+        
+        accumulated_time
     }
 
     pub fn time_to_tick(&self, time: f64) -> u32 {
-        // TODO: Handle tempo changes properly
-        let default_tempo = self.tempo_map[0].tempo;
-        let ticks_per_second = (self.ppq as f64 * 1_000_000.0) / default_tempo as f64;
-        (time * ticks_per_second) as u32
+        // Accumulate ticks across tempo segments until we reach the target time
+        let mut accumulated_time = 0.0;
+        let mut accumulated_ticks = 0u32;
+        
+        for i in 0..self.tempo_map.len() {
+            let current_tempo = &self.tempo_map[i];
+            let next_tempo_tick = if i + 1 < self.tempo_map.len() {
+                self.tempo_map[i + 1].tick
+            } else {
+                u32::MAX
+            };
+            
+            let seconds_per_tick = current_tempo.tempo as f64 / (self.ppq as f64 * 1_000_000.0);
+            let ticks_per_second = 1.0 / seconds_per_tick;
+            
+            // How much time is available in this tempo segment?
+            let ticks_in_segment = next_tempo_tick - accumulated_ticks;
+            let time_in_segment = ticks_in_segment as f64 * seconds_per_tick;
+            
+            if accumulated_time + time_in_segment >= time {
+                // Target time is in this segment
+                let remaining_time = time - accumulated_time;
+                let remaining_ticks = (remaining_time * ticks_per_second) as u32;
+                return accumulated_ticks + remaining_ticks;
+            }
+            
+            // Move to next segment
+            accumulated_time += time_in_segment;
+            accumulated_ticks = next_tempo_tick;
+        }
+        
+        // If we get here, use the last tempo
+        let last_tempo = &self.tempo_map[self.tempo_map.len() - 1];
+        let seconds_per_tick = last_tempo.tempo as f64 / (self.ppq as f64 * 1_000_000.0);
+        let ticks_per_second = 1.0 / seconds_per_tick;
+        let remaining_time = time - accumulated_time;
+        accumulated_ticks + (remaining_time * ticks_per_second) as u32
     }
 
     pub fn delete_note(&mut self, note_id: &str) {
