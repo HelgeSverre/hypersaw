@@ -34,6 +34,27 @@ impl TimeUtils {
     pub fn seconds_to_beats(seconds: f64, bpm: f64) -> f64 {
         seconds * bpm / 60.0
     }
+
+    /// Convert seconds to Bar:Beat:Tick format string
+    /// PPQ is typically 480 ticks per beat
+    pub fn format_bar_beat_tick(seconds: f64, bpm: f64, ppq: u32) -> String {
+        if seconds < 0.0 {
+            return "1:1:000".to_string();
+        }
+
+        let ticks_per_second = (bpm / 60.0) * ppq as f64;
+        let total_ticks = (seconds * ticks_per_second) as u32;
+
+        let beats_per_bar: u32 = 4; // 4/4 time signature
+        let ticks_per_bar = ppq * beats_per_bar;
+
+        let bar = (total_ticks / ticks_per_bar) + 1;
+        let remaining = total_ticks % ticks_per_bar;
+        let beat = (remaining / ppq) + 1;
+        let tick = remaining % ppq;
+
+        format!("{}:{}:{:03}", bar, beat, tick)
+    }
 }
 
 /// Handles smooth snapping with accumulator to prevent jumpiness
