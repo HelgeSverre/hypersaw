@@ -25,6 +25,8 @@ pub struct Timeline {
     // Device panel state
     device_panel_height: f32,
     show_device_panel: bool,
+    // Track name editing state
+    editing_track_name: Option<(String, String)>, // (track_id, current_text)
 }
 
 impl Default for Timeline {
@@ -45,6 +47,7 @@ impl Default for Timeline {
             dragging_track: None,
             device_panel_height: 100.0,
             show_device_panel: true,
+            editing_track_name: None,
         }
     }
 }
@@ -684,15 +687,41 @@ impl Timeline {
         }
 
         ui.painter().rect_filled(rect, 0.0, bg_color);
-        
-        // Add drag handle area (entire header is draggable)
-        let drag_response = ui.allocate_rect(rect, egui::Sense::drag());
-        
+
+        // Split header into drag zone (left) and content zone
+        const DRAG_HANDLE_WIDTH: f32 = 16.0;
+
+        let drag_zone = egui::Rect::from_min_size(
+            rect.min,
+            egui::vec2(DRAG_HANDLE_WIDTH, rect.height()),
+        );
+
+        let content_zone = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + DRAG_HANDLE_WIDTH, rect.min.y),
+            rect.max,
+        );
+
+        // 1. Drag handle zone - only responds to drag
+        let drag_response = ui.allocate_rect(drag_zone, egui::Sense::drag());
+
+        // Draw grip dots (⋮⋮ pattern)
+        let grip_color = if drag_response.hovered() || drag_response.dragged() {
+            ui.visuals().strong_text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        let center_x = drag_zone.center().x;
+        for i in 0..3 {
+            let y = drag_zone.center().y + (i as f32 - 1.0) * 4.0;
+            ui.painter().circle_filled(egui::pos2(center_x - 2.0, y), 1.0, grip_color);
+            ui.painter().circle_filled(egui::pos2(center_x + 2.0, y), 1.0, grip_color);
+        }
+
         // Handle drag start
         if drag_response.drag_started() {
             self.dragging_track = Some((index, 0.0));
         }
-        
+
         // Handle dragging
         if let Some((drag_index, _)) = self.dragging_track {
             if drag_index == index && drag_response.dragged() {
@@ -700,12 +729,12 @@ impl Timeline {
                 if let Some((_, ref mut offset)) = self.dragging_track {
                     *offset += delta_y;
                 }
-                
+
                 // Change cursor to indicate dragging
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
         }
-        
+
         // Handle drag end
         if drag_response.drag_stopped() {
             if let Some((from_index, offset)) = self.dragging_track {
@@ -713,25 +742,36 @@ impl Timeline {
                 let tracks_moved = (offset / self.track_height).round() as i32;
                 let to_index = (from_index as i32 + tracks_moved).max(0) as usize;
                 let to_index = to_index.min(state.project.tracks.len().saturating_sub(1));
-                
+
                 if from_index != to_index {
                     self.command_collector.add_command(DawCommand::ReorderTracks {
                         from_index,
                         to_index,
                     });
                 }
-                
+
                 self.dragging_track = None;
             }
         }
-        
-        // Show hover cursor
+
+        // Show grab cursor on drag handle hover
         if drag_response.hovered() && self.dragging_track.is_none() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
 
-        // Draw track color stripe on the left (like Bitwig)
-        let stripe_rect = egui::Rect::from_min_size(rect.min, egui::vec2(4.0, rect.height()));
+        // 2. Content zone - responds to click for selection
+        let content_response = ui.allocate_rect(content_zone, egui::Sense::click());
+        if content_response.clicked() {
+            self.command_collector.add_command(DawCommand::SelectTrack {
+                track_id: track.id.clone(),
+            });
+        }
+
+        // Draw track color stripe (after drag handle)
+        let stripe_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + DRAG_HANDLE_WIDTH, rect.min.y),
+            egui::vec2(4.0, rect.height()),
+        );
         let track_color =
             hex_to_color32(&track.color).unwrap_or(egui::Color32::from_rgb(253, 224, 71)); // Default yellow
         ui.painter().rect_filled(stripe_rect, 0.0, track_color);
@@ -748,10 +788,10 @@ impl Timeline {
             (1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
 
-        // Content area with padding (accounting for color stripe)
+        // Content area with padding (accounting for drag handle and color stripe)
         let content_rect = egui::Rect::from_min_size(
-            rect.min + egui::vec2(10.0, 6.0),
-            egui::vec2(rect.width() - 16.0, rect.height() - 12.0),
+            rect.min + egui::vec2(DRAG_HANDLE_WIDTH + 8.0, 6.0),
+            egui::vec2(rect.width() - DRAG_HANDLE_WIDTH - 14.0, rect.height() - 12.0),
         );
 
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
@@ -762,16 +802,61 @@ impl Timeline {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
 
-                    // Track name (clickable for selection)
-                    let name_response = ui.add(
-                        egui::Label::new(egui::RichText::new(&track.name).size(13.0))
-                            .sense(egui::Sense::click()),
-                    );
+                    // Track name (double-click to edit, single-click to select)
+                    let is_editing_this_track = self.editing_track_name
+                        .as_ref()
+                        .map(|(id, _)| id == &track.id)
+                        .unwrap_or(false);
 
-                    if name_response.clicked() {
-                        self.command_collector.add_command(DawCommand::SelectTrack {
-                            track_id: track.id.clone(),
-                        });
+                    if is_editing_this_track {
+                        // Show text input for editing
+                        if let Some((_, ref mut edit_text)) = &mut self.editing_track_name {
+                            let text_edit = egui::TextEdit::singleline(edit_text)
+                                .desired_width(120.0)
+                                .font(egui::TextStyle::Body);
+
+                            let response = ui.add(text_edit);
+
+                            // Request focus on first frame
+                            response.request_focus();
+
+                            // Commit on Enter or focus lost
+                            if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                let new_name = edit_text.clone();
+                                let track_id = track.id.clone();
+
+                                // Clear editing state
+                                self.editing_track_name = None;
+
+                                if !new_name.is_empty() && new_name != track.name {
+                                    self.command_collector.add_command(DawCommand::RenameTrack {
+                                        track_id,
+                                        new_name,
+                                    });
+                                }
+                            }
+
+                            // Cancel on Escape
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.editing_track_name = None;
+                            }
+                        }
+                    } else {
+                        // Show label with click and double-click handling
+                        let name_response = ui.add(
+                            egui::Label::new(egui::RichText::new(&track.name).size(13.0))
+                                .sense(egui::Sense::click()),
+                        );
+
+                        if name_response.double_clicked() {
+                            // Start editing
+                            self.editing_track_name = Some((track.id.clone(), track.name.clone()));
+                        } else if name_response.clicked() {
+                            // Select track
+                            self.command_collector.add_command(DawCommand::SelectTrack {
+                                track_id: track.id.clone(),
+                            });
+                        }
                     }
 
                     // Push buttons to the right
