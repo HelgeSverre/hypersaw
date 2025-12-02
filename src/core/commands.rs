@@ -95,6 +95,10 @@ pub enum DawCommand {
         from_index: usize,
         to_index: usize,
     },
+    RenameTrack {
+        track_id: String,
+        new_name: String,
+    },
 
     // Clips
     SelectClip {
