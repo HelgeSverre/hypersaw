@@ -6,7 +6,8 @@
       "Bash(cargo run:*)",
       "Bash(cargo:*)",
       "Bash(grep:*)",
-      "Bash(rg:*)"
+      "Bash(rg:*)",
+      "Bash(git grep:*)"
     ],
     "deny": []
   }
