@@ -52,6 +52,168 @@ pub enum MidiMessage {
     MidiContinue,
 }
 
+impl MidiMessage {
+    pub fn with_channel(mut self, channel: u8) -> Self {
+        let channel = channel.min(15);
+        match &mut self {
+            Self::NoteOn { channel: value, .. }
+            | Self::NoteOff { channel: value, .. }
+            | Self::ControlChange { channel: value, .. }
+            | Self::ProgramChange { channel: value, .. }
+            | Self::PitchBend { channel: value, .. }
+            | Self::Aftertouch { channel: value, .. } => *value = channel,
+            Self::SysEx(_)
+            | Self::MidiClock
+            | Self::MidiStart
+            | Self::MidiStop
+            | Self::MidiContinue => {}
+        }
+        self
+    }
+}
+
+pub fn midi_channel_index(display_channel: u8) -> u8 {
+    display_channel.saturating_sub(1).min(15)
+}
+
+#[cfg(test)]
+mod message_tests {
+    use super::{MidiEventStore, MidiMessage, Note};
+
+    #[test]
+    fn with_channel_rewrites_channel_messages() {
+        let message = MidiMessage::NoteOn {
+            channel: 0,
+            key: 60,
+            velocity: 100,
+        }
+        .with_channel(9);
+        assert_eq!(
+            message,
+            MidiMessage::NoteOn {
+                channel: 9,
+                key: 60,
+                velocity: 100
+            }
+        );
+    }
+
+    #[test]
+    fn with_channel_clamps_to_midi_range() {
+        let message = MidiMessage::ProgramChange {
+            channel: 0,
+            program: 1,
+        }
+        .with_channel(16);
+        assert_eq!(
+            message,
+            MidiMessage::ProgramChange {
+                channel: 15,
+                program: 1
+            }
+        );
+    }
+
+    #[test]
+    fn display_channels_are_converted_to_zero_based_midi_channels() {
+        assert_eq!(super::midi_channel_index(1), 0);
+        assert_eq!(super::midi_channel_index(16), 15);
+    }
+
+    #[test]
+    fn event_range_includes_an_event_at_its_start_boundary() {
+        let mut store = MidiEventStore::new(480);
+        store.add_note(Note {
+            id: "note".to_string(),
+            channel: 0,
+            key: 60,
+            velocity: 100,
+            start_time: 0.0,
+            duration: 1.0,
+            start_tick: 0,
+            duration_ticks: 480,
+        });
+        let events = store.get_events_in_range(0.0, 0.5);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].message, MidiMessage::NoteOn { .. }));
+    }
+
+    #[test]
+    fn imported_tick_zero_tempo_replaces_the_default_before_time_conversion() {
+        let smf = midly::Smf {
+            header: midly::Header {
+                format: midly::Format::SingleTrack,
+                timing: midly::Timing::Metrical(480.into()),
+            },
+            tracks: vec![vec![
+                midly::TrackEvent {
+                    delta: 0.into(),
+                    kind: midly::TrackEventKind::Meta(midly::MetaMessage::Tempo(1_000_000.into())),
+                },
+                midly::TrackEvent {
+                    delta: 480.into(),
+                    kind: midly::TrackEventKind::Meta(midly::MetaMessage::Tempo(500_000.into())),
+                },
+                midly::TrackEvent {
+                    delta: 0.into(),
+                    kind: midly::TrackEventKind::Midi {
+                        channel: 0.into(),
+                        message: midly::MidiMessage::NoteOn {
+                            key: 60.into(),
+                            vel: 100.into(),
+                        },
+                    },
+                },
+                midly::TrackEvent {
+                    delta: 480.into(),
+                    kind: midly::TrackEventKind::Midi {
+                        channel: 0.into(),
+                        message: midly::MidiMessage::NoteOff {
+                            key: 60.into(),
+                            vel: 0.into(),
+                        },
+                    },
+                },
+            ]],
+        };
+        let path =
+            std::env::temp_dir().join(format!("tempo-regression-{}.mid", uuid::Uuid::new_v4()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        smf.write_std(&mut file).unwrap();
+
+        let store = MidiEventStore::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let note = store.get_notes().next().unwrap();
+        assert_eq!(store.tempo_map.len(), 2);
+        assert_eq!(note.start_time, 1.0);
+        assert_eq!(note.duration, 0.5);
+    }
+
+    #[test]
+    fn updating_note_velocity_updates_its_note_on_event() {
+        let mut store = MidiEventStore::new(480);
+        store.add_note(Note {
+            id: "note".to_string(),
+            channel: 0,
+            key: 60,
+            velocity: 64,
+            start_time: 0.0,
+            duration: 1.0,
+            start_tick: 0,
+            duration_ticks: 480,
+        });
+
+        store.update_note_velocity("note", 110);
+
+        assert_eq!(store.get_note("note").map(|note| note.velocity), Some(110));
+        assert!(matches!(
+            store.event_data["note_on"].message,
+            MidiMessage::NoteOn { velocity: 110, .. }
+        ));
+    }
+}
+
 // A single MIDI event with timing information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MidiEvent {
@@ -210,21 +372,21 @@ impl MidiEventStore {
     pub fn get_notes(&self) -> impl Iterator<Item = &Note> {
         self.notes.values()
     }
-    
+
     pub fn get_note(&self, note_id: &str) -> Option<&Note> {
         self.notes.get(note_id)
     }
-    
+
     pub fn get_note_mut(&mut self, note_id: &str) -> Option<&mut Note> {
         self.notes.get_mut(note_id)
     }
-    
+
     pub fn rebuild_note_maps(&mut self) {
         // Clear the existing maps
         self.events_by_time.clear();
         self.events_by_tick.clear();
         self.event_data.clear();
-        
+
         // Rebuild from notes
         let notes: Vec<Note> = self.notes.values().cloned().collect();
         for note in notes {
@@ -237,7 +399,7 @@ impl MidiEventStore {
         // Accumulate time across all tempo segments up to the target tick
         let mut accumulated_time = 0.0;
         let mut current_tick = 0u32;
-        
+
         for i in 0..self.tempo_map.len() {
             let current_tempo = &self.tempo_map[i];
             let next_tick = if i + 1 < self.tempo_map.len() {
@@ -245,23 +407,23 @@ impl MidiEventStore {
             } else {
                 tick
             };
-            
+
             if next_tick <= current_tick {
                 break;
             }
-            
+
             // Calculate time for this segment
             let tick_delta = next_tick - current_tick;
             let seconds_per_tick = current_tempo.tempo as f64 / (self.ppq as f64 * 1_000_000.0);
             accumulated_time += tick_delta as f64 * seconds_per_tick;
-            
+
             current_tick = next_tick;
-            
+
             if current_tick >= tick {
                 break;
             }
         }
-        
+
         accumulated_time
     }
 
@@ -269,7 +431,7 @@ impl MidiEventStore {
         // Accumulate ticks across tempo segments until we reach the target time
         let mut accumulated_time = 0.0;
         let mut accumulated_ticks = 0u32;
-        
+
         for i in 0..self.tempo_map.len() {
             let current_tempo = &self.tempo_map[i];
             let next_tempo_tick = if i + 1 < self.tempo_map.len() {
@@ -277,26 +439,26 @@ impl MidiEventStore {
             } else {
                 u32::MAX
             };
-            
+
             let seconds_per_tick = current_tempo.tempo as f64 / (self.ppq as f64 * 1_000_000.0);
             let ticks_per_second = 1.0 / seconds_per_tick;
-            
+
             // How much time is available in this tempo segment?
             let ticks_in_segment = next_tempo_tick - accumulated_ticks;
             let time_in_segment = ticks_in_segment as f64 * seconds_per_tick;
-            
+
             if accumulated_time + time_in_segment >= time {
                 // Target time is in this segment
                 let remaining_time = time - accumulated_time;
                 let remaining_ticks = (remaining_time * ticks_per_second) as u32;
                 return accumulated_ticks + remaining_ticks;
             }
-            
+
             // Move to next segment
             accumulated_time += time_in_segment;
             accumulated_ticks = next_tempo_tick;
         }
-        
+
         // If we get here, use the last tempo
         let last_tempo = &self.tempo_map[self.tempo_map.len() - 1];
         let seconds_per_tick = last_tempo.tempo as f64 / (self.ppq as f64 * 1_000_000.0);
@@ -356,12 +518,55 @@ impl MidiEventStore {
         // Add updated note
         self.add_note(updated_note);
     }
-    
+
     pub fn update_note_velocity(&mut self, note_id: &str, new_velocity: u8) {
         if let Some(note) = self.notes.get_mut(note_id) {
             note.velocity = new_velocity;
-            // TODO: Update the corresponding events in the event stores
+        } else {
+            return;
         }
+
+        if let Some(MidiEvent {
+            message: MidiMessage::NoteOn { velocity, .. },
+            ..
+        }) = self.event_data.get_mut(&format!("{note_id}_on"))
+        {
+            *velocity = new_velocity;
+        }
+    }
+
+    /// Sort imported tempo changes and retain the final tempo at each tick.
+    ///
+    /// A store starts with the default 120 BPM event at tick zero. MIDI files
+    /// commonly carry their own tick-zero tempo, so deduplicating is required
+    /// before converting ticks to time; otherwise the zero-length first segment
+    /// causes `tick_to_time` to stop immediately.
+    fn normalize_tempo_map(&mut self) {
+        self.tempo_map.sort_by_key(|change| change.tick);
+
+        let mut normalized = Vec::with_capacity(self.tempo_map.len() + 1);
+        for change in self.tempo_map.drain(..) {
+            if let Some(previous) = normalized
+                .last_mut()
+                .filter(|previous: &&mut TempoChange| previous.tick == change.tick)
+            {
+                *previous = change;
+            } else {
+                normalized.push(change);
+            }
+        }
+
+        if normalized.first().is_none_or(|change| change.tick != 0) {
+            normalized.insert(
+                0,
+                TempoChange {
+                    tick: 0,
+                    tempo: 500_000,
+                },
+            );
+        }
+
+        self.tempo_map = normalized;
     }
 
     pub fn move_note(&mut self, note_id: &str, delta_time: f64, delta_pitch: i8) {
@@ -403,11 +608,26 @@ impl MidiEventStore {
         };
 
         let mut store = MidiEventStore::new(ppq);
-        let mut running_tick = 0;
+
+        // Tempo events govern timing across every track, so collect and
+        // normalize them before constructing timestamped events.
+        for track in &smf.tracks {
+            let mut running_tick = 0;
+            for event in track {
+                running_tick += event.delta.as_int();
+                if let TrackEventKind::Meta(MetaMessage::Tempo(tempo)) = event.kind {
+                    store.tempo_map.push(TempoChange {
+                        tick: running_tick,
+                        tempo: tempo.as_int(),
+                    });
+                }
+            }
+        }
+        store.normalize_tempo_map();
 
         // Process each track
         for track in smf.tracks {
-            running_tick = 0;
+            let mut running_tick = 0;
             let mut active_notes: HashMap<(u8, u8), (EventID, u32, u8)> = HashMap::new(); // (channel, key) -> (id, start_tick, velocity)
 
             for event in track {
@@ -460,12 +680,7 @@ impl MidiEventStore {
                         }
                     }
                     TrackEventKind::Meta(meta_msg) => match meta_msg {
-                        MetaMessage::Tempo(tempo) => {
-                            store.tempo_map.push(TempoChange {
-                                tick: running_tick,
-                                tempo: tempo.as_int(),
-                            });
-                        }
+                        MetaMessage::Tempo(_) => {}
                         MetaMessage::TimeSignature(num, denom, _, _) => {
                             store.time_signatures.push(TimeSignature {
                                 tick: running_tick,

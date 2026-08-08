@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 
-use crate::core::{MidiEvent, MidiEventStore, AutomationLane};
+use crate::core::{AutomationLane, AutomationParameter, MidiEvent, MidiEventStore};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
@@ -29,16 +29,16 @@ impl SnapMode {
     pub fn get_division(&self, bpm: f64) -> f64 {
         let beat_duration = 60.0 / bpm; // Duration of one beat in seconds
         match self {
-            SnapMode::None => 0.0, // No snapping
-            SnapMode::Bar => beat_duration * 4.0, // Full measure
-            SnapMode::Beat => beat_duration,      // Quarter note
-            SnapMode::Halfbeat => beat_duration / 2.0, // Eighth note
-            SnapMode::Quarter => beat_duration / 4.0, // Sixteenth note
-            SnapMode::Eighth => beat_duration / 8.0, // 32nd note
-            SnapMode::Sixteenth => beat_duration / 16.0, // 64th note
-            SnapMode::Triplet => beat_duration / 3.0, // Eighth-note triplet
+            SnapMode::None => 0.0,                             // No snapping
+            SnapMode::Bar => beat_duration * 4.0,              // Full measure
+            SnapMode::Beat => beat_duration,                   // Quarter note
+            SnapMode::Halfbeat => beat_duration / 2.0,         // Eighth note
+            SnapMode::Quarter => beat_duration / 4.0,          // Sixteenth note
+            SnapMode::Eighth => beat_duration / 8.0,           // 32nd note
+            SnapMode::Sixteenth => beat_duration / 16.0,       // 64th note
+            SnapMode::Triplet => beat_duration / 3.0,          // Eighth-note triplet
             SnapMode::SixteenthTriplet => beat_duration / 6.0, // 16th-note triplet
-            SnapMode::ThirtySecond => beat_duration / 32.0, // 128th note
+            SnapMode::ThirtySecond => beat_duration / 32.0,    // 128th note
         }
     }
 
@@ -100,8 +100,8 @@ pub struct Track {
     pub is_soloed: bool,
     pub is_armed: bool,
     pub input_monitoring: bool,
-    pub color: String, // Hex color like "#fde047"
-    pub takes: Vec<Take>, // Recording takes
+    pub color: String,               // Hex color like "#fde047"
+    pub takes: Vec<Take>,            // Recording takes
     pub active_take: Option<String>, // Currently active take ID
 }
 
@@ -142,25 +142,23 @@ pub enum Clip {
 
 impl Clip {
     pub fn load_midi(&mut self) -> Result<(), Box<dyn Error>> {
-        if let Clip::Midi {
+        let Clip::Midi {
             file_path,
             midi_data,
             loaded,
             length,
             ..
-        } = self
-        {
-            if !*loaded {
-                let store = MidiEventStore::load_from_file(file_path)?;
+        } = self;
+        if !*loaded {
+            let store = MidiEventStore::load_from_file(file_path)?;
 
-                // Update clip length based on actual MIDI content
-                if let Some(last_time) = store.get_last_event_time() {
-                    *length = last_time;
-                }
-
-                *midi_data = Some(store);
-                *loaded = true;
+            // Update clip length based on actual MIDI content
+            if let Some(last_time) = store.get_last_event_time() {
+                *length = last_time;
             }
+
+            *midi_data = Some(store);
+            *loaded = true;
         }
         Ok(())
     }
@@ -242,7 +240,7 @@ impl Project {
         }
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+    pub fn save(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
         // Create project directory if it doesn't exist
         fs::create_dir_all(path)?;
 
@@ -254,7 +252,8 @@ impl Project {
 
         println!("After creating folders at: {}", path.display());
 
-        // Copy all referenced files to project directory and update paths
+        // Persist all MIDI assets under a stable clip-based filename. Using the
+        // clip id avoids creating another duplicate asset on every save.
         let mut project = self.clone();
         println!("Saving tracks...");
         for track in &mut project.tracks {
@@ -265,10 +264,25 @@ impl Project {
 
             println!("Saving clips...");
             for clip in &mut track.clips {
-                let Clip::Midi { file_path, .. } = clip;
+                let Clip::Midi {
+                    id,
+                    file_path,
+                    midi_data,
+                    ..
+                } = clip;
                 println!("MIDI clip file path: {:?}", file_path);
-                let new_path = copy_to_project_dir(file_path, &midi_dir)?;
-                *file_path = new_path;
+                let relative_path = PathBuf::from("midi").join(format!("{id}.mid"));
+                let target_path = path.join(&relative_path);
+
+                if let Some(midi_data) = midi_data {
+                    midi_data.save_to_file(&target_path)?;
+                } else if file_path.as_os_str().is_empty() {
+                    MidiEventStore::new(project.ppq).save_to_file(&target_path)?;
+                } else {
+                    copy_midi_asset(file_path, &target_path)?;
+                }
+
+                *file_path = relative_path;
             }
         }
 
@@ -282,6 +296,7 @@ impl Project {
         fs::write(&project_file, json)
             .map_err(|e| format!("Failed to write project file: {}", e))?;
 
+        self.project_path = Some(path.to_path_buf());
         println!("Project saved successfully.");
         Ok(())
     }
@@ -291,7 +306,16 @@ impl Project {
         let content = fs::read_to_string(path)?;
         let mut project: Project = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to deserialize project: {}", e))?;
-        project.project_path = Some(path.parent().unwrap().to_path_buf());
+        let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        for track in &mut project.tracks {
+            for clip in &mut track.clips {
+                let Clip::Midi { file_path, .. } = clip;
+                if file_path.is_relative() {
+                    *file_path = project_dir.join(&*file_path);
+                }
+            }
+        }
+        project.project_path = Some(project_dir.to_path_buf());
         println!("Project loaded successfully.");
         Ok(project)
     }
@@ -307,7 +331,7 @@ impl Project {
             file_path: file_path.to_path_buf(),
             midi_data: None,
             loaded: false,
-            automation_lanes: Vec::new(),
+            automation_lanes: vec![AutomationLane::new(AutomationParameter::Velocity)],
         };
 
         // Load the MIDI data
@@ -352,32 +376,15 @@ impl Project {
     }
 }
 
-// Helper function to copy a file to the project directory and return the relative path
-fn copy_to_project_dir(source_path: &Path, target_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+fn copy_midi_asset(source_path: &Path, target_path: &Path) -> Result<(), Box<dyn Error>> {
     if !source_path.exists() {
         return Err(format!("Source file does not exist: {:?}", source_path).into());
     }
 
-    let file_name = source_path
-        .file_name()
-        .ok_or_else(|| "Invalid source path: Missing file name")?;
+    if source_path.canonicalize().ok() == target_path.canonicalize().ok() && target_path.exists() {
+        return Ok(());
+    }
 
-    // Generate unique filename to avoid conflicts
-    // Example: "myfile_123e4567-e89b-12d3-a456-426614174000.mid"
-    let unique_name = format!(
-        "{}_{}.{}",
-        source_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy(),
-        Uuid::new_v4().to_string(),
-        source_path
-            .extension()
-            .unwrap_or_default()
-            .to_string_lossy()
-    );
-
-    let target_path = target_dir.join(unique_name);
     println!("Copying file from {:?} to {:?}", source_path, target_path);
 
     fs::copy(source_path, &target_path).map_err(|e| {
@@ -387,5 +394,57 @@ fn copy_to_project_dir(source_path: &Path, target_dir: &Path) -> Result<PathBuf,
         )
     })?;
 
-    Ok(target_path)
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saving_empty_clip_creates_stable_midi_asset() -> Result<(), Box<dyn Error>> {
+        let test_dir = std::env::temp_dir().join(format!("hypersaw-project-{}", Uuid::new_v4()));
+        let clip_id = Uuid::new_v4().to_string();
+        let mut project = Project::new("Empty clip".to_string());
+        project.tracks.push(Track {
+            id: Uuid::new_v4().to_string(),
+            name: "Track 1".to_string(),
+            track_type: TrackType::Midi {
+                channel: 1,
+                device_name: None,
+            },
+            clips: vec![Clip::Midi {
+                id: clip_id.clone(),
+                start_time: 0.0,
+                length: 1.0,
+                file_path: PathBuf::new(),
+                midi_data: Some(MidiEventStore::new(project.ppq)),
+                loaded: true,
+                automation_lanes: Vec::new(),
+            }],
+            is_muted: false,
+            is_soloed: false,
+            is_armed: false,
+            input_monitoring: false,
+            color: "#fde047".to_string(),
+            takes: Vec::new(),
+            active_take: None,
+        });
+
+        project.save(&test_dir)?;
+        let asset_path = test_dir.join("midi").join(format!("{clip_id}.mid"));
+        assert!(asset_path.exists());
+        assert!(test_dir.join("Empty clip.supersaw").exists());
+
+        let loaded = Project::load(&test_dir.join("Empty clip.supersaw"))?;
+        let Clip::Midi { file_path, .. } = &loaded.tracks[0].clips[0];
+        assert_eq!(file_path, &asset_path);
+
+        project.save(&test_dir)?;
+        let asset_count = fs::read_dir(test_dir.join("midi"))?.count();
+        assert_eq!(asset_count, 1);
+
+        fs::remove_dir_all(test_dir)?;
+        Ok(())
+    }
 }

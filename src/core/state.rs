@@ -1,6 +1,9 @@
-use crate::core::{EditorView, Project, SnapMode, StatusManager, MidiEngineHandle, RecordingCoordinator, RecordingMode};
-use std::sync::Arc;
+use crate::core::{
+    EditorView, MidiEngineHandle, Project, RecordingCoordinator, RecordingMode, SnapMode,
+    StatusManager,
+};
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 pub struct DawState {
     pub project: Project,
@@ -19,16 +22,17 @@ pub struct DawState {
     pub current_view: EditorView,
     pub status: StatusManager,
     // pub plugin_manager: PluginManager,
-    
+
     // Shared UI state
     pub track_scroll_y: f32,
-    
+
     // MIDI engine
     pub midi_engine: Option<Arc<Mutex<MidiEngineHandle>>>,
-    
+
     // Recording
     pub recording_coordinator: Option<Arc<Mutex<RecordingCoordinator>>>,
-    pub midi_input_sender: Option<crossbeam::channel::Sender<(String, crate::core::MidiMessage, u64)>>,
+    pub midi_input_sender:
+        Option<crossbeam::channel::Sender<(String, crate::core::MidiMessage, u64)>>,
     pub recording_track: Option<String>,
     pub recording_mode: RecordingMode,
     pub punch_in: Option<f64>,
@@ -43,14 +47,14 @@ impl DawState {
         // Start MIDI engine
         let midi_engine = MidiEngineHandle::start(44100); // TODO: Get actual sample rate
         let midi_engine_arc = Arc::new(Mutex::new(midi_engine));
-        
+
         // Create bounded channel for MIDI input from engine to recording (prevent unbounded growth)
         // Buffer up to 2000 MIDI events
         let (midi_input_tx, midi_input_rx) = crossbeam::channel::bounded(2000);
-        
+
         // Create recording coordinator
         let recording_coordinator = RecordingCoordinator::new(44100, midi_input_rx);
-        
+
         Self {
             project: Project::new("Untitled".to_string()),
             snap_mode: SnapMode::Eighth,
@@ -92,23 +96,20 @@ impl DawState {
                 self.last_update = Some(now);
                 return;
             }
-            
+
             // Fallback: update time locally if no engine
             if let Some(last_update) = self.last_update {
                 let delta_time = now.duration_since(last_update).as_secs_f64();
-                let ticks_elapsed = self.project.seconds_to_ticks(delta_time);
 
                 self.current_time += delta_time;
 
-                // Handle looping
-                // TODO: maybe move this to a separate function
-                if self.loop_enabled && self.current_time >= self.loop_end {
-                    let minimum_loop_length = 5.0;
-                    if (self.loop_end - self.loop_start) > minimum_loop_length {
-                        self.current_time = self.loop_start + (self.current_time - self.loop_end);
-                    } else {
-                        self.current_time = self.loop_start;
-                    }
+                let loop_length = self.loop_end - self.loop_start;
+                if self.loop_enabled
+                    && loop_length > f64::EPSILON
+                    && self.current_time >= self.loop_end
+                {
+                    self.current_time = self.loop_start
+                        + (self.current_time - self.loop_start).rem_euclid(loop_length);
                 }
             }
         }

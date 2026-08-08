@@ -1,15 +1,19 @@
 use crate::core::{
-    CommandManager, DawCommand, DawState, EditorView, MessageType, MidiMessage, MidiEngineCommand,
-    Project, SnapMode, StatusMessage, Track, TrackType, RecordingMode,
+    midi_channel_index, CommandManager, DawCommand, DawState, EditorView, MessageType,
+    MidiEngineCommand, MidiMessage, Project, RecordingMode, SnapMode, StatusMessage, Track,
+    TrackType,
 };
 use crate::ui::piano_roll::PianoRoll;
 use crate::ui::Timeline;
 use eframe::egui;
 use eframe::emath::Align;
 use egui::Key;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
+
+const TRANSPORT_ICON_BUTTON_SIZE: egui::Vec2 = egui::Vec2::new(28.0, 28.0);
 
 pub struct SupersawApp {
     state: DawState,
@@ -17,25 +21,259 @@ pub struct SupersawApp {
     midi_output_ports: Vec<(String, usize)>,
     midi_input_ports: Vec<(String, usize)>,
     file_dialog: Option<FileDialog>,
+    pending_project_action: Option<ProjectAction>,
     last_bpm_sent: Option<f64>,
-    last_scheduled_beat: f64, // Watermark to prevent duplicate scheduling
+    scheduled_through_beat: Option<f64>,
+    pending_midi_routes: HashMap<String, Vec<String>>,
+    recording_start_times: HashMap<String, f64>,
 
     // Views
     timeline: Timeline,
     piano_roll: PianoRoll,
 }
 
+#[derive(Clone, Copy)]
 enum FileDialog {
     SaveProject,
     LoadProject,
     ImportMidi,
 }
 
+#[derive(Clone, Copy)]
+enum ProjectAction {
+    New,
+    Load,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectActionDecision {
+    Save,
+    Discard,
+    Cancel,
+}
+
+fn recorded_events_to_midi(
+    events: &[crate::core::RecordedEvent],
+    ppq: u32,
+    bpm: f64,
+    snap_mode: SnapMode,
+    quantize: bool,
+    quantize_strength: f32,
+) -> crate::core::MidiEventStore {
+    let mut midi_data = crate::core::MidiEventStore::new(ppq);
+    let Some(first_beat) = events.first().map(|event| event.timestamp_beats) else {
+        return midi_data;
+    };
+
+    let seconds_per_beat = 60.0 / bpm;
+    let grid_seconds = quantize
+        .then(|| snap_mode.get_division(bpm))
+        .filter(|division| *division > 0.0);
+    let strength = f64::from(quantize_strength.clamp(0.0, 1.0));
+    let mut note_starts: HashMap<(u8, u8), VecDeque<(f64, u8)>> = HashMap::new();
+
+    for recorded_event in events {
+        let relative_seconds =
+            (recorded_event.timestamp_beats - first_beat).max(0.0) * seconds_per_beat;
+
+        match &recorded_event.message {
+            MidiMessage::NoteOn {
+                channel,
+                key,
+                velocity,
+            } if *velocity > 0 => {
+                note_starts
+                    .entry((*channel, *key))
+                    .or_default()
+                    .push_back((relative_seconds, *velocity));
+            }
+            MidiMessage::NoteOff { channel, key, .. }
+            | MidiMessage::NoteOn {
+                channel,
+                key,
+                velocity: 0,
+            } => {
+                let Some(starts) = note_starts.get_mut(&(*channel, *key)) else {
+                    continue;
+                };
+                let Some((raw_start, velocity)) = starts.pop_front() else {
+                    continue;
+                };
+
+                let start_time = grid_seconds.map_or(raw_start, |grid| {
+                    let snapped = (raw_start / grid).round() * grid;
+                    raw_start + (snapped - raw_start) * strength
+                });
+                let duration = (relative_seconds - raw_start).max(1.0 / 1000.0);
+                midi_data.add_note(crate::core::Note {
+                    id: Uuid::new_v4().to_string(),
+                    channel: *channel,
+                    key: *key,
+                    velocity,
+                    start_time,
+                    duration,
+                    start_tick: midi_data.time_to_tick(start_time),
+                    duration_ticks: midi_data.time_to_tick(duration),
+                });
+            }
+            _ => {
+                midi_data.add_event(crate::core::MidiEvent {
+                    id: Uuid::new_v4().to_string(),
+                    time: relative_seconds,
+                    tick: midi_data.time_to_tick(relative_seconds),
+                    message: recorded_event.message.clone(),
+                });
+            }
+        }
+    }
+
+    midi_data
+}
+
 impl SupersawApp {
     fn reset_scheduling_watermark(&mut self) {
-        self.last_scheduled_beat = 0.0;
+        self.scheduled_through_beat = None;
     }
-    
+
+    fn rebuild_playback_schedule(&mut self) {
+        self.reset_scheduling_watermark();
+        if !self.state.playing {
+            return;
+        }
+
+        if let Some(engine) = &self.state.midi_engine {
+            let current_beat = self.state.current_time * self.state.project.bpm / 60.0;
+            engine
+                .lock()
+                .send_command(MidiEngineCommand::SetPosition(current_beat));
+        }
+        self.schedule_midi_events();
+    }
+
+    fn pause_for_modal_dialog(&mut self) {
+        if !self.state.playing {
+            return;
+        }
+
+        self.state.playing = false;
+        self.state.last_update = None;
+        if let Some(engine) = &self.state.midi_engine {
+            engine.lock().send_command(MidiEngineCommand::Stop);
+        }
+        self.reset_scheduling_watermark();
+        self.state
+            .status
+            .info("Playback paused while the file picker is open");
+    }
+
+    fn save_project(&mut self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let path = std::env::current_dir()?
+            .join("projects")
+            .join(self.state.project.name.clone());
+        self.state.project.save(&path)?;
+        self.command_manager.mark_project_saved();
+        Ok(path)
+    }
+
+    fn continue_project_action(&mut self, action: ProjectAction) {
+        match action {
+            ProjectAction::New => {
+                self.install_project(Project::new("Untitled".to_string()));
+                self.state.status.success("Created new project");
+            }
+            ProjectAction::Load => {
+                self.file_dialog = Some(FileDialog::LoadProject);
+            }
+        }
+    }
+
+    fn request_project_action(&mut self, action: ProjectAction) {
+        if self.command_manager.is_project_dirty() {
+            self.pending_project_action = Some(action);
+        } else {
+            self.continue_project_action(action);
+        }
+    }
+
+    fn install_project(&mut self, mut project: Project) {
+        let old_track_ids: Vec<_> = self
+            .state
+            .project
+            .tracks
+            .iter()
+            .map(|track| track.id.clone())
+            .collect();
+
+        if let Some(recording_track) = self.state.recording_track.take() {
+            if let Some(coordinator) = &self.state.recording_coordinator {
+                coordinator.lock().stop_recording(&recording_track, false);
+            }
+        }
+
+        if let Some(engine) = &self.state.midi_engine {
+            let engine = engine.lock();
+            engine.send_command(MidiEngineCommand::Stop);
+            for track_id in &old_track_ids {
+                engine.send_command(MidiEngineCommand::ClearPortRouting(track_id.clone()));
+            }
+            engine.send_command(MidiEngineCommand::SetPosition(0.0));
+            engine.send_command(MidiEngineCommand::SetTempo(project.bpm));
+            engine.send_command(MidiEngineCommand::SetMetronomeEnabled(false));
+        }
+
+        if let Some(coordinator) = &self.state.recording_coordinator {
+            for track_id in &old_track_ids {
+                coordinator
+                    .lock()
+                    .send_command(crate::core::RecordingCommand::DisarmTrack {
+                        track_id: track_id.clone(),
+                    });
+            }
+            coordinator
+                .lock()
+                .send_command(crate::core::RecordingCommand::SetTempo(project.bpm));
+        }
+
+        // Arming and monitoring are runtime state. Do not display persisted
+        // values that are no longer active in the coordinator.
+        for track in &mut project.tracks {
+            track.is_armed = false;
+            track.input_monitoring = false;
+        }
+
+        self.state.project = project;
+        self.state.playing = false;
+        self.state.recording = false;
+        self.state.current_time = 0.0;
+        self.state.last_update = None;
+        self.state.selected_track = None;
+        self.state.selected_clip = None;
+        self.state.current_view = EditorView::Arrangement;
+        self.state.loop_enabled = false;
+        self.state.loop_start = 0.0;
+        self.state.loop_end = 4.0;
+        self.state.metronome = false;
+        self.state.track_scroll_y = 0.0;
+        self.state.count_in_active = false;
+        self.state.count_in_start_time = None;
+
+        self.command_manager.clear();
+        self.pending_midi_routes.clear();
+        self.recording_start_times.clear();
+        self.last_bpm_sent = Some(self.state.project.bpm);
+        self.reset_scheduling_watermark();
+
+        let mut timeline = Timeline::default();
+        timeline.update_midi_ports(
+            self.midi_output_ports
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+        );
+        self.timeline = timeline;
+        self.piano_roll = PianoRoll::default();
+    }
+
     fn handle_key_action(&mut self, action: KeyAction) {
         match action {
             KeyAction::TogglePlay => {
@@ -54,23 +292,29 @@ impl SupersawApp {
                 }
                 // Reset watermark on playback state change
                 self.reset_scheduling_watermark();
-            }
-            KeyAction::LoadProject => {
-                self.file_dialog = Some(FileDialog::LoadProject);
+                if self.state.playing {
+                    self.schedule_midi_events();
+                }
             }
             KeyAction::SaveProject => {
                 self.file_dialog = Some(FileDialog::SaveProject);
             }
             KeyAction::Undo => {
+                let had_undo = self.command_manager.can_undo();
                 if let Err(e) = self.command_manager.undo(&mut self.state) {
                     eprintln!("Undo failed: {}", e);
                     self.state.status.error(format!("Undo failed: {}", e));
+                } else if had_undo {
+                    self.rebuild_playback_schedule();
                 }
             }
             KeyAction::Redo => {
+                let had_redo = self.command_manager.can_redo();
                 if let Err(e) = self.command_manager.redo(&mut self.state) {
                     eprintln!("Redo failed: {}", e);
                     self.state.status.error(format!("Redo failed: {}", e));
+                } else if had_redo {
+                    self.rebuild_playback_schedule();
                 }
             }
         }
@@ -78,14 +322,21 @@ impl SupersawApp {
     fn scan_midi_output_ports() -> Vec<(String, usize)> {
         crate::core::MidiEngineHandle::scan_midi_output_ports()
     }
-    
+
     fn scan_midi_input_ports() -> Vec<(String, usize)> {
         crate::core::MidiEngineHandle::scan_midi_input_ports()
     }
 
-    fn connect_midi_output_port(&mut self, port_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn connect_midi_output_port(
+        &mut self,
+        port_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Find the port index
-        if let Some((_, port_index)) = self.midi_output_ports.iter().find(|(name, _)| name == port_name) {
+        if let Some((_, port_index)) = self
+            .midi_output_ports
+            .iter()
+            .find(|(name, _)| name == port_name)
+        {
             if let Some(engine) = &self.state.midi_engine {
                 engine.lock().send_command(MidiEngineCommand::AddOutputPort(
                     port_name.to_string(),
@@ -94,25 +345,32 @@ impl SupersawApp {
                 return Ok(());
             }
         }
-        
+
         Err("MIDI port not found".into())
     }
-
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Set up MIDI ports
         let midi_output_ports = Self::scan_midi_output_ports();
         let midi_input_ports = Self::scan_midi_input_ports();
         let mut timeline = Timeline::default();
-        timeline.update_midi_ports(midi_output_ports.iter().map(|(name, _)| name.clone()).collect());
-        
+        timeline.update_midi_ports(
+            midi_output_ports
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+        );
+
         let mut app = Self {
             state: DawState::new(),
             midi_output_ports,
             midi_input_ports,
             file_dialog: None,
+            pending_project_action: None,
             last_bpm_sent: None,
-            last_scheduled_beat: 0.0,
+            scheduled_through_beat: None,
+            pending_midi_routes: HashMap::new(),
+            recording_start_times: HashMap::new(),
             timeline,
             piano_roll: PianoRoll::default(),
             command_manager: CommandManager::default(),
@@ -145,80 +403,105 @@ impl SupersawApp {
 
         app
     }
-    
+
     fn schedule_midi_events(&mut self) {
         // Get all clips and schedule their events
         let current_beats = (self.state.current_time / 60.0) * self.state.project.bpm;
-        let lookahead_beats = 0.1; // Schedule 100ms ahead
-        
-        // Only schedule events beyond the watermark to prevent duplicates
-        if current_beats <= self.last_scheduled_beat {
+        // Keep a time-based horizon so high tempos do not reduce the amount of
+        // real time already queued in the engine.
+        let lookahead_beats = (self.state.project.bpm / 60.0) * 4.0;
+
+        let schedule_from = self
+            .scheduled_through_beat
+            .map_or(current_beats, |watermark| watermark.max(current_beats));
+        let schedule_to = current_beats + lookahead_beats;
+
+        if schedule_from >= schedule_to {
             return;
         }
-        
-        let schedule_from = self.last_scheduled_beat.max(current_beats);
-        let schedule_to = current_beats + lookahead_beats;
-        
+
         for track in &self.state.project.tracks {
             if track.is_muted {
                 continue;
             }
-            
+
             // Check solo status
             let any_soloed = self.state.project.tracks.iter().any(|t| t.is_soloed);
             if any_soloed && !track.is_soloed {
                 continue;
             }
-            
-            if let TrackType::Midi { channel, device_name } = &track.track_type {
-                let port_id = device_name.clone().unwrap_or_default();
-                
-                for clip in &track.clips {
-                    match clip {
-                        crate::core::Clip::Midi { start_time, length, midi_data, .. } => {
-                            // Check if clip is in range
-                            let clip_start_beats = (*start_time / 60.0) * self.state.project.bpm;
-                            let clip_length_beats = (*length / 60.0) * self.state.project.bpm;
-                            let clip_end_beats = clip_start_beats + clip_length_beats;
-                            
-                            if schedule_to >= clip_start_beats && schedule_from <= clip_end_beats {
-                                if let Some(events) = midi_data {
-                                    // Get events in the scheduling window (only new events)
-                                    let relative_start = (schedule_from - clip_start_beats).max(0.0);
-                                    let relative_end = (schedule_to - clip_start_beats).min(clip_length_beats);
-                                    
-                                    let start_time_seconds = relative_start * 60.0 / self.state.project.bpm;
-                                    let end_time_seconds = relative_end * 60.0 / self.state.project.bpm;
-                                    
-                                    let events_in_range = events.get_events_in_range(start_time_seconds, end_time_seconds);
-                                    
-                                    // Schedule each event with the MIDI engine
-                                    if let Some(engine) = &self.state.midi_engine {
-                                        for event in events_in_range {
-                                            let absolute_time_beats = clip_start_beats + (event.time * self.state.project.bpm / 60.0);
-                                            
-                                            // Only schedule if beyond watermark
-                                            if absolute_time_beats > self.last_scheduled_beat {
-                                                engine.lock().send_command(MidiEngineCommand::ScheduleEvent {
-                                                    time_in_beats: absolute_time_beats,
-                                                    port_id: port_id.clone(),
-                                                    message: event.message.clone(),
-                                                    track_id: track.id.clone(),
-                                                });
-                                            }
-                                        }
-                                    }
+
+            let TrackType::Midi {
+                channel,
+                device_name,
+            } = &track.track_type;
+            let port_id = device_name.clone().unwrap_or_default();
+
+            for clip in &track.clips {
+                let crate::core::Clip::Midi {
+                    id: clip_id,
+                    start_time,
+                    length,
+                    midi_data,
+                    ..
+                } = clip;
+                if let Some(take) = track.takes.iter().find(|take| take.clip_id == *clip_id) {
+                    let is_active = track.active_take.as_ref() == Some(&take.id);
+                    if !is_active || take.is_muted {
+                        continue;
+                    }
+                }
+                // Check if clip is in range
+                let clip_start_beats = (*start_time / 60.0) * self.state.project.bpm;
+                let clip_length_beats = (*length / 60.0) * self.state.project.bpm;
+                let clip_end_beats = clip_start_beats + clip_length_beats;
+
+                if schedule_to >= clip_start_beats && schedule_from <= clip_end_beats {
+                    if let Some(events) = midi_data {
+                        // Get events in the scheduling window (only new events)
+                        let relative_start = (schedule_from - clip_start_beats).max(0.0);
+                        let relative_end = (schedule_to - clip_start_beats).min(clip_length_beats);
+
+                        let start_time_seconds = relative_start * 60.0 / self.state.project.bpm;
+                        let mut end_time_seconds = relative_end * 60.0 / self.state.project.bpm;
+                        if schedule_to >= clip_end_beats {
+                            // MidiEventStore uses a half-open range. Extend the final
+                            // window so a note-off exactly at the clip end is included.
+                            end_time_seconds += 1.0e-9;
+                        }
+
+                        let events_in_range =
+                            events.get_events_in_range(start_time_seconds, end_time_seconds);
+
+                        // Schedule each event with the MIDI engine
+                        if let Some(engine) = &self.state.midi_engine {
+                            for event in events_in_range {
+                                let absolute_time_beats =
+                                    clip_start_beats + (event.time * self.state.project.bpm / 60.0);
+
+                                if absolute_time_beats >= schedule_from {
+                                    let message = event
+                                        .message
+                                        .clone()
+                                        .with_channel(midi_channel_index(*channel));
+                                    engine
+                                        .lock()
+                                        .send_command(MidiEngineCommand::ScheduleEvent {
+                                            time_in_beats: absolute_time_beats,
+                                            port_id: port_id.clone(),
+                                            message,
+                                            track_id: track.id.clone(),
+                                        });
                                 }
                             }
                         }
-                        _ => {}
                     }
                 }
             }
         }
-        
+
         // Update watermark
-        self.last_scheduled_beat = schedule_to;
+        self.scheduled_through_beat = Some(schedule_to);
     }
 
     fn draw_transport(&mut self, ui: &mut egui::Ui) {
@@ -227,81 +510,104 @@ impl SupersawApp {
 
             // ===== ESSENTIAL CONTROLS =====
 
-            // Play/Stop button
+            // Play/Pause button
             if ui
-                .button(if self.state.playing { "⏹" } else { "▶" })
+                .add_sized(
+                    TRANSPORT_ICON_BUTTON_SIZE,
+                    egui::Button::new(if self.state.playing { "⏸" } else { "▶" }),
+                )
+                .on_hover_text(if self.state.playing { "Pause" } else { "Play" })
                 .clicked()
             {
-                self.state.playing = !self.state.playing;
-                if self.state.playing {
-                    self.state.last_update = Some(std::time::Instant::now());
-                    if let Some(engine) = &self.state.midi_engine {
-                        engine.lock().send_command(MidiEngineCommand::Start);
-                    }
-                } else {
-                    if let Some(engine) = &self.state.midi_engine {
-                        engine.lock().send_command(MidiEngineCommand::Stop);
-                    }
-                }
+                self.handle_key_action(KeyAction::TogglePlay);
             }
 
             // Return to start
-            if ui.button("⏮").clicked() {
-                self.state.current_time = 0.0;
-                if let Some(engine) = &self.state.midi_engine {
-                    engine.lock().send_command(MidiEngineCommand::SetPosition(0.0));
+            if ui
+                .add_sized(TRANSPORT_ICON_BUTTON_SIZE, egui::Button::new("⏮"))
+                .on_hover_text("Return to start")
+                .clicked()
+            {
+                if let Err(error) = self
+                    .command_manager
+                    .execute(DawCommand::SeekTime { time: 0.0 }, &mut self.state)
+                {
+                    self.state.status.error(format!("Failed to seek: {error}"));
                 }
+                self.reset_scheduling_watermark();
             }
 
             // Recording button with color state
             let rec_button = if self.state.count_in_active {
-                ui.add(egui::Button::new("⏺").fill(egui::Color32::YELLOW))
+                ui.add_sized(
+                    TRANSPORT_ICON_BUTTON_SIZE,
+                    egui::Button::new("⏺").fill(egui::Color32::YELLOW),
+                )
             } else if self.state.recording_track.is_some() {
-                ui.add(egui::Button::new("⏺").fill(egui::Color32::RED))
+                ui.add_sized(
+                    TRANSPORT_ICON_BUTTON_SIZE,
+                    egui::Button::new("⏺").fill(egui::Color32::RED),
+                )
             } else {
-                ui.button("⏺")
+                ui.add_sized(TRANSPORT_ICON_BUTTON_SIZE, egui::Button::new("⏺"))
             };
 
-            if rec_button.clicked() {
-                if let Some(track_id) = &self.state.selected_track {
-                    if self.state.recording_track.is_some() {
-                        if let Err(e) = self.command_manager.execute(
-                            DawCommand::StopMidiRecording {
-                                track_id: track_id.clone(),
-                                create_take: true,
-                            },
-                            &mut self.state,
-                        ) {
-                            self.state.status.error(format!("Failed to stop recording: {}", e));
-                        }
-                    } else {
-                        if let Err(e) = self.command_manager.execute(
-                            DawCommand::StartMidiRecording {
-                                track_id: track_id.clone(),
-                                mode: self.state.recording_mode,
-                            },
-                            &mut self.state,
-                        ) {
-                            self.state.status.error(format!("Failed to start recording: {}", e));
-                        }
+            if rec_button.on_hover_text("Record MIDI").clicked() {
+                if let Some(track_id) = self.state.recording_track.clone() {
+                    if let Err(e) = self.command_manager.execute(
+                        DawCommand::StopMidiRecording {
+                            track_id,
+                            create_take: true,
+                        },
+                        &mut self.state,
+                    ) {
+                        self.state
+                            .status
+                            .error(format!("Failed to stop recording: {}", e));
+                    }
+                } else if let Some(track_id) = self.state.selected_track.clone() {
+                    if let Err(e) = self.command_manager.execute(
+                        DawCommand::StartMidiRecording {
+                            track_id: track_id.clone(),
+                            mode: self.state.recording_mode,
+                        },
+                        &mut self.state,
+                    ) {
+                        self.state
+                            .status
+                            .error(format!("Failed to start recording: {}", e));
+                    } else if !self.state.count_in_active {
+                        self.recording_start_times
+                            .insert(track_id, self.state.current_time);
                     }
                 } else {
-                    self.state.status.warning("Select a track to record on".to_string());
+                    self.state
+                        .status
+                        .warning("Select a track to record on".to_string());
                 }
             }
 
             // Metronome toggle with visual state
             let metro_btn = if self.state.metronome {
-                ui.add(egui::Button::new("M").fill(egui::Color32::from_rgb(80, 120, 200)))
+                ui.add_sized(
+                    TRANSPORT_ICON_BUTTON_SIZE,
+                    egui::Button::new("M").fill(egui::Color32::from_rgb(80, 120, 200)),
+                )
             } else {
-                ui.button("M")
+                ui.add_sized(TRANSPORT_ICON_BUTTON_SIZE, egui::Button::new("M"))
             };
-            if metro_btn.clicked() {
+            if metro_btn.on_hover_text("Toggle metronome").clicked() {
                 if let Err(e) = self.command_manager.execute(
-                    if self.state.metronome { DawCommand::DisableMetronome } else { DawCommand::EnableMetronome },
+                    if self.state.metronome {
+                        DawCommand::DisableMetronome
+                    } else {
+                        DawCommand::EnableMetronome
+                    },
                     &mut self.state,
                 ) {
-                    self.state.status.error(format!("Failed to toggle metronome: {}", e));
+                    self.state
+                        .status
+                        .error(format!("Failed to toggle metronome: {}", e));
                 }
             }
 
@@ -310,12 +616,15 @@ impl SupersawApp {
             // BPM display and controls
             ui.label(format!("{:.0}", self.state.project.bpm));
             for (label, delta) in [("−", -1.0), ("+", 1.0)] {
-                if ui.small_button(label).clicked() {
+                if ui
+                    .add_sized(TRANSPORT_ICON_BUTTON_SIZE, egui::Button::new(label).small())
+                    .clicked()
+                {
                     let new_bpm = (self.state.project.bpm + delta).clamp(20.0, 400.0);
-                    if let Err(e) = self.command_manager.execute(
-                        DawCommand::SetBpm { bpm: new_bpm },
-                        &mut self.state,
-                    ) {
+                    if let Err(e) = self
+                        .command_manager
+                        .execute(DawCommand::SetBpm { bpm: new_bpm }, &mut self.state)
+                    {
                         self.state.status.error(format!("Failed to set BPM: {}", e));
                     }
                 }
@@ -334,9 +643,12 @@ impl SupersawApp {
             // Count-in status (only when active)
             if self.state.count_in_active {
                 if let Some(start_time) = self.state.count_in_start_time {
-                    let count_in_duration = (self.state.count_in_bars as f64 * 4.0 * 60.0) / self.state.project.bpm;
+                    let count_in_duration =
+                        (self.state.count_in_bars as f64 * 4.0 * 60.0) / self.state.project.bpm;
                     let elapsed = self.state.current_time - start_time;
-                    let remaining_beats = ((count_in_duration - elapsed) * self.state.project.bpm / 60.0).ceil() as u32;
+                    let remaining_beats = ((count_in_duration - elapsed) * self.state.project.bpm
+                        / 60.0)
+                        .ceil() as u32;
                     ui.colored_label(egui::Color32::YELLOW, format!("⏱ {}", remaining_beats));
                 }
             }
@@ -345,170 +657,265 @@ impl SupersawApp {
 
             // Loop toggle
             let loop_btn = if self.state.loop_enabled {
-                ui.add(egui::Button::new("⟲").fill(egui::Color32::from_rgb(80, 160, 80)))
+                ui.add_sized(
+                    TRANSPORT_ICON_BUTTON_SIZE,
+                    egui::Button::new("⟲").fill(egui::Color32::from_rgb(80, 160, 80)),
+                )
             } else {
-                ui.button("⟲")
+                ui.add_sized(TRANSPORT_ICON_BUTTON_SIZE, egui::Button::new("⟲"))
             };
-            if loop_btn.clicked() {
+            if loop_btn.on_hover_text("Toggle loop playback").clicked() {
                 self.state.loop_enabled = !self.state.loop_enabled;
             }
 
             ui.separator();
 
             // ===== SETTINGS DROPDOWN =====
-            ui.menu_button("⚙", |ui| {
-                ui.set_min_width(220.0);
+            egui::menu::menu_custom_button(
+                ui,
+                egui::Button::new("⚙").min_size(TRANSPORT_ICON_BUTTON_SIZE),
+                |ui| {
+                    ui.set_min_width(220.0);
 
-                // Snap Mode
-                ui.horizontal(|ui| {
-                    ui.label("Snap:");
-                    egui::ComboBox::from_id_salt("snap_settings")
-                        .selected_text(self.state.snap_mode.display_name())
-                        .show_ui(ui, |ui| {
-                            for snap_mode in [
-                                SnapMode::None, SnapMode::Bar, SnapMode::Beat,
-                                SnapMode::Halfbeat, SnapMode::Quarter, SnapMode::Eighth, SnapMode::Triplet,
-                            ] {
-                                if ui.selectable_value(&mut self.state.snap_mode, snap_mode, snap_mode.display_name()).clicked() {
-                                    let _ = self.command_manager.execute(DawCommand::SetSnapMode { snap_mode }, &mut self.state);
+                    // Snap Mode
+                    ui.horizontal(|ui| {
+                        ui.label("Snap:");
+                        egui::ComboBox::from_id_salt("snap_settings")
+                            .selected_text(self.state.snap_mode.display_name())
+                            .show_ui(ui, |ui| {
+                                for snap_mode in [
+                                    SnapMode::None,
+                                    SnapMode::Bar,
+                                    SnapMode::Beat,
+                                    SnapMode::Halfbeat,
+                                    SnapMode::Quarter,
+                                    SnapMode::Eighth,
+                                    SnapMode::Sixteenth,
+                                    SnapMode::Triplet,
+                                    SnapMode::SixteenthTriplet,
+                                    SnapMode::ThirtySecond,
+                                ] {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.state.snap_mode,
+                                            snap_mode,
+                                            snap_mode.display_name(),
+                                        )
+                                        .clicked()
+                                    {
+                                        let _ = self.command_manager.execute(
+                                            DawCommand::SetSnapMode { snap_mode },
+                                            &mut self.state,
+                                        );
+                                    }
                                 }
-                            }
-                        });
-                });
+                            });
+                    });
 
-                // Recording Mode
-                ui.horizontal(|ui| {
-                    ui.label("Record:");
-                    egui::ComboBox::from_id_salt("rec_mode_settings")
-                        .selected_text(format!("{:?}", self.state.recording_mode))
-                        .show_ui(ui, |ui| {
-                            use crate::core::RecordingMode;
-                            if ui.selectable_label(matches!(self.state.recording_mode, RecordingMode::Overdub), "Overdub").clicked() {
-                                self.state.recording_mode = RecordingMode::Overdub;
-                            }
-                            if ui.selectable_label(matches!(self.state.recording_mode, RecordingMode::Replace), "Replace").clicked() {
-                                self.state.recording_mode = RecordingMode::Replace;
-                            }
-                            if ui.selectable_label(matches!(self.state.recording_mode, RecordingMode::PunchInOut), "Punch In/Out").clicked() {
-                                self.state.recording_mode = RecordingMode::PunchInOut;
-                            }
-                        });
-                });
-
-                // Count-in
-                ui.horizontal(|ui| {
-                    ui.label("Count-in:");
-                    egui::ComboBox::from_id_salt("countin_settings")
-                        .selected_text(if self.state.count_in_bars == 0 { "Off".to_string() } else { format!("{} bars", self.state.count_in_bars) })
-                        .show_ui(ui, |ui| {
-                            for bars in [0u32, 1, 2, 4] {
-                                let label = if bars == 0 { "Off".to_string() } else { format!("{} bars", bars) };
-                                if ui.selectable_label(self.state.count_in_bars == bars, label).clicked() {
-                                    let _ = self.command_manager.execute(DawCommand::SetCountInBars { bars }, &mut self.state);
+                    // Recording Mode
+                    ui.horizontal(|ui| {
+                        ui.label("Record:");
+                        egui::ComboBox::from_id_salt("rec_mode_settings")
+                            .selected_text(format!("{:?}", self.state.recording_mode))
+                            .show_ui(ui, |ui| {
+                                use crate::core::RecordingMode;
+                                if ui
+                                    .selectable_label(
+                                        matches!(self.state.recording_mode, RecordingMode::Overdub),
+                                        "Overdub",
+                                    )
+                                    .clicked()
+                                {
+                                    self.state.recording_mode = RecordingMode::Overdub;
                                 }
-                            }
-                        });
-                });
-
-                // Quantize on record
-                let mut quantize_on_record = self.state.recording_coordinator.as_ref()
-                    .map(|rc| rc.lock().get_config().quantize_on_record)
-                    .unwrap_or(false);
-                if ui.checkbox(&mut quantize_on_record, "Quantize on record").changed() {
-                    if let Some(rc) = &self.state.recording_coordinator {
-                        let mut config = rc.lock().get_config();
-                        config.quantize_on_record = quantize_on_record;
-                        rc.lock().update_config(config);
-                    }
-                }
-
-                ui.separator();
-
-                // Loop Range
-                ui.menu_button(format!("Loop: {:.1}s - {:.1}s", self.state.loop_start, self.state.loop_end), |ui| {
-                    if ui.button("Set Start to Playhead").clicked() {
-                        self.state.loop_start = self.state.current_time;
-                        ui.close_menu();
-                    }
-                    if ui.button("Set End to Playhead").clicked() {
-                        self.state.loop_end = self.state.current_time;
-                        ui.close_menu();
-                    }
-                });
-
-                // Punch In/Out
-                let punch_label = match (self.state.punch_in, self.state.punch_out) {
-                    (Some(i), Some(o)) => format!("Punch: {:.1}s - {:.1}s", i, o),
-                    (Some(i), None) => format!("Punch In: {:.1}s", i),
-                    (None, Some(o)) => format!("Punch Out: {:.1}s", o),
-                    _ => "Punch: Off".to_string(),
-                };
-                ui.menu_button(punch_label, |ui| {
-                    if ui.button("Set Punch In").clicked() {
-                        let _ = self.command_manager.execute(
-                            DawCommand::SetPunchPoints { punch_in: Some(self.state.current_time), punch_out: self.state.punch_out },
-                            &mut self.state,
-                        );
-                        ui.close_menu();
-                    }
-                    if ui.button("Set Punch Out").clicked() {
-                        let _ = self.command_manager.execute(
-                            DawCommand::SetPunchPoints { punch_in: self.state.punch_in, punch_out: Some(self.state.current_time) },
-                            &mut self.state,
-                        );
-                        ui.close_menu();
-                    }
-                    if ui.button("Clear").clicked() {
-                        let _ = self.command_manager.execute(
-                            DawCommand::SetPunchPoints { punch_in: None, punch_out: None },
-                            &mut self.state,
-                        );
-                        ui.close_menu();
-                    }
-                });
-
-                ui.separator();
-
-                // MIDI Ports
-                ui.menu_button("MIDI Ports", |ui| {
-                    if ui.button("Refresh Ports").clicked() {
-                        self.midi_output_ports = Self::scan_midi_output_ports();
-                        self.midi_input_ports = Self::scan_midi_input_ports();
-                        self.timeline.update_midi_ports(self.midi_output_ports.iter().map(|(name, _)| name.clone()).collect());
-                        self.state.status.success("MIDI ports refreshed".to_string());
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if self.midi_input_ports.is_empty() {
-                        ui.label("No input ports");
-                    } else {
-                        for (port_name, port_index) in &self.midi_input_ports {
-                            if ui.button(format!("+ {}", port_name)).clicked() {
-                                if let Some(engine) = &self.state.midi_engine {
-                                    engine.lock().send_command(MidiEngineCommand::AddInputPort(port_name.clone(), *port_index));
-                                    self.state.status.success(format!("Enabled: {}", port_name));
+                                if ui
+                                    .selectable_label(
+                                        matches!(self.state.recording_mode, RecordingMode::Replace),
+                                        "Replace",
+                                    )
+                                    .clicked()
+                                {
+                                    self.state.recording_mode = RecordingMode::Replace;
                                 }
-                                ui.close_menu();
-                            }
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            self.state.recording_mode,
+                                            RecordingMode::PunchInOut
+                                        ),
+                                        "Punch In/Out",
+                                    )
+                                    .clicked()
+                                {
+                                    self.state.recording_mode = RecordingMode::PunchInOut;
+                                }
+                            });
+                    });
+
+                    // Count-in
+                    ui.horizontal(|ui| {
+                        ui.label("Count-in:");
+                        egui::ComboBox::from_id_salt("countin_settings")
+                            .selected_text(if self.state.count_in_bars == 0 {
+                                "Off".to_string()
+                            } else {
+                                format!("{} bars", self.state.count_in_bars)
+                            })
+                            .show_ui(ui, |ui| {
+                                for bars in [0u32, 1, 2, 4] {
+                                    let label = if bars == 0 {
+                                        "Off".to_string()
+                                    } else {
+                                        format!("{} bars", bars)
+                                    };
+                                    if ui
+                                        .selectable_label(self.state.count_in_bars == bars, label)
+                                        .clicked()
+                                    {
+                                        let _ = self.command_manager.execute(
+                                            DawCommand::SetCountInBars { bars },
+                                            &mut self.state,
+                                        );
+                                    }
+                                }
+                            });
+                    });
+
+                    // Quantize on record
+                    let mut quantize_on_record = self
+                        .state
+                        .recording_coordinator
+                        .as_ref()
+                        .map(|rc| rc.lock().get_config().quantize_on_record)
+                        .unwrap_or(false);
+                    if ui
+                        .checkbox(&mut quantize_on_record, "Quantize on record")
+                        .changed()
+                    {
+                        if let Some(rc) = &self.state.recording_coordinator {
+                            let mut config = rc.lock().get_config();
+                            config.quantize_on_record = quantize_on_record;
+                            rc.lock().update_config(config);
                         }
                     }
-                });
-            });
+
+                    ui.separator();
+
+                    // Loop Range
+                    ui.menu_button(
+                        format!(
+                            "Loop: {:.1}s - {:.1}s",
+                            self.state.loop_start, self.state.loop_end
+                        ),
+                        |ui| {
+                            if ui.button("Set Start to Playhead").clicked() {
+                                self.state.loop_start = self.state.current_time;
+                                ui.close_menu();
+                            }
+                            if ui.button("Set End to Playhead").clicked() {
+                                self.state.loop_end = self.state.current_time;
+                                ui.close_menu();
+                            }
+                        },
+                    );
+
+                    // Punch In/Out
+                    let punch_label = match (self.state.punch_in, self.state.punch_out) {
+                        (Some(i), Some(o)) => format!("Punch: {:.1}s - {:.1}s", i, o),
+                        (Some(i), None) => format!("Punch In: {:.1}s", i),
+                        (None, Some(o)) => format!("Punch Out: {:.1}s", o),
+                        _ => "Punch: Off".to_string(),
+                    };
+                    ui.menu_button(punch_label, |ui| {
+                        if ui.button("Set Punch In").clicked() {
+                            let _ = self.command_manager.execute(
+                                DawCommand::SetPunchPoints {
+                                    punch_in: Some(self.state.current_time),
+                                    punch_out: self.state.punch_out,
+                                },
+                                &mut self.state,
+                            );
+                            ui.close_menu();
+                        }
+                        if ui.button("Set Punch Out").clicked() {
+                            let _ = self.command_manager.execute(
+                                DawCommand::SetPunchPoints {
+                                    punch_in: self.state.punch_in,
+                                    punch_out: Some(self.state.current_time),
+                                },
+                                &mut self.state,
+                            );
+                            ui.close_menu();
+                        }
+                        if ui.button("Clear").clicked() {
+                            let _ = self.command_manager.execute(
+                                DawCommand::SetPunchPoints {
+                                    punch_in: None,
+                                    punch_out: None,
+                                },
+                                &mut self.state,
+                            );
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // MIDI Ports
+                    ui.menu_button("MIDI Ports", |ui| {
+                        if ui.button("Refresh Ports").clicked() {
+                            self.midi_output_ports = Self::scan_midi_output_ports();
+                            self.midi_input_ports = Self::scan_midi_input_ports();
+                            self.timeline.update_midi_ports(
+                                self.midi_output_ports
+                                    .iter()
+                                    .map(|(name, _)| name.clone())
+                                    .collect(),
+                            );
+                            self.state
+                                .status
+                                .success("MIDI ports refreshed".to_string());
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if self.midi_input_ports.is_empty() {
+                            ui.label("No input ports");
+                        } else {
+                            for (port_name, port_index) in &self.midi_input_ports {
+                                if ui.button(format!("+ {}", port_name)).clicked() {
+                                    if let Some(engine) = &self.state.midi_engine {
+                                        engine.lock().send_command(
+                                            MidiEngineCommand::AddInputPort(
+                                                port_name.clone(),
+                                                *port_index,
+                                            ),
+                                        );
+                                        self.state
+                                            .status
+                                            .success(format!("Enabled: {}", port_name));
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                    });
+                },
+            );
         });
     }
 
-
     fn import_midi_file(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.pause_for_modal_dialog();
         if let Some(file_path) = rfd::FileDialog::new()
             .set_title("Select MIDI File")
             .add_filter("MIDI Files", &["mid", "midi"])
-            .set_directory(std::env::current_dir().unwrap())
             .pick_file()
         {
             let track_id = self
                 .state
                 .project
                 .create_midi_track_from_file_path(&file_path)?;
+            self.command_manager.mark_project_dirty();
 
             // Select the newly created track
             self.state.selected_track = Some(track_id);
@@ -525,7 +932,6 @@ impl SupersawApp {
 
 enum KeyAction {
     TogglePlay,
-    LoadProject,
     SaveProject,
     Undo,
     Redo,
@@ -534,45 +940,64 @@ enum KeyAction {
 impl eframe::App for SupersawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.state.update_playhead();
-        
+
         // Check count-in completion
         if self.state.count_in_active {
             if let Some(start_time) = self.state.count_in_start_time {
-                let count_in_duration = (self.state.count_in_bars as f64 * 4.0 * 60.0) / self.state.project.bpm;
+                let count_in_duration =
+                    (self.state.count_in_bars as f64 * 4.0 * 60.0) / self.state.project.bpm;
                 let elapsed = self.state.current_time - start_time;
-                
+
                 if elapsed >= count_in_duration {
                     // Count-in complete, start actual recording
                     self.state.count_in_active = false;
                     self.state.count_in_start_time = None;
-                    
+
                     // Check if metronome should continue during recording
-                    let should_disable_metronome = if let Some(rc) = &self.state.recording_coordinator {
-                        let config = rc.lock().get_config();
-                        !config.metronome_during_record && !self.state.metronome
-                    } else {
-                        !self.state.metronome
-                    };
-                    
+                    let should_disable_metronome =
+                        if let Some(rc) = &self.state.recording_coordinator {
+                            let config = rc.lock().get_config();
+                            !config.metronome_during_record && !self.state.metronome
+                        } else {
+                            !self.state.metronome
+                        };
+
                     // Disable metronome if it was only for count-in
                     if should_disable_metronome {
                         if let Some(engine) = &self.state.midi_engine {
-                            engine.lock().send_command(crate::core::MidiEngineCommand::SetMetronomeEnabled(false));
+                            engine.lock().send_command(
+                                crate::core::MidiEngineCommand::SetMetronomeEnabled(false),
+                            );
                         }
                     }
-                    
+
                     // Start actual recording
                     if let Some(track_id) = &self.state.recording_track.clone() {
+                        self.recording_start_times
+                            .insert(track_id.clone(), self.state.current_time);
                         if let Some(recording_coordinator) = &self.state.recording_coordinator {
+                            let (punch_in, punch_out) =
+                                if self.state.recording_mode == RecordingMode::PunchInOut {
+                                    (
+                                        self.state
+                                            .punch_in
+                                            .map(|time| (time - self.state.current_time).max(0.0)),
+                                        self.state
+                                            .punch_out
+                                            .map(|time| (time - self.state.current_time).max(0.0)),
+                                    )
+                                } else {
+                                    (None, None)
+                                };
                             recording_coordinator.lock().start_recording(
                                 track_id.clone(),
                                 None,
                                 self.state.recording_mode,
-                                self.state.punch_in,
-                                self.state.punch_out,
+                                punch_in,
+                                punch_out,
                             );
                         }
-                        self.state.status.info(format!("Recording started after count-in"));
+                        self.state.status.info("Recording started after count-in");
                     }
                 }
             }
@@ -584,266 +1009,309 @@ impl eframe::App for SupersawApp {
                 let engine = engine.lock();
                 engine.send_command(MidiEngineCommand::SetTempo(self.state.project.bpm));
             }
-            
+
             // Also update recording coordinator
             if let Some(coordinator) = &self.state.recording_coordinator {
-                coordinator.lock().send_command(crate::core::RecordingCommand::SetTempo(self.state.project.bpm));
+                coordinator
+                    .lock()
+                    .send_command(crate::core::RecordingCommand::SetTempo(
+                        self.state.project.bpm,
+                    ));
             }
-            
+
             self.last_bpm_sent = Some(self.state.project.bpm);
         }
-        
+
+        let mut loop_seeked = false;
         if let Some(engine) = &self.state.midi_engine {
             let engine = engine.lock();
-            
+
             // Process any messages from the MIDI engine
             while let Some(message) = engine.try_recv_message() {
                 match message {
                     crate::core::MidiEngineMessage::PositionUpdate(beats) => {
                         // Convert beats to seconds for display
                         let seconds = (beats / self.state.project.bpm) * 60.0;
-                        if self.state.playing {
-                            self.state.current_time = seconds;
+                        if self.state.playing && !loop_seeked {
+                            let loop_length = self.state.loop_end - self.state.loop_start;
+                            if self.state.loop_enabled && loop_length > f64::EPSILON {
+                                if seconds >= self.state.loop_end {
+                                    let loop_time = self.state.loop_start
+                                        + (seconds - self.state.loop_start).rem_euclid(loop_length);
+                                    let loop_beat = loop_time * self.state.project.bpm / 60.0;
+                                    engine.send_command(MidiEngineCommand::SetPosition(loop_beat));
+                                    self.state.current_time = loop_time;
+                                    loop_seeked = true;
+                                } else {
+                                    self.state.current_time = seconds;
+                                }
+                            } else {
+                                if self.state.loop_enabled {
+                                    self.state.loop_enabled = false;
+                                    self.state
+                                        .status
+                                        .warning("Loop range must have a positive length");
+                                }
+                                self.state.current_time = seconds;
+                            }
                         }
                     }
                     crate::core::MidiEngineMessage::MidiInput(port_id, midi_message, timestamp) => {
                         // Forward to recording coordinator via channel
                         if let Some(sender) = &self.state.midi_input_sender {
-                            let _ = sender.send((port_id, midi_message, timestamp));
+                            let _ = sender.try_send((port_id, midi_message, timestamp));
                         }
+                    }
+                    crate::core::MidiEngineMessage::PortStatusChanged(port_name, true) => {
+                        if let Some(track_ids) = self.pending_midi_routes.remove(&port_name) {
+                            for track_id in track_ids {
+                                if let Some(track) = self
+                                    .state
+                                    .project
+                                    .tracks
+                                    .iter_mut()
+                                    .find(|track| track.id == track_id)
+                                {
+                                    let TrackType::Midi { device_name, .. } = &mut track.track_type;
+                                    *device_name = Some(port_name.clone());
+                                    self.command_manager.mark_project_dirty();
+                                }
+                                engine.send_command(MidiEngineCommand::SetPortRouting(
+                                    track_id,
+                                    port_name.clone(),
+                                ));
+                            }
+                            self.state
+                                .status
+                                .success(format!("Connected to MIDI port: {port_name}"));
+                        }
+                    }
+                    crate::core::MidiEngineMessage::PortConnectionFailed(port_name, error) => {
+                        self.pending_midi_routes.remove(&port_name);
+                        self.state.status.error(format!(
+                            "Failed to connect to MIDI port {port_name}: {error}"
+                        ));
                     }
                     _ => {} // Handle other messages as needed
                 }
             }
         }
-        
-        // Process recording events
-        if let Some(recording_coordinator) = &self.state.recording_coordinator {
-            let coordinator = recording_coordinator.lock();
-            while let Some(event) = coordinator.try_recv_event() {
-                use crate::core::RecordingEvent;
-                match event {
-                    RecordingEvent::RecordingStarted { track_id, .. } => {
-                        self.state.status.info(format!("Recording started on track {}", track_id));
-                    }
-                    RecordingEvent::RecordingStopped { track_id, events_recorded } => {
-                        self.state.status.info(format!("Recording stopped on track {}: {} events", track_id, events_recorded));
-                    }
-                    RecordingEvent::EventsRecorded { track_id, events } => {
-                        // Create a MIDI clip from the recorded events
-                        if let Some(track) = self.state.project.tracks.iter_mut().find(|t| t.id == track_id) {
-                            if events.is_empty() {
-                                continue;
-                            }
-                            
-                            // Calculate time bounds
-                            let first_timestamp = events.first().map(|e| e.timestamp_beats).unwrap_or(0.0);
-                            let last_timestamp = events.last().map(|e| e.timestamp_beats).unwrap_or(first_timestamp);
-                            
-                            // Convert beats to seconds for clip placement
-                            let start_time = (first_timestamp / self.state.project.bpm) * 60.0;
-                            let end_time = (last_timestamp / self.state.project.bpm) * 60.0;
-                            let length = (end_time - start_time + 1.0).max(1.0); // At least 1 second
-                            
-                            // Handle Replace mode - remove overlapping clips
-                            if self.state.recording_mode == crate::core::RecordingMode::Replace {
-                                // Find and remove clips that overlap with the recording range
-                                track.clips.retain(|clip| {
-                                    match clip {
-                                        crate::core::Clip::Midi { start_time: clip_start, length: clip_length, .. } => {
-                                            let clip_end = clip_start + clip_length;
-                                            // Keep clip if it doesn't overlap
-                                            clip_end <= start_time || *clip_start >= end_time
-                                        }
-                                        _ => true, // Keep audio clips
-                                    }
-                                });
-                            }
-                            
-                            // Create new MIDI event store
-                            let mut midi_data = crate::core::MidiEventStore::new(self.state.project.ppq);
-                            
-                            // Check if quantization is enabled
-                            let quantize_config = self.state.recording_coordinator
-                                .as_ref()
-                                .map(|rc| rc.lock().get_config())
-                                .unwrap_or_default();
-                            
-                            // Convert recorded events to MIDI events
-                            if quantize_config.quantize_on_record {
-                                // Group events into note on/off pairs for quantization
-                                let mut note_starts: std::collections::HashMap<(u8, u8), (f64, u8)> = std::collections::HashMap::new();
-                                let mut quantized_notes = Vec::new();
-                                
-                                for recorded_event in events {
-                                    let relative_time = recorded_event.timestamp_beats - first_timestamp;
-                                    
-                                    match &recorded_event.message {
-                                        crate::core::MidiMessage::NoteOn { channel, key, velocity } => {
-                                            note_starts.insert((*channel, *key), (relative_time, *velocity));
-                                        }
-                                        crate::core::MidiMessage::NoteOff { channel, key, .. } => {
-                                            if let Some((start_time, velocity)) = note_starts.remove(&(*channel, *key)) {
-                                                // Apply quantization to note start
-                                                let grid_interval = match self.state.snap_mode {
-                                                    crate::core::SnapMode::None => continue, // Skip quantization
-                                                    crate::core::SnapMode::Bar => 4.0,
-                                                    crate::core::SnapMode::Beat => 1.0,
-                                                    crate::core::SnapMode::Halfbeat => 0.5,
-                                                    crate::core::SnapMode::Quarter => 0.25,
-                                                    crate::core::SnapMode::Eighth => 0.125,
-                                                    crate::core::SnapMode::Sixteenth => 0.0625,
-                                                    crate::core::SnapMode::Triplet => 1.0 / 3.0,
-                                                    crate::core::SnapMode::SixteenthTriplet => 1.0 / 6.0,
-                                                    crate::core::SnapMode::ThirtySecond => 0.03125,
-                                                };
-                                                
-                                                let quantized_start = (start_time / grid_interval).round() * grid_interval;
-                                                let duration = relative_time - start_time;
-                                                
-                                                // Create quantized note
-                                                let note = crate::core::Note {
-                                                    id: uuid::Uuid::new_v4().to_string(),
-                                                    channel: *channel,
-                                                    key: *key,
-                                                    velocity,
-                                                    start_time: quantized_start,
-                                                    duration,
-                                                    start_tick: midi_data.time_to_tick(quantized_start),
-                                                    duration_ticks: midi_data.time_to_tick(duration),
-                                                };
-                                                quantized_notes.push(note);
-                                            }
-                                        }
-                                        _ => {
-                                            // Non-note events pass through unchanged
-                                            let event = crate::core::MidiEvent {
-                                                id: uuid::Uuid::new_v4().to_string(),
-                                                time: relative_time,
-                                                tick: (relative_time * self.state.project.ppq as f64) as u32,
-                                                message: recorded_event.message,
-                                            };
-                                            midi_data.add_event(event);
-                                        }
-                                    }
-                                }
-                                
-                                // Add all quantized notes
-                                for note in quantized_notes {
-                                    midi_data.add_note(note);
-                                }
-                            } else {
-                                // No quantization - add events as-is
-                                for recorded_event in events {
-                                    let relative_time = recorded_event.timestamp_beats - first_timestamp;
-                                    let event = crate::core::MidiEvent {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        time: relative_time,
-                                        tick: (relative_time * self.state.project.ppq as f64) as u32,
-                                        message: recorded_event.message,
-                                    };
-                                    midi_data.add_event(event);
-                                }
-                            }
-                            
-                            // Save recorded MIDI to file
-                            let clip_id = uuid::Uuid::new_v4().to_string();
-                            
-                            // Determine file path
-                            let file_path = if let Some(project_path) = &self.state.project.project_path {
-                                // Save in project's midi directory
-                                let midi_dir = project_path.join("midi");
-                                std::fs::create_dir_all(&midi_dir).ok();
-                                midi_dir.join(format!("{}.mid", clip_id))
-                            } else {
-                                // No project path, save in temp location
-                                let temp_dir = std::env::temp_dir().join("hypersaw_recordings");
-                                std::fs::create_dir_all(&temp_dir).ok();
-                                temp_dir.join(format!("{}.mid", clip_id))
-                            };
-                            
-                            // Save MIDI data to file
-                            if let Err(e) = midi_data.save_to_file(&file_path) {
-                                self.state.status.error(format!("Failed to save recorded MIDI: {}", e));
-                            }
-                            
-                            let clip = crate::core::Clip::Midi {
-                                id: clip_id.clone(),
-                                start_time,
-                                length,
-                                file_path,
-                                midi_data: Some(midi_data),
-                                loaded: true,
-                                automation_lanes: Vec::new(),
-                            };
-                            
-                            track.clips.push(clip);
-                            self.state.selected_clip = Some(clip_id.clone());
-                            
-                            // Create a take for this recording
-                            let take_number = track.takes.len() + 1;
-                            let take = crate::core::Take {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                track_id: track_id.clone(),
-                                clip_id: clip_id.clone(),
-                                name: format!("Take {}", take_number),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs(),
-                                is_muted: false,
-                            };
-                            
-                            let take_id = take.id.clone();
-                            track.takes.push(take);
-                            track.active_take = Some(take_id);
-                            
-                            let mode_str = match self.state.recording_mode {
-                                crate::core::RecordingMode::Replace => "replaced",
-                                _ => "recorded",
-                            };
-                            self.state.status.success(format!("MIDI {} successfully", mode_str));
+
+        if loop_seeked {
+            self.reset_scheduling_watermark();
+        }
+
+        // Drain first so event handling can safely query the coordinator config
+        // without attempting to lock the same non-reentrant mutex twice.
+        let recording_events: Vec<_> = self
+            .state
+            .recording_coordinator
+            .as_ref()
+            .map(|recording_coordinator| {
+                let coordinator = recording_coordinator.lock();
+                std::iter::from_fn(|| coordinator.try_recv_event()).collect()
+            })
+            .unwrap_or_default();
+
+        for event in recording_events {
+            use crate::core::RecordingEvent;
+            match event {
+                RecordingEvent::RecordingStarted { track_id, .. } => {
+                    self.recording_start_times
+                        .entry(track_id.clone())
+                        .or_insert(self.state.current_time);
+                    self.state
+                        .status
+                        .info(format!("Recording started on track {}", track_id));
+                }
+                RecordingEvent::RecordingStopped {
+                    track_id,
+                    events_recorded,
+                } => {
+                    self.recording_start_times.remove(&track_id);
+                    self.state.status.info(format!(
+                        "Recording stopped on track {}: {} events",
+                        track_id, events_recorded
+                    ));
+                }
+                RecordingEvent::EventsRecorded { track_id, events } => {
+                    // Create a MIDI clip from the recorded events
+                    if let Some(track) = self
+                        .state
+                        .project
+                        .tracks
+                        .iter_mut()
+                        .find(|t| t.id == track_id)
+                    {
+                        if events.is_empty() {
+                            continue;
                         }
+
+                        // Calculate time bounds
+                        let first_timestamp =
+                            events.first().map(|e| e.timestamp_beats).unwrap_or(0.0);
+                        let last_timestamp = events
+                            .last()
+                            .map(|e| e.timestamp_beats)
+                            .unwrap_or(first_timestamp);
+
+                        // Recorded timestamps are relative to the capture
+                        // session. Placement comes from the transport time
+                        // observed when recording actually started.
+                        let start_time = self
+                            .recording_start_times
+                            .get(&track_id)
+                            .copied()
+                            .unwrap_or(self.state.current_time);
+                        let length = ((last_timestamp - first_timestamp) * 60.0
+                            / self.state.project.bpm)
+                            .max(1.0);
+                        let end_time = start_time + length;
+
+                        // Handle Replace mode - remove overlapping clips
+                        if self.state.recording_mode == crate::core::RecordingMode::Replace {
+                            // Find and remove clips that overlap with the recording range
+                            track.clips.retain(|clip| {
+                                let crate::core::Clip::Midi {
+                                    start_time: clip_start,
+                                    length: clip_length,
+                                    ..
+                                } = clip;
+                                let clip_end = clip_start + clip_length;
+                                clip_end <= start_time || *clip_start >= end_time
+                            });
+                        }
+
+                        // Check if quantization is enabled
+                        let quantize_config = self
+                            .state
+                            .recording_coordinator
+                            .as_ref()
+                            .map(|rc| rc.lock().get_config())
+                            .unwrap_or_default();
+
+                        let midi_data = recorded_events_to_midi(
+                            &events,
+                            self.state.project.ppq,
+                            self.state.project.bpm,
+                            self.state.snap_mode,
+                            quantize_config.quantize_on_record,
+                            quantize_config.quantize_strength,
+                        );
+
+                        // Save recorded MIDI to file
+                        let clip_id = uuid::Uuid::new_v4().to_string();
+
+                        // Determine file path
+                        let file_path = if let Some(project_path) = &self.state.project.project_path
+                        {
+                            // Save in project's midi directory
+                            let midi_dir = project_path.join("midi");
+                            std::fs::create_dir_all(&midi_dir).ok();
+                            midi_dir.join(format!("{}.mid", clip_id))
+                        } else {
+                            // No project path, save in temp location
+                            let temp_dir = std::env::temp_dir().join("hypersaw_recordings");
+                            std::fs::create_dir_all(&temp_dir).ok();
+                            temp_dir.join(format!("{}.mid", clip_id))
+                        };
+
+                        // Save MIDI data to file
+                        if let Err(e) = midi_data.save_to_file(&file_path) {
+                            self.state
+                                .status
+                                .error(format!("Failed to save recorded MIDI: {}", e));
+                        }
+
+                        let clip = crate::core::Clip::Midi {
+                            id: clip_id.clone(),
+                            start_time,
+                            length,
+                            file_path,
+                            midi_data: Some(midi_data),
+                            loaded: true,
+                            automation_lanes: vec![crate::core::AutomationLane::new(
+                                crate::core::AutomationParameter::Velocity,
+                            )],
+                        };
+
+                        track.clips.push(clip);
+                        self.command_manager.mark_project_dirty();
+                        self.state.selected_clip = Some(clip_id.clone());
+
+                        // Create a take for this recording
+                        let take_number = track.takes.len() + 1;
+                        let take = crate::core::Take {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            track_id: track_id.clone(),
+                            clip_id: clip_id.clone(),
+                            name: format!("Take {}", take_number),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            is_muted: false,
+                        };
+
+                        let take_id = take.id.clone();
+                        track.takes.push(take);
+                        track.active_take = Some(take_id);
+
+                        let mode_str = match self.state.recording_mode {
+                            crate::core::RecordingMode::Replace => "replaced",
+                            _ => "recorded",
+                        };
+                        self.state
+                            .status
+                            .success(format!("MIDI {} successfully", mode_str));
                     }
-                    RecordingEvent::BufferOverflow { track_id, dropped_events } => {
-                        self.state.status.error(format!(
-                            "Recording buffer overflow on track {}: {} events dropped",
-                            track_id, dropped_events
-                        ));
-                    }
-                    RecordingEvent::MonitoringEvent { track_id, message } => {
-                        // Forward monitored MIDI to the track's output
-                        if let Some(track) = self.state.project.tracks.iter().find(|t| t.id == track_id) {
-                            if let crate::core::TrackType::Midi { device_name, channel } = &track.track_type {
-                                let port_id = device_name.clone().unwrap_or_default();
-                                
-                                // Send immediately via MIDI engine
-                                if let Some(engine) = &self.state.midi_engine {
-                                    // Adjust channel if needed
-                                    let mut msg = message.clone();
-                                    match &mut msg {
-                                        MidiMessage::NoteOn { channel: ch, .. } |
-                                        MidiMessage::NoteOff { channel: ch, .. } |
-                                        MidiMessage::ControlChange { channel: ch, .. } => {
-                                            *ch = *channel;
-                                        }
-                                        _ => {}
-                                    }
-                                    
-                                    engine.lock().send_command(MidiEngineCommand::ScheduleEvent {
-                                        time_in_beats: 0.0, // Immediate
-                                        port_id,
-                                        message: msg,
-                                        track_id: track_id.clone(),
-                                    });
+                }
+                RecordingEvent::BufferOverflow {
+                    track_id,
+                    dropped_events,
+                } => {
+                    self.state.status.error(format!(
+                        "Recording buffer overflow on track {}: {} events dropped",
+                        track_id, dropped_events
+                    ));
+                }
+                RecordingEvent::MonitoringEvent { track_id, message } => {
+                    // Forward monitored MIDI to the track's output
+                    if let Some(track) = self.state.project.tracks.iter().find(|t| t.id == track_id)
+                    {
+                        let crate::core::TrackType::Midi {
+                            device_name,
+                            channel,
+                        } = &track.track_type;
+                        let port_id = device_name.clone().unwrap_or_default();
+
+                        // Send immediately via MIDI engine
+                        if let Some(engine) = &self.state.midi_engine {
+                            // Adjust channel if needed
+                            let mut msg = message.clone();
+                            match &mut msg {
+                                MidiMessage::NoteOn { channel: ch, .. }
+                                | MidiMessage::NoteOff { channel: ch, .. }
+                                | MidiMessage::ControlChange { channel: ch, .. } => {
+                                    *ch = midi_channel_index(*channel);
                                 }
+                                _ => {}
                             }
+
+                            engine
+                                .lock()
+                                .send_command(MidiEngineCommand::ScheduleEvent {
+                                    time_in_beats: 0.0, // Immediate
+                                    port_id,
+                                    message: msg,
+                                    track_id: track_id.clone(),
+                                });
                         }
                     }
                 }
             }
         }
-        
+
         // Schedule MIDI events if playing (moved to a separate method for clarity)
         if self.state.playing {
             self.schedule_midi_events();
@@ -853,29 +1321,56 @@ impl eframe::App for SupersawApp {
         // SAVE -  Ctrl + S
         // REDO -  Shift + Ctrl + Z
         // UNDO -  Ctrl + Z
-        ctx.input(|i| {
-            if i.key_pressed(Key::Z) && (i.modifiers.ctrl || i.modifiers.command) {
-                if i.modifiers.shift {
-                    self.handle_key_action(KeyAction::Redo);
-                } else {
-                    self.handle_key_action(KeyAction::Undo);
+        if self.pending_project_action.is_none() && !ctx.wants_keyboard_input() {
+            ctx.input(|i| {
+                if i.key_pressed(Key::Z) && (i.modifiers.ctrl || i.modifiers.command) {
+                    if i.modifiers.shift {
+                        self.handle_key_action(KeyAction::Redo);
+                    } else {
+                        self.handle_key_action(KeyAction::Undo);
+                    }
                 }
-            }
 
-            if i.key_pressed(Key::S) && (i.modifiers.ctrl || i.modifiers.command) {
-                self.handle_key_action(KeyAction::SaveProject);
-            }
+                if i.key_pressed(Key::S) && (i.modifiers.ctrl || i.modifiers.command) {
+                    self.handle_key_action(KeyAction::SaveProject);
+                }
 
-            if i.key_pressed(Key::Space) {
-                self.handle_key_action(KeyAction::TogglePlay);
-            }
-        });
+                if i.key_pressed(Key::Space) {
+                    self.handle_key_action(KeyAction::TogglePlay);
+                }
+
+                // View switching shortcuts (Bitwig-style)
+                if i.modifiers.command || i.modifiers.ctrl {
+                    if i.key_pressed(Key::Num1) {
+                        // Cmd+1 = Arrangement view
+                        self.state.current_view = EditorView::Arrangement;
+                    }
+
+                    if i.key_pressed(Key::Num2) {
+                        // Cmd+2 = Piano Roll (if clip selected)
+                        if let (Some(clip_id), Some(track_id)) =
+                            (&self.state.selected_clip, &self.state.selected_track)
+                        {
+                            self.state.current_view = EditorView::PianoRoll {
+                                clip_id: clip_id.clone(),
+                                track_id: track_id.clone(),
+                                scroll_position: 0.0,
+                                vertical_zoom: 1.0,
+                            };
+                        }
+                    }
+                }
+            });
+        }
 
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            if self.pending_project_action.is_some() {
+                ui.disable();
+            }
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New Project").clicked() {
-                        self.state = DawState::new();
+                        self.request_project_action(ProjectAction::New);
                         ui.close_menu();
                     }
                     if ui.button("Save Project").clicked() {
@@ -883,7 +1378,7 @@ impl eframe::App for SupersawApp {
                         ui.close_menu();
                     }
                     if ui.button("Load Project").clicked() {
-                        self.file_dialog = Some(FileDialog::LoadProject);
+                        self.request_project_action(ProjectAction::Load);
                         ui.close_menu();
                     }
                     ui.separator();
@@ -896,27 +1391,157 @@ impl eframe::App for SupersawApp {
                 ui.menu_button("Edit", |ui| {
                     let can_undo = self.command_manager.can_undo();
                     let can_redo = self.command_manager.can_redo();
-                    
-                    if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
-                        self.handle_key_action(KeyAction::Undo);
-                        ui.close_menu();
-                    }
-                    ui.ctx().style_mut(|style| {
-                        if let Some(item) = style.text_styles.get_mut(&egui::TextStyle::Button) {
-                            *item = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+                    let shortcut_modifier = if cfg!(target_os = "macos") {
+                        "⌘"
+                    } else {
+                        "Ctrl+"
+                    };
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(can_undo, egui::Button::new("Undo"))
+                            .clicked()
+                        {
+                            self.handle_key_action(KeyAction::Undo);
+                            ui.close_menu();
                         }
+                        ui.label(
+                            egui::RichText::new(format!("{shortcut_modifier}Z"))
+                                .small()
+                                .weak(),
+                        );
                     });
-                    ui.label("Ctrl+Z");
-                    
-                    if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
-                        self.handle_key_action(KeyAction::Redo);
-                        ui.close_menu();
-                    }
-                    ui.label("Ctrl+Shift+Z");
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(can_redo, egui::Button::new("Redo"))
+                            .clicked()
+                        {
+                            self.handle_key_action(KeyAction::Redo);
+                            ui.close_menu();
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{shortcut_modifier}Shift+Z"))
+                                .small()
+                                .weak(),
+                        );
+                    });
                 });
-                
+
+                ui.menu_button("View", |ui| {
+                    let is_arrangement = matches!(self.state.current_view, EditorView::Arrangement);
+                    let is_piano_roll =
+                        matches!(self.state.current_view, EditorView::PianoRoll { .. });
+
+                    // Arrangement
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new("Arrangement").selected(is_arrangement))
+                            .clicked()
+                        {
+                            self.state.current_view = EditorView::Arrangement;
+                            ui.close_menu();
+                        }
+                        ui.label(egui::RichText::new("⌘1").weak());
+                    });
+
+                    // Piano Roll - only enabled if clip selected
+                    let piano_roll_enabled =
+                        self.state.selected_clip.is_some() && self.state.selected_track.is_some();
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                piano_roll_enabled,
+                                egui::Button::new("Piano Roll").selected(is_piano_roll),
+                            )
+                            .clicked()
+                        {
+                            if let (Some(clip_id), Some(track_id)) =
+                                (&self.state.selected_clip, &self.state.selected_track)
+                            {
+                                self.state.current_view = EditorView::PianoRoll {
+                                    clip_id: clip_id.clone(),
+                                    track_id: track_id.clone(),
+                                    scroll_position: 0.0,
+                                    vertical_zoom: 1.0,
+                                };
+                                ui.close_menu();
+                            }
+                        }
+                        ui.label(egui::RichText::new("⌘2").weak());
+                    });
+
+                    ui.separator();
+
+                    // Close Editor (back to Arrangement)
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!is_arrangement, egui::Button::new("Close Editor"))
+                            .clicked()
+                        {
+                            self.state.current_view = EditorView::Arrangement;
+                            ui.close_menu();
+                        }
+                        ui.label(egui::RichText::new("⌘1").weak());
+                    });
+                });
             });
         });
+
+        let mut project_action_decision = None;
+        if let Some(action) = self.pending_project_action {
+            let action_name = match action {
+                ProjectAction::New => "create a new project",
+                ProjectAction::Load => "load another project",
+            };
+            let modal_response =
+                egui::Modal::new(egui::Id::new("unsaved_changes")).show(ctx, |ui| {
+                    ui.heading("Unsaved changes");
+                    ui.label(format!("Save your changes before you {action_name}?"));
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            project_action_decision = Some(ProjectActionDecision::Save);
+                        }
+                        if ui.button("Discard").clicked() {
+                            project_action_decision = Some(ProjectActionDecision::Discard);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            project_action_decision = Some(ProjectActionDecision::Cancel);
+                        }
+                    });
+                });
+            if modal_response.should_close() {
+                project_action_decision = Some(ProjectActionDecision::Cancel);
+            }
+        }
+
+        if let Some(decision) = project_action_decision {
+            match decision {
+                ProjectActionDecision::Save => match self.save_project() {
+                    Ok(path) => {
+                        self.state
+                            .status
+                            .success(format!("Project saved to {}", path.display()));
+                        if let Some(action) = self.pending_project_action.take() {
+                            self.continue_project_action(action);
+                        }
+                    }
+                    Err(error) => self
+                        .state
+                        .status
+                        .error(format!("Failed to save project: {error}")),
+                },
+                ProjectActionDecision::Discard => {
+                    if let Some(action) = self.pending_project_action.take() {
+                        self.continue_project_action(action);
+                    }
+                }
+                ProjectActionDecision::Cancel => {
+                    self.pending_project_action = None;
+                }
+            }
+        }
 
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             self.state.status.update(); // Clear expired messages
@@ -933,126 +1558,171 @@ impl eframe::App for SupersawApp {
         });
 
         egui::TopBottomPanel::top("transport").show(ctx, |ui| {
+            if self.pending_project_action.is_some() {
+                ui.disable();
+            }
             self.draw_transport(ui);
         });
 
         // Update timeline with current MIDI ports
-        self.timeline.update_midi_ports(self.midi_output_ports.iter().map(|(name, _)| name.clone()).collect());
+        self.timeline.update_midi_ports(
+            self.midi_output_ports
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+        );
 
-        // Draw the main content area
-        egui::CentralPanel::default().show(ctx, |ui| match &self.state.current_view {
-            EditorView::Arrangement => {
-                let commands = self.timeline.show(ui, &mut self.state);
-                for command in commands {
-                    // Check if this is a command that affects scheduling
-                    let affects_scheduling = matches!(command, 
-                        DawCommand::SeekTime { .. } | 
-                        DawCommand::StartPlayback | 
-                        DawCommand::PausePlayback |
-                        DawCommand::StopPlayback
-                    );
-                    
-                    if let Err(e) = self.command_manager.execute(command, &mut self.state) {
-                        eprintln!("timeline: Command failed: {}", e);
-                        self.state.status.error(format!("Command failed: {}", e));
+        // Do not run editor-local raw input handlers behind a modal.
+        if self.pending_project_action.is_some() {
+            egui::CentralPanel::default().show(ctx, |_ui| {});
+        } else {
+            // Draw the main content area
+            egui::CentralPanel::default().show(ctx, |ui| match &self.state.current_view {
+                EditorView::Arrangement => {
+                    let commands = self.timeline.show(ui, &mut self.state);
+                    for command in commands {
+                        // Check if this is a command that affects scheduling
+                        let affects_transport = matches!(
+                            command,
+                            DawCommand::SeekTime { .. }
+                                | DawCommand::StartPlayback
+                                | DawCommand::PausePlayback
+                                | DawCommand::StopPlayback
+                        );
+                        let affects_midi_schedule = command.affects_midi_schedule();
+
+                        match self.command_manager.execute(command, &mut self.state) {
+                            Ok(()) if affects_midi_schedule => self.rebuild_playback_schedule(),
+                            Ok(()) if affects_transport => {
+                                self.reset_scheduling_watermark();
+                                if self.state.playing {
+                                    self.schedule_midi_events();
+                                }
+                            }
+                            Ok(()) => {}
+                            Err(error) => {
+                                eprintln!("timeline: Command failed: {error}");
+                                self.state.status.error(format!("Command failed: {error}"));
+                            }
+                        }
                     }
-                    
-                    // Reset scheduling watermark on seek/stop/pause
-                    if affects_scheduling {
-                        self.reset_scheduling_watermark();
+
+                    if self.timeline.take_playback_schedule_dirty() {
+                        self.rebuild_playback_schedule();
                     }
-                }
-                
-                // Handle pending MIDI connections from timeline
-                let pending_connections = self.timeline.take_pending_midi_connections();
-                for (track_id, device_name) in pending_connections {
-                    if device_name.is_empty() {
-                        // Disconnect - remove port from engine
-                        if let Some(track) = self.state.project.tracks.iter().find(|t| t.id == track_id) {
-                            if let TrackType::Midi { device_name: current_device, .. } = &track.track_type {
+
+                    // Handle pending MIDI connections from timeline
+                    let pending_connections = self.timeline.take_pending_midi_connections();
+                    for (track_id, device_name) in pending_connections {
+                        if device_name.is_empty() {
+                            // Disconnect - remove port from engine
+                            if let Some(track) =
+                                self.state.project.tracks.iter().find(|t| t.id == track_id)
+                            {
+                                let TrackType::Midi {
+                                    device_name: current_device,
+                                    ..
+                                } = &track.track_type;
                                 if let Some(current) = current_device {
                                     if let Some(engine) = &self.state.midi_engine {
-                                        engine.lock().send_command(MidiEngineCommand::RemoveOutputPort(current.clone()));
+                                        let used_by_another_track =
+                                        self.state.project.tracks.iter().any(|other| {
+                                            other.id != track_id
+                                                && matches!(
+                                                    &other.track_type,
+                                                    TrackType::Midi { device_name: Some(name), .. }
+                                                        if name == current
+                                                )
+                                        });
+                                        let engine = engine.lock();
+                                        engine.send_command(MidiEngineCommand::ClearPortRouting(
+                                            track_id.clone(),
+                                        ));
+                                        if !used_by_another_track {
+                                            engine.send_command(
+                                                MidiEngineCommand::RemoveOutputPort(
+                                                    current.clone(),
+                                                ),
+                                            );
+                                        }
                                     }
                                 }
                             }
-                        }
-                        
-                        self.state
-                            .status
-                            .info("MIDI output disconnected".to_string());
-                            
-                        // Update track device name
-                        if let Some(track) = self.state.project.tracks.iter_mut().find(|t| t.id == track_id) {
-                            if let TrackType::Midi { device_name: ref mut dev_name, .. } = &mut track.track_type {
-                                *dev_name = None;
-                            }
-                        }
-                    } else {
-                        // Connect to the port
-                        if let Err(e) = self.connect_midi_output_port(&device_name) {
-                            self.state
-                                .status
-                                .error(format!("Failed to connect to MIDI port: {}", e));
-                        } else {
-                            self.state
-                                .status
-                                .success(format!("Connected to MIDI port: {}", device_name));
-                                
-                            // Update track device name and routing
-                            if let Some(track) = self.state.project.tracks.iter_mut().find(|t| t.id == track_id) {
-                                if let TrackType::Midi { device_name: ref mut dev_name, .. } = &mut track.track_type {
-                                    *dev_name = Some(device_name.clone());
-                                }
-                            }
-                            
-                            // Set port routing in the engine
-                            if let Some(engine) = &self.state.midi_engine {
-                                engine.lock().send_command(MidiEngineCommand::SetPortRouting(
-                                    track_id.clone(),
-                                    device_name,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            EditorView::PianoRoll { .. } => {
-                let commands = self.piano_roll.show(ui, &mut self.state);
-                for command in commands {
-                    println!("command: {:?}", command);
 
-                    if let Err(e) = self.command_manager.execute(command, &mut self.state) {
-                        eprintln!("piano_roll: Command failed: {}", e);
-                        self.state.status.error(format!("Command failed: {}", e));
+                            self.state
+                                .status
+                                .info("MIDI output disconnected".to_string());
+
+                            // Update track device name
+                            if let Some(track) = self
+                                .state
+                                .project
+                                .tracks
+                                .iter_mut()
+                                .find(|t| t.id == track_id)
+                            {
+                                let TrackType::Midi {
+                                    device_name: dev_name,
+                                    ..
+                                } = &mut track.track_type;
+                                *dev_name = None;
+                                self.command_manager.mark_project_dirty();
+                            }
+                        } else {
+                            // Connect to the port
+                            self.pending_midi_routes
+                                .entry(device_name.clone())
+                                .or_default()
+                                .push(track_id.clone());
+                            if let Err(e) = self.connect_midi_output_port(&device_name) {
+                                self.pending_midi_routes.remove(&device_name);
+                                self.state
+                                    .status
+                                    .error(format!("Failed to connect to MIDI port: {}", e));
+                            } else {
+                                self.state
+                                    .status
+                                    .info(format!("Connecting to MIDI port: {device_name}"));
+                            }
+                        }
                     }
                 }
-            }
-            EditorView::SampleEditor { .. } => {
-                ui.label("Sample Editor (Not Implemented)");
-            }
-        });
+                EditorView::PianoRoll { .. } => {
+                    let commands = self.piano_roll.show(ui, &mut self.state);
+                    for command in commands {
+                        println!("command: {:?}", command);
+                        let affects_midi_schedule = command.affects_midi_schedule();
+
+                        match self.command_manager.execute(command, &mut self.state) {
+                            Ok(()) if affects_midi_schedule => self.rebuild_playback_schedule(),
+                            Ok(()) => {}
+                            Err(error) => {
+                                eprintln!("piano_roll: Command failed: {error}");
+                                self.state.status.error(format!("Command failed: {error}"));
+                            }
+                        }
+                    }
+                }
+                EditorView::SampleEditor { .. } => {
+                    ui.label("Sample Editor (Not Implemented)");
+                }
+            });
+        }
 
         // MIDI editor functionality is now integrated into the piano roll
 
         // Handle file dialogs
-        if let Some(dialog_type) = &self.file_dialog {
+        if let Some(dialog_type) = self.file_dialog {
             match dialog_type {
                 // TODO: Implement dialog for naming the project
                 FileDialog::SaveProject => {
-                    // For now, just save to a fixed test location
-                    let path = std::env::current_dir()
-                        .unwrap()
-                        .join("projects")
-                        .join(self.state.project.name.clone());
-
-                    match self.state.project.save(&path) {
+                    match self.save_project() {
                         Err(e) => {
-                            self.state.status.error("Failed to save project");
-                            eprintln!("Failed to save project: {}", path.display());
-                            eprintln!("error: {}", e);
+                            self.state
+                                .status
+                                .error(format!("Failed to save project: {e}"));
                         }
-                        Ok(..) => {
+                        Ok(path) => {
                             self.state.status.success("Project saved successfully");
                             println!("Project saved to: {}", path.display());
                         }
@@ -1061,18 +1731,18 @@ impl eframe::App for SupersawApp {
                     self.file_dialog = None;
                 }
                 FileDialog::LoadProject => {
+                    self.pause_for_modal_dialog();
                     // Use a file dialog to allow the user to select a project file
                     if let Some(file_path) = rfd::FileDialog::new()
                         .set_title("Select Project File")
                         .add_filter("Supersaw Project", &["supersaw"])
-                        .set_directory(std::env::current_dir().unwrap())
                         .pick_file()
                     {
                         println!("Selected project file: {}", file_path.display());
 
                         match Project::load(&file_path) {
                             Ok(project) => {
-                                self.state.project = project;
+                                self.install_project(project);
                                 self.state.status.success("Project loaded successfully");
                             }
                             Err(e) => {
@@ -1099,9 +1769,136 @@ impl eframe::App for SupersawApp {
             }
         }
 
-        // Request continuous repaints while playing
-        if self.state.playing {
+        // Playback requires animation frames. Recording and asynchronous MIDI
+        // connection work also need a short poll interval because their events
+        // arrive without an egui input event to wake the UI.
+        let awaiting_midi_input = self
+            .state
+            .project
+            .tracks
+            .iter()
+            .any(|track| track.is_armed || track.input_monitoring);
+        if self.state.playing || self.state.count_in_active {
             ctx.request_repaint();
+        } else if self.state.recording_track.is_some()
+            || !self.pending_midi_routes.is_empty()
+            || awaiting_midi_input
+        {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else if self.state.status.get_message().is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::RecordedEvent;
+
+    fn recorded_event(timestamp_beats: f64, message: MidiMessage) -> RecordedEvent {
+        RecordedEvent {
+            timestamp_samples: 0,
+            timestamp_beats,
+            port_id: "input".to_string(),
+            message,
+        }
+    }
+
+    #[test]
+    fn unquantized_recording_builds_notes_for_the_piano_roll() {
+        let events = vec![
+            recorded_event(
+                0.0,
+                MidiMessage::NoteOn {
+                    channel: 0,
+                    key: 60,
+                    velocity: 96,
+                },
+            ),
+            recorded_event(
+                1.0,
+                MidiMessage::NoteOff {
+                    channel: 0,
+                    key: 60,
+                    velocity: 0,
+                },
+            ),
+        ];
+
+        let store = recorded_events_to_midi(&events, 480, 120.0, SnapMode::None, false, 1.0);
+        let note = store.get_notes().next().expect("recorded note");
+        assert_eq!(note.start_time, 0.0);
+        assert_eq!(note.duration, 0.5);
+        assert_eq!(note.velocity, 96);
+    }
+
+    #[test]
+    fn quantize_with_snap_none_keeps_recorded_notes() {
+        let events = vec![
+            recorded_event(
+                0.1,
+                MidiMessage::NoteOn {
+                    channel: 0,
+                    key: 64,
+                    velocity: 100,
+                },
+            ),
+            recorded_event(
+                0.6,
+                MidiMessage::NoteOff {
+                    channel: 0,
+                    key: 64,
+                    velocity: 0,
+                },
+            ),
+        ];
+
+        let store = recorded_events_to_midi(&events, 480, 120.0, SnapMode::None, true, 1.0);
+        assert_eq!(store.get_notes().count(), 1);
+    }
+
+    #[test]
+    fn overlapping_same_pitch_recording_pairs_note_offs_fifo() {
+        let events = vec![
+            recorded_event(
+                0.0,
+                MidiMessage::NoteOn {
+                    channel: 0,
+                    key: 60,
+                    velocity: 80,
+                },
+            ),
+            recorded_event(
+                0.25,
+                MidiMessage::NoteOn {
+                    channel: 0,
+                    key: 60,
+                    velocity: 100,
+                },
+            ),
+            recorded_event(
+                0.5,
+                MidiMessage::NoteOff {
+                    channel: 0,
+                    key: 60,
+                    velocity: 0,
+                },
+            ),
+            recorded_event(
+                1.0,
+                MidiMessage::NoteOff {
+                    channel: 0,
+                    key: 60,
+                    velocity: 0,
+                },
+            ),
+        ];
+
+        let store = recorded_events_to_midi(&events, 480, 60.0, SnapMode::None, false, 1.0);
+        let mut notes: Vec<_> = store.get_notes().cloned().collect();
+        notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
+        assert_eq!(notes[0].duration, 0.5);
+        assert_eq!(notes[1].duration, 0.75);
     }
 }
