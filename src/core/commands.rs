@@ -286,8 +286,6 @@ impl DawCommand {
                 | Self::SetTrackMidiInputChannel { .. }
                 | Self::SoloTrack { .. }
                 | Self::UnsoloTrack { .. }
-                | Self::ArmTrack { .. }
-                | Self::UnarmTrack { .. }
                 | Self::SetTrackColor { .. }
                 | Self::ReorderTracks { .. }
                 | Self::RenameTrack { .. }
@@ -302,12 +300,6 @@ impl DawCommand {
                 | Self::DeleteAutomationPoints { .. }
                 | Self::UpdateAutomationPoint { .. }
                 | Self::SetBpm { .. }
-                | Self::StartMidiRecording { .. }
-                | Self::StopMidiRecording { .. }
-                | Self::SetRecordingMode { .. }
-                | Self::ToggleInputMonitoring { .. }
-                | Self::SetPunchPoints { .. }
-                | Self::SetCountInBars { .. }
                 | Self::QuantizeNotes { .. }
                 | Self::CreateTake { .. }
                 | Self::SelectTake { .. }
@@ -336,8 +328,6 @@ impl DawCommand {
                 | Self::UnmuteTrack { .. }
                 | Self::SoloTrack { .. }
                 | Self::UnsoloTrack { .. }
-                | Self::ArmTrack { .. }
-                | Self::UnarmTrack { .. }
                 | Self::SetTrackColor { .. }
                 | Self::ReorderTracks { .. }
                 | Self::RenameTrack { .. }
@@ -352,8 +342,6 @@ impl DawCommand {
                 | Self::DeleteAutomationPoints { .. }
                 | Self::UpdateAutomationPoint { .. }
                 | Self::SetBpm { .. }
-                | Self::StartMidiRecording { .. }
-                | Self::ToggleInputMonitoring { .. }
                 | Self::QuantizeNotes { .. }
                 | Self::CreateTake { .. }
                 | Self::SelectTake { .. }
@@ -361,6 +349,16 @@ impl DawCommand {
                 | Self::MuteTake { .. }
                 | Self::RenameTake { .. }
         )
+    }
+
+    /// Project mutations without command-specific inverse data are restored
+    /// from a bounded project/session snapshot by `CommandManager`.
+    pub fn uses_project_snapshot(&self) -> bool {
+        self.changes_project() && !self.is_undoable()
+    }
+
+    pub fn requires_runtime_sync_after_execute(&self) -> bool {
+        matches!(self, Self::DeleteTrack { .. })
     }
 
     pub fn affects_midi_schedule(&self) -> bool {
@@ -403,6 +401,89 @@ fn recording_input_routing(track: &Track) -> (String, Option<u8>) {
         .filter(|channel| *channel < 16);
 
     (input_port, channel_filter)
+}
+
+/// Reapplies the persisted project routing after `CommandManager` restores a
+/// snapshot. Device connection availability remains an application concern;
+/// this only updates routes for ports the engine already knows about.
+pub(crate) fn synchronize_project_runtime_after_restore(
+    state: &DawState,
+    previous_tracks: &[Track],
+) {
+    let removed_track_ids = removed_track_ids(previous_tracks, &state.project.tracks);
+
+    if let Some(engine) = &state.midi_engine {
+        let engine = engine.lock();
+        engine.send_command(MidiEngineCommand::SetTempo(state.project.bpm));
+
+        for track_id in &removed_track_ids {
+            engine.send_command(MidiEngineCommand::ClearPortRouting(track_id.clone()));
+            engine.send_command(MidiEngineCommand::SetTrackSolo(track_id.clone(), false));
+            engine.send_command(MidiEngineCommand::SetTrackMute(track_id.clone(), false));
+        }
+
+        for track in &state.project.tracks {
+            engine.send_command(MidiEngineCommand::SetTrackMute(
+                track.id.clone(),
+                track.is_muted,
+            ));
+            engine.send_command(MidiEngineCommand::SetTrackSolo(
+                track.id.clone(),
+                track.is_soloed,
+            ));
+
+            let TrackType::Midi { device_name, .. } = &track.track_type;
+            match device_name {
+                Some(port_id) => engine.send_command(MidiEngineCommand::SetPortRouting(
+                    track.id.clone(),
+                    port_id.clone(),
+                )),
+                None => engine.send_command(MidiEngineCommand::ClearPortRouting(track.id.clone())),
+            }
+        }
+    }
+
+    if let Some(recording_coordinator) = &state.recording_coordinator {
+        let coordinator = recording_coordinator.lock();
+        coordinator.send_command(RecordingCommand::SetTempo(state.project.bpm));
+
+        for track_id in &removed_track_ids {
+            coordinator.send_command(RecordingCommand::DisarmTrack {
+                track_id: track_id.clone(),
+            });
+        }
+
+        for track in &state.project.tracks {
+            if track.is_armed {
+                let (input_port, channel_filter) = recording_input_routing(track);
+                coordinator.send_command(RecordingCommand::ArmTrack {
+                    track_id: track.id.clone(),
+                    input_port,
+                    channel_filter,
+                });
+            } else {
+                coordinator.send_command(RecordingCommand::DisarmTrack {
+                    track_id: track.id.clone(),
+                });
+            }
+            coordinator.send_command(RecordingCommand::SetInputMonitoring {
+                track_id: track.id.clone(),
+                enabled: track.input_monitoring,
+            });
+        }
+    }
+}
+
+fn removed_track_ids(previous_tracks: &[Track], current_tracks: &[Track]) -> Vec<String> {
+    previous_tracks
+        .iter()
+        .filter(|previous_track| {
+            !current_tracks
+                .iter()
+                .any(|current_track| current_track.id == previous_track.id)
+        })
+        .map(|track| track.id.clone())
+        .collect()
 }
 
 pub(crate) fn recording_session_context(
@@ -840,6 +921,16 @@ impl Command for DawCommand {
             }
             DawCommand::SetBpm { bpm } => {
                 state.project.bpm = *bpm;
+                if let Some(engine) = &state.midi_engine {
+                    engine
+                        .lock()
+                        .send_command(MidiEngineCommand::SetTempo(*bpm));
+                }
+                if let Some(recording_coordinator) = &state.recording_coordinator {
+                    recording_coordinator
+                        .lock()
+                        .send_command(RecordingCommand::SetTempo(*bpm));
+                }
                 state.status.info(format!("BPM set to: {}", bpm));
                 Ok(())
             }
@@ -2054,6 +2145,17 @@ mod tests {
         assert_eq!(
             recording_input_routing(&track),
             ("Keyboard".to_string(), Some(0))
+        );
+    }
+
+    #[test]
+    fn removed_tracks_are_identified_for_runtime_cleanup() {
+        let removed = midi_track("removed");
+        let remaining = midi_track("remaining");
+
+        assert_eq!(
+            removed_track_ids(&[removed.clone(), remaining.clone()], &[remaining]),
+            vec![removed.id]
         );
     }
 

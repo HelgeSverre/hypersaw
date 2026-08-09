@@ -55,12 +55,18 @@ another UI framework is considered.
 - `src/core/project.rs` defines serializable projects, tracks, clips, takes, editor views, and
   project asset persistence.
 - `src/core/commands.rs` defines application commands and their execution behavior.
-- `src/core/command_manager.rs` tracks the implemented undo/redo subset and project dirty state.
+- `src/core/command_manager.rs` owns bounded undo/redo history, project savepoints, session
+  selection restoration, and project dirty state.
 - `src/core/automation.rs` defines automation lanes, points, parameters, and interpolation.
 
-The command enum covers most actions, but undo is intentionally enabled only where enough
-original data is stored to restore state correctly. Note edits and track mute are covered;
-most track, clip, take, automation, routing, and tempo mutations still need undo data.
+Commands with compact inverse data retain command-level undo. Other persistent mutations use a
+bounded history of 128 project/session before-and-after snapshots, covering destructive track,
+clip, take, automation, input-routing/channel, and tempo changes. Consecutive updates to one
+automation point coalesce until a save or external-mutation boundary. Snapshot restoration keeps
+the current project document identity and live arm/monitor flags, then reapplies tempo, mute,
+solo, output routes, input routes, and monitoring to the MIDI runtimes. Direct recording, import,
+and asynchronous output-routing commits currently clear older history so a stale whole-project
+snapshot cannot overwrite newly committed data.
 
 ### MIDI model and runtime
 
@@ -122,10 +128,12 @@ A project is stored as a directory:
 
 MIDI asset paths serialized into the project are relative and stable. Loading resolves them
 against the project-file directory. Repeated saves reuse the clip ID rather than creating
-duplicate assets, and empty MIDI clips produce valid empty MIDI files.
+duplicate assets, and empty MIDI clips produce valid empty MIDI files. Save As validates a single
+safe project-name component, creates exactly one named directory under the selected parent, and
+rejects collisions without overwriting another document. A normal Save preserves the exact
+project file selected on load, even when its filename differs from the display name.
 
-Remaining project-management work includes project naming, Save As, saving loaded projects back
-to their existing location, recent projects, and autosave/recovery.
+Remaining project-management work includes recent projects and autosave/recovery.
 
 ## egui Interaction Rules
 
@@ -142,15 +150,16 @@ The custom arrangement and piano-roll canvases rely on explicit egui gesture sta
 
 ## Verification Baseline
 
-The repository currently has 67 unit tests covering live MIDI codecs, fake-output lifecycle,
+The repository currently has 81 unit tests covering live MIDI codecs, fake-output lifecycle,
 scheduling queues, routing and monitoring, recording batching and session semantics, count-in,
 quantize-on-record, every recording mode, loop-pass boundaries, take deletion, project asset
-persistence, recorded-note conversion, piano-roll gesture math, and timeline behavior.
+persistence and Save As safety, destructive undo/savepoints, recorded-note conversion,
+piano-roll gesture math, and timeline behavior.
 
 Important gaps:
 
 - no CI configuration;
-- no command-level undo matrix;
+- no exhaustive command-level undo matrix or asynchronous output-routing undo;
 - no controller-level or full-UI recording/project workflow tests;
 - no egui interaction tests for take controls or editor focus; and
 - no cross-platform release/packaging matrix.
@@ -165,8 +174,9 @@ Important gaps:
 
 ## Implementation Order
 
-1. Complete destructive-operation undo and project Save/Save As safety.
-2. Add CI and integration coverage around scheduling, undo, persistence, and UI interaction.
+1. Add CI and integration coverage around scheduling, undo, persistence, and UI interaction.
+2. Move direct recording/import/output-routing mutations behind controller commands and finish
+   gesture-level undo grouping.
 3. Extract framework-neutral transport, scheduling, recording, and project controllers.
 4. Add higher-level MIDI editing, effects, and step-sequencer workflows.
 5. Revisit a GPUI vertical-slice experiment only after the controller extraction.

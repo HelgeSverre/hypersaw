@@ -21,6 +21,8 @@ pub struct SupersawApp {
     midi_output_ports: Vec<(String, usize)>,
     midi_input_ports: Vec<(String, usize)>,
     file_dialog: Option<FileDialog>,
+    save_as_name: String,
+    save_as_name_needs_focus: bool,
     pending_project_action: Option<ProjectAction>,
     last_bpm_sent: Option<f64>,
     scheduled_through_beat: Option<f64>,
@@ -33,7 +35,8 @@ pub struct SupersawApp {
 
 #[derive(Clone, Copy)]
 enum FileDialog {
-    SaveProject,
+    SaveAsName,
+    SaveAsDirectory,
     LoadProject,
     ImportMidi,
 }
@@ -377,12 +380,44 @@ impl SupersawApp {
     }
 
     fn save_project(&mut self) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let path = std::env::current_dir()?
-            .join("projects")
-            .join(self.state.project.name.clone());
-        self.state.project.save(&path)?;
+        let path = self.state.project.save_current()?;
         self.command_manager.mark_project_saved();
         Ok(path)
+    }
+
+    fn open_save_as_dialog(&mut self) {
+        self.save_as_name = self.state.project.name.clone();
+        self.save_as_name_needs_focus = true;
+        self.file_dialog = Some(FileDialog::SaveAsName);
+    }
+
+    fn request_project_save(&mut self) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+        if self.state.project.project_path.is_some() {
+            self.save_project().map(Some)
+        } else {
+            self.open_save_as_dialog();
+            Ok(None)
+        }
+    }
+
+    fn report_project_saved(&mut self, path: PathBuf) {
+        self.state
+            .status
+            .success(format!("Project saved to {}", path.display()));
+        if let Some(action) = self.pending_project_action.take() {
+            self.continue_project_action(action);
+        }
+    }
+
+    fn save_or_open_save_as(&mut self) {
+        match self.request_project_save() {
+            Ok(Some(path)) => self.report_project_saved(path),
+            Ok(None) => {}
+            Err(error) => self
+                .state
+                .status
+                .error(format!("Failed to save project: {error}")),
+        }
     }
 
     fn continue_project_action(&mut self, action: ProjectAction) {
@@ -514,7 +549,7 @@ impl SupersawApp {
                 }
             }
             KeyAction::SaveProject => {
-                self.file_dialog = Some(FileDialog::SaveProject);
+                self.save_or_open_save_as();
             }
             KeyAction::Undo => {
                 let had_undo = self.command_manager.can_undo();
@@ -589,6 +624,8 @@ impl SupersawApp {
             midi_output_ports,
             midi_input_ports,
             file_dialog: None,
+            save_as_name: "Untitled".to_string(),
+            save_as_name_needs_focus: false,
             pending_project_action: None,
             last_bpm_sent: None,
             scheduled_through_beat: None,
@@ -1586,7 +1623,11 @@ impl eframe::App for SupersawApp {
                         ui.close_menu();
                     }
                     if ui.button("Save Project").clicked() {
-                        self.file_dialog = Some(FileDialog::SaveProject);
+                        self.save_or_open_save_as();
+                        ui.close_menu();
+                    }
+                    if ui.button("Save Project As...").clicked() {
+                        self.open_save_as_dialog();
                         ui.close_menu();
                     }
                     if ui.button("Load Project").clicked() {
@@ -1702,48 +1743,37 @@ impl eframe::App for SupersawApp {
         });
 
         let mut project_action_decision = None;
-        if let Some(action) = self.pending_project_action {
-            let action_name = match action {
-                ProjectAction::New => "create a new project",
-                ProjectAction::Load => "load another project",
-            };
-            let modal_response =
-                egui::Modal::new(egui::Id::new("unsaved_changes")).show(ctx, |ui| {
-                    ui.heading("Unsaved changes");
-                    ui.label(format!("Save your changes before you {action_name}?"));
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            project_action_decision = Some(ProjectActionDecision::Save);
-                        }
-                        if ui.button("Discard").clicked() {
-                            project_action_decision = Some(ProjectActionDecision::Discard);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            project_action_decision = Some(ProjectActionDecision::Cancel);
-                        }
+        if self.file_dialog.is_none() {
+            if let Some(action) = self.pending_project_action {
+                let action_name = match action {
+                    ProjectAction::New => "create a new project",
+                    ProjectAction::Load => "load another project",
+                };
+                let modal_response =
+                    egui::Modal::new(egui::Id::new("unsaved_changes")).show(ctx, |ui| {
+                        ui.heading("Unsaved changes");
+                        ui.label(format!("Save your changes before you {action_name}?"));
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                project_action_decision = Some(ProjectActionDecision::Save);
+                            }
+                            if ui.button("Discard").clicked() {
+                                project_action_decision = Some(ProjectActionDecision::Discard);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                project_action_decision = Some(ProjectActionDecision::Cancel);
+                            }
+                        });
                     });
-                });
-            if modal_response.should_close() {
-                project_action_decision = Some(ProjectActionDecision::Cancel);
+                if modal_response.should_close() {
+                    project_action_decision = Some(ProjectActionDecision::Cancel);
+                }
             }
         }
 
         if let Some(decision) = project_action_decision {
             match decision {
-                ProjectActionDecision::Save => match self.save_project() {
-                    Ok(path) => {
-                        self.state
-                            .status
-                            .success(format!("Project saved to {}", path.display()));
-                        if let Some(action) = self.pending_project_action.take() {
-                            self.continue_project_action(action);
-                        }
-                    }
-                    Err(error) => self
-                        .state
-                        .status
-                        .error(format!("Failed to save project: {error}")),
-                },
+                ProjectActionDecision::Save => self.save_or_open_save_as(),
                 ProjectActionDecision::Discard => {
                     if let Some(action) = self.pending_project_action.take() {
                         self.continue_project_action(action);
@@ -1826,6 +1856,22 @@ impl eframe::App for SupersawApp {
                     // Handle pending MIDI connections from timeline
                     let pending_connections = self.timeline.take_pending_midi_connections();
                     for (track_id, device_name) in pending_connections {
+                        let requested_device =
+                            (!device_name.is_empty()).then_some(device_name.as_str());
+                        let current_device = self
+                            .state
+                            .project
+                            .tracks
+                            .iter()
+                            .find(|track| track.id == track_id)
+                            .and_then(|track| {
+                                let TrackType::Midi { device_name, .. } = &track.track_type;
+                                device_name.as_deref()
+                            });
+                        if current_device == requested_device {
+                            continue;
+                        }
+
                         if device_name.is_empty() {
                             // Disconnect - remove port from engine
                             if let Some(track) =
@@ -1923,24 +1969,81 @@ impl eframe::App for SupersawApp {
 
         // MIDI editor functionality is now integrated into the piano roll
 
+        if matches!(self.file_dialog, Some(FileDialog::SaveAsName)) {
+            let mut begin_folder_selection = false;
+            let mut cancel_save_as = false;
+            let modal_response =
+                egui::Modal::new(egui::Id::new("save_as_project")).show(ctx, |ui| {
+                    ui.heading("Save Project As");
+                    ui.label("Project name");
+                    let name_response = ui
+                        .push_id("save_as_project_name", |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.save_as_name)
+                                    .desired_width(260.0),
+                            )
+                        })
+                        .inner;
+                    if self.save_as_name_needs_focus {
+                        name_response.request_focus();
+                        self.save_as_name_needs_focus = false;
+                    }
+                    let submit_with_enter = name_response.has_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    ui.label(
+                        "Choose a parent folder; a new project folder will be created inside it.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Choose Folder...").clicked() || submit_with_enter {
+                            match Project::validate_name(&self.save_as_name) {
+                                Ok(name) => {
+                                    self.save_as_name = name;
+                                    begin_folder_selection = true;
+                                }
+                                Err(error) => self.state.status.error(error.to_string()),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_save_as = true;
+                        }
+                    });
+                });
+
+            if begin_folder_selection {
+                self.file_dialog = Some(FileDialog::SaveAsDirectory);
+            } else if cancel_save_as || modal_response.should_close() {
+                self.file_dialog = None;
+                self.pending_project_action = None;
+            }
+        }
+
         // Handle file dialogs
         if let Some(dialog_type) = self.file_dialog {
             match dialog_type {
-                // TODO: Implement dialog for naming the project
-                FileDialog::SaveProject => {
-                    match self.save_project() {
-                        Err(e) => {
-                            self.state
-                                .status
-                                .error(format!("Failed to save project: {e}"));
-                        }
-                        Ok(path) => {
-                            self.state.status.success("Project saved successfully");
-                            println!("Project saved to: {}", path.display());
-                        }
-                    }
-
+                FileDialog::SaveAsName => {}
+                FileDialog::SaveAsDirectory => {
                     self.file_dialog = None;
+                    self.pause_for_modal_dialog();
+                    if let Some(parent_dir) = rfd::FileDialog::new()
+                        .set_title("Choose Parent Folder for New Project")
+                        .pick_folder()
+                    {
+                        match self.state.project.save_as(&parent_dir, &self.save_as_name) {
+                            Ok(path) => {
+                                self.command_manager.mark_project_saved();
+                                self.report_project_saved(path);
+                            }
+                            Err(error) => {
+                                self.state
+                                    .status
+                                    .error(format!("Failed to save project: {error}"));
+                                self.save_as_name_needs_focus = true;
+                                self.file_dialog = Some(FileDialog::SaveAsName);
+                            }
+                        }
+                    } else {
+                        self.pending_project_action = None;
+                    }
                 }
                 FileDialog::LoadProject => {
                     self.pause_for_modal_dialog();

@@ -88,6 +88,12 @@ pub struct Project {
     pub tracks: Vec<Track>,
     #[serde(skip)]
     pub project_path: Option<PathBuf>,
+    /// Exact project document selected on load or created by Save As.
+    ///
+    /// This is runtime-only so a normal Save can preserve a loaded filename
+    /// even when it does not match the project's display name.
+    #[serde(skip)]
+    pub project_file_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,10 +249,129 @@ impl Project {
             ppq: 480,
             tracks: Vec::new(),
             project_path: None,
+            project_file_path: None,
         }
     }
 
+    /// Validate a user-facing project name before using it as a filesystem component.
+    pub fn validate_name(name: &str) -> Result<String, Box<dyn Error>> {
+        let name = name.trim();
+        if name.is_empty() || matches!(name, "." | "..") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Project name must not be empty, '.' or '..'",
+            )
+            .into());
+        }
+
+        if name.contains(['/', '\\'])
+            || name.chars().any(|character| {
+                character.is_control()
+                    || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+            })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Project name must be a single safe filename",
+            )
+            .into());
+        }
+
+        Ok(name.to_owned())
+    }
+
+    /// Save a project as a new, named directory directly under `parent_dir`.
+    ///
+    /// Existing destinations are rejected unless the exact project document is
+    /// already this project's current document, preventing Save As from
+    /// silently overwriting another project.
+    pub fn save_as(&mut self, parent_dir: &Path, name: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let name = Self::validate_name(name)?;
+        if self
+            .project_path
+            .as_deref()
+            .is_some_and(|current_dir| paths_match(current_dir, parent_dir))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Choose the folder containing the current project, not the project folder itself",
+            )
+            .into());
+        }
+        let project_dir = parent_dir.join(&name);
+        let project_file = project_dir.join(format!("{name}.supersaw"));
+        let is_current_destination = self
+            .project_file_path
+            .as_deref()
+            .is_some_and(|current_file| paths_match(current_file, &project_file));
+
+        let reserved_project_dir = if is_current_destination {
+            false
+        } else {
+            fs::create_dir_all(parent_dir)?;
+            match reserve_project_directory(&project_dir) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let destination = if project_file.exists() {
+                        format!("Project file already exists: {}", project_file.display())
+                    } else {
+                        format!(
+                            "Project directory already exists: {}",
+                            project_dir.display()
+                        )
+                    };
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        destination,
+                    )
+                    .into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        let previous_name = std::mem::replace(&mut self.name, name.clone());
+        let previous_project_path = self.project_path.clone();
+        let previous_project_file_path = self.project_file_path.clone();
+        self.project_path = Some(project_dir.clone());
+        self.project_file_path = Some(project_file);
+
+        match self.save(&project_dir) {
+            Ok(()) => Ok(project_dir),
+            Err(error) => {
+                self.name = previous_name;
+                self.project_path = previous_project_path;
+                self.project_file_path = previous_project_file_path;
+                if reserved_project_dir {
+                    let _ = fs::remove_dir_all(&project_dir);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Save to the directory associated with this project.
+    pub fn save_current(&mut self) -> Result<PathBuf, Box<dyn Error>> {
+        let project_dir = self.project_path.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Project has not been saved yet; use Save As",
+            )
+        })?;
+        self.save(&project_dir)?;
+        Ok(project_dir)
+    }
+
     pub fn save(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
+        let name = Self::validate_name(&self.name)?;
+        self.name = name.clone();
+        let project_file = self
+            .project_file_path
+            .as_ref()
+            .filter(|file_path| file_path.parent() == Some(path))
+            .cloned()
+            .unwrap_or_else(|| path.join(format!("{name}.supersaw")));
+
         // Create project directory if it doesn't exist
         fs::create_dir_all(path)?;
 
@@ -294,7 +419,6 @@ impl Project {
 
         // Save project file
         println!("Finalizing save...");
-        let project_file = path.join(format!("{}.supersaw", self.name));
         println!("Saving project to: {}", project_file.display());
 
         let json = serde_json::to_string_pretty(&project)
@@ -303,6 +427,7 @@ impl Project {
             .map_err(|e| format!("Failed to write project file: {}", e))?;
 
         self.project_path = Some(path.to_path_buf());
+        self.project_file_path = Some(project_file);
         println!("Project saved successfully.");
         Ok(())
     }
@@ -322,6 +447,7 @@ impl Project {
             }
         }
         project.project_path = Some(project_dir.to_path_buf());
+        project.project_file_path = Some(path.to_path_buf());
         println!("Project loaded successfully.");
         Ok(project)
     }
@@ -405,6 +531,19 @@ fn copy_midi_asset(source_path: &Path, target_path: &Path) -> Result<(), Box<dyn
     Ok(())
 }
 
+fn paths_match(left: &Path, right: &Path) -> bool {
+    left == right
+        || fs::canonicalize(left)
+            .ok()
+            .zip(fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+/// Atomically claim a fresh project directory for Save As.
+fn reserve_project_directory(project_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir(project_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +614,172 @@ mod tests {
 
         assert_eq!(input_device_name, None);
         assert_eq!(input_channel, None);
+        Ok(())
+    }
+
+    #[test]
+    fn project_names_are_single_safe_path_components() {
+        assert_eq!(
+            Project::validate_name("  Session One  ").unwrap(),
+            "Session One"
+        );
+
+        for invalid_name in [
+            "",
+            ".",
+            "..",
+            "nested/project",
+            "nested\\project",
+            "bad:name",
+        ] {
+            assert!(
+                Project::validate_name(invalid_name).is_err(),
+                "{invalid_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_as_uses_one_named_directory_and_normal_save_preserves_loaded_file_name(
+    ) -> Result<(), Box<dyn Error>> {
+        let parent_dir = std::env::temp_dir().join(format!("hypersaw-save-as-{}", Uuid::new_v4()));
+        fs::create_dir_all(&parent_dir)?;
+
+        let mut project = Project::new("Untitled".to_string());
+        let project_dir = project.save_as(&parent_dir, "First Session")?;
+        let project_file = project_dir.join("First Session.supersaw");
+        assert_eq!(project_dir, parent_dir.join("First Session"));
+        assert_eq!(project.project_path.as_deref(), Some(project_dir.as_path()));
+        assert_eq!(
+            project.project_file_path.as_deref(),
+            Some(project_file.as_path())
+        );
+        assert!(project_file.is_file());
+        assert!(!parent_dir
+            .join("First Session")
+            .join("First Session")
+            .exists());
+
+        let mut loaded = Project::load(&project_file)?;
+        loaded.name = "Renamed in memory".to_string();
+        assert_eq!(loaded.save_current()?, project_dir);
+        assert!(project_file.is_file());
+        assert!(!project_dir.join("Renamed in memory.supersaw").exists());
+
+        let alternate_project_file = project_dir.join("alternate.supersaw");
+        fs::copy(&project_file, &alternate_project_file)?;
+        let original_project_contents = fs::read(&project_file)?;
+        let mut alternate_project = Project::load(&alternate_project_file)?;
+        assert!(alternate_project
+            .save_as(&parent_dir, "First Session")
+            .is_err());
+        assert_eq!(fs::read(&project_file)?, original_project_contents);
+
+        let mut other_project = Project::new("Other".to_string());
+        assert!(other_project.save_as(&parent_dir, "First Session").is_err());
+        assert!(project.save_as(&project_dir, "Nested Session").is_err());
+        assert!(!project_dir.join("Nested Session").exists());
+
+        fs::remove_dir_all(parent_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_save_as_cleans_up_only_its_new_destination() -> Result<(), Box<dyn Error>> {
+        let parent_dir =
+            std::env::temp_dir().join(format!("hypersaw-save-failure-{}", Uuid::new_v4()));
+        fs::create_dir_all(&parent_dir)?;
+        let missing_source = parent_dir.join("missing-source.mid");
+        let mut project = Project::new("Untitled".to_string());
+        project.tracks.push(Track {
+            id: Uuid::new_v4().to_string(),
+            name: "Track 1".to_string(),
+            track_type: TrackType::Midi {
+                channel: 1,
+                device_name: None,
+                input_device_name: None,
+                input_channel: None,
+            },
+            clips: vec![Clip::Midi {
+                id: Uuid::new_v4().to_string(),
+                start_time: 0.0,
+                length: 1.0,
+                file_path: missing_source.clone(),
+                midi_data: None,
+                loaded: false,
+                automation_lanes: Vec::new(),
+            }],
+            is_muted: false,
+            is_soloed: false,
+            is_armed: false,
+            input_monitoring: false,
+            color: "#fde047".to_string(),
+            takes: Vec::new(),
+            active_take: None,
+        });
+
+        let preexisting_dir = parent_dir.join("Existing Session");
+        let marker_file = preexisting_dir.join("keep-me.txt");
+        fs::create_dir(&preexisting_dir)?;
+        fs::write(&marker_file, "preexisting project data")?;
+        assert!(project.save_as(&parent_dir, "Existing Session").is_err());
+        assert_eq!(
+            fs::read_to_string(&marker_file)?,
+            "preexisting project data"
+        );
+
+        assert!(project.save_as(&parent_dir, "Retry Session").is_err());
+        assert!(!parent_dir.join("Retry Session").exists());
+        assert!(parent_dir.is_dir());
+        assert!(project.project_path.is_none());
+        assert!(project.project_file_path.is_none());
+
+        let mut current_project = Project::new("Untitled".to_string());
+        let current_project_dir = current_project.save_as(&parent_dir, "Current Session")?;
+        let current_project_file = current_project_dir.join("Current Session.supersaw");
+        let original_contents = fs::read(&current_project_file)?;
+        current_project.tracks.push(Track {
+            id: Uuid::new_v4().to_string(),
+            name: "Track 1".to_string(),
+            track_type: TrackType::Midi {
+                channel: 1,
+                device_name: None,
+                input_device_name: None,
+                input_channel: None,
+            },
+            clips: vec![Clip::Midi {
+                id: Uuid::new_v4().to_string(),
+                start_time: 0.0,
+                length: 1.0,
+                file_path: missing_source,
+                midi_data: None,
+                loaded: false,
+                automation_lanes: Vec::new(),
+            }],
+            is_muted: false,
+            is_soloed: false,
+            is_armed: false,
+            input_monitoring: false,
+            color: "#fde047".to_string(),
+            takes: Vec::new(),
+            active_take: None,
+        });
+
+        assert!(current_project
+            .save_as(&parent_dir, "Current Session")
+            .is_err());
+        assert!(current_project_dir.is_dir());
+        assert_eq!(fs::read(&current_project_file)?, original_contents);
+        assert_eq!(
+            current_project.project_path.as_deref(),
+            Some(current_project_dir.as_path())
+        );
+        assert_eq!(
+            current_project.project_file_path.as_deref(),
+            Some(current_project_file.as_path())
+        );
+
+        fs::remove_dir_all(parent_dir)?;
         Ok(())
     }
 }

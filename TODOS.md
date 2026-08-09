@@ -8,17 +8,19 @@
 ## Current Status
 
 The arrangement, piano roll, MIDI playback, recording, automation lanes, takes, project
-persistence, and basic undo/redo are functional. The next milestone is not another editor
-surface; it is making recording and hardware I/O reliable enough for regular use.
+persistence, and bounded undo/redo are functional. Recording v1 and the first project/undo
+safety pass are complete; the next milestone is architecture and automated verification.
 
 Known constraints:
 
 - The MIDI engine and recorder use a hardcoded 44.1 kHz internal sample clock.
 - Playback scheduling is still coordinated by the egui application layer.
-- Undo covers note edits and track mute, but not most track, clip, take, automation, or tempo
-  mutations.
-- There are 67 unit tests, including deterministic recording-workflow and fake MIDI-output
-  coverage, but no CI or automated full-UI/project workflow tests.
+- Undo covers persistent command-driven track, clip, take, automation, input-routing, and tempo
+  mutations. Direct recording/import/output-routing commits create a safe history boundary until
+  those flows are moved behind commands.
+- There are 81 unit tests, including deterministic recording-workflow, project-safety,
+  command-history, and fake MIDI-output coverage, but no CI or automated full-UI/project workflow
+  tests.
 
 ## P0: Recording v1
 
@@ -57,8 +59,8 @@ Count-in elapsed time is independent of transport position so loop wrapping cann
 - [x] Store clip assets under stable, relative `midi/<clip-id>.mid` paths.
 - [x] Save empty clips and avoid duplicating MIDI assets on repeated saves.
 - [x] Warn before New or Load when the project is dirty.
-- [ ] Add project naming and Save As.
-- [ ] Save a loaded project back to its existing location by default.
+- [x] Add project naming and Save As.
+- [x] Save a loaded project back to its existing location by default.
 - [ ] Add recent-project handling.
 - [ ] Add autosave and crash recovery after Save/Save As semantics are settled.
 
@@ -66,9 +68,12 @@ Count-in elapsed time is independent of transport position so loop wrapping cann
 
 - [x] Undo/redo for note add, delete, move, resize, velocity, and track mute.
 - [x] Keyboard shortcuts and truthful Edit-menu enabled state.
-- [ ] Add undo data for destructive track, clip, take, automation, routing, and BPM changes.
-- [ ] Group a continuous drag or paint gesture into one undo entry.
-- [ ] Add command-level undo/redo regression tests.
+- [x] Add undo data for destructive track, clip, take, automation, input-routing/channel, and BPM
+  changes.
+- [ ] Route asynchronous MIDI output-device assignment through command history.
+- [ ] Group every continuous drag or paint gesture into one undo entry; automation-point drags
+  already coalesce.
+- [x] Add command-level undo/redo regression tests.
 - [ ] Add an undo history panel after command coverage and grouping are complete.
 
 ## P1: Architecture and Verification
@@ -154,6 +159,9 @@ Count-in elapsed time is independent of transport position so loop wrapping cann
 - MIDI timestamp conversion and coherent committed recording batches.
 - Active/muted take-aware playback.
 - Portable project MIDI assets and empty-clip saving.
+- Safe project naming, Save As, exact-document normal Save, and collision/failure handling.
+- Bounded destructive-operation undo with savepoints, runtime restoration, and automation-drag
+  coalescing.
 - egui focus, modal, drag, scrolling, snapping, and fixed-size transport control fixes.
 - Piano-roll paste/duplicate timing, full 0-127 pitch range, automation scrolling, and velocity
   editing.
