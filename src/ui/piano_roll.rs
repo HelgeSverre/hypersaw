@@ -389,8 +389,12 @@ impl PianoRoll {
             Vec::new()
         };
 
+        // Query focus before borrowing egui's input state. Calling
+        // `wants_keyboard_input` from inside `Ui::input` re-enters the same
+        // context lock and deadlocks as soon as the piano roll opens.
+        let wants_keyboard_input = ui.ctx().wants_keyboard_input();
         ui.input(|i| {
-            if ui.ctx().wants_keyboard_input() {
+            if wants_keyboard_input {
                 return;
             }
 
@@ -885,62 +889,22 @@ impl PianoRoll {
             StrokeKind::Outside,
         );
 
-        let response = ui.allocate_rect(key_rect, egui::Sense::click());
-
-        // Draw note name and MIDI number side by side
-        let note = note_number % 12;
-        let octave = (note_number / 12) - 1;
-        let note_names = [
-            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-        ];
-        let note_name = format!("{}{}", note_names[note as usize], octave);
-
-        // Always show labels for white keys, show black key labels on hover or when active
-        let show_label = if is_black {
-            response.hovered() || is_active
-        } else {
-            true
-        };
-
-        if show_label {
-            // Note name color
-            let note_color = if is_active {
+        // One octave marker per octave keeps the keyboard legible at the default
+        // row height. Rendering both a note name and MIDI number on every key made
+        // adjacent labels read as duplicates.
+        if !is_black && note_number % 12 == 0 {
+            let label = format!("C{}", midi_note_octave(note_number));
+            let label_color = if is_active {
                 egui::Color32::WHITE
-            } else if is_black {
-                egui::Color32::from_gray(200)
             } else {
                 egui::Color32::from_gray(40)
             };
-
-            // MIDI number color (fainter)
-            let midi_color = if is_active {
-                egui::Color32::from_gray(220)
-            } else if is_black {
-                egui::Color32::from_gray(160)
-            } else {
-                egui::Color32::from_gray(100)
-            };
-
-            let font_size = if is_black { 8.0 } else { 9.0 };
-
-            // Draw note name
-            let note_pos = egui::pos2(key_rect.center().x - 8.0, key_rect.center().y);
             ui.painter().text(
-                note_pos,
-                egui::Align2::RIGHT_CENTER,
-                &note_name,
-                FontId::monospace(font_size),
-                note_color,
-            );
-
-            // Draw MIDI number
-            let midi_pos = egui::pos2(key_rect.center().x + 8.0, key_rect.center().y);
-            ui.painter().text(
-                midi_pos,
+                key_rect.left_center() + egui::vec2(6.0, 0.0),
                 egui::Align2::LEFT_CENTER,
-                &note_number.to_string(),
-                FontId::monospace(font_size * 0.9),
-                midi_color,
+                label,
+                FontId::proportional(10.0),
+                label_color,
             );
         }
     }
@@ -1121,20 +1085,14 @@ impl PianoRoll {
         note_response: &egui::Response,
         all_notes: &[Note],
     ) {
-        let handle_width = 6.0; // Made wider for easier grabbing
+        const VISUAL_HANDLE_WIDTH: f32 = 2.0;
+        const HIT_HANDLE_WIDTH: f32 = 8.0;
         const DRAG_THRESHOLD: f32 = 3.0; // Pixels before resize starts
 
-        // Create resize handles
-        let left_handle = egui::Rect::from_min_size(
-            note_rect.left_top(),
-            egui::vec2(handle_width, note_rect.height()),
-        );
-        let right_handle = egui::Rect::from_min_size(
-            egui::pos2(note_rect.right() - handle_width, note_rect.top()),
-            egui::vec2(handle_width, note_rect.height()),
-        );
+        let (left_handle, right_handle) = note_resize_handle_rects(note_rect, VISUAL_HANDLE_WIDTH);
 
-        // Draw handles when note is hovered or selected
+        // Keep the handles visually subtle while accepting a wider edge strip from
+        // the note's single interaction response below.
         if note_response.hovered() || self.selected_notes.contains(&note.id) {
             ui.painter()
                 .rect_filled(left_handle, 0.0, ui.visuals().selection.stroke.color);
@@ -1142,20 +1100,18 @@ impl PianoRoll {
                 .rect_filled(right_handle, 0.0, ui.visuals().selection.stroke.color);
         }
 
-        // Handle resizing
-        let left_response = ui.allocate_rect(left_handle, egui::Sense::drag());
-        let right_response = ui.allocate_rect(right_handle, egui::Sense::drag());
+        if let (true, Some(pointer_position)) = (
+            note_response.drag_started(),
+            note_response.interact_pointer_pos(),
+        ) {
+            let Some(edge) = resize_edge_at(pointer_position.x, note_rect, HIT_HANDLE_WIDTH) else {
+                return;
+            };
 
-        if left_response.drag_started() || right_response.drag_started() {
             if !self.selected_notes.contains(&note.id) {
                 self.selected_notes.clear();
                 self.selected_notes.push(note.id.clone());
             }
-            let edge = if left_response.drag_started() {
-                ResizeEdge::Left
-            } else {
-                ResizeEdge::Right
-            };
             self.note_gesture = Some(NoteGesture::Resize {
                 initial_notes: all_notes
                     .iter()
@@ -1167,11 +1123,7 @@ impl PianoRoll {
             });
             self.dragging = Some(DragOperation::ResizingNotes {
                 edge,
-                start_x: if left_response.drag_started() {
-                    left_response.interact_pointer_pos().unwrap_or_default().x
-                } else {
-                    right_response.interact_pointer_pos().unwrap_or_default().x
-                },
+                start_x: pointer_position.x,
             });
         }
 
@@ -1221,7 +1173,9 @@ impl PianoRoll {
             }
         }
 
-        if left_response.drag_stopped() || right_response.drag_stopped() {
+        if note_response.drag_stopped()
+            && matches!(self.dragging, Some(DragOperation::ResizingNotes { .. }))
+        {
             if let Some(NoteGesture::Resize {
                 initial_notes,
                 edge,
@@ -1253,7 +1207,13 @@ impl PianoRoll {
         }
 
         // Update cursor
-        if left_response.hovered() || right_response.hovered() {
+        if note_response.hovered()
+            && ui
+                .input(|input| input.pointer.hover_pos())
+                .is_some_and(|pointer_position| {
+                    resize_edge_at(pointer_position.x, note_rect, HIT_HANDLE_WIDTH).is_some()
+                })
+        {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
         }
     }
@@ -1267,7 +1227,11 @@ impl PianoRoll {
         state: &DawState,
         all_notes: &[Note],
     ) {
-        let response = ui.allocate_rect(note_rect, egui::Sense::click_and_drag());
+        let response = ui.interact(
+            note_rect,
+            ui.id().with(("piano-note", &note.id)),
+            egui::Sense::click_and_drag(),
+        );
 
         // Handle selection
         if response.clicked() {
@@ -1600,16 +1564,6 @@ impl PianoRoll {
                 }
             }
         }
-    }
-
-    //todo move into utils/midi module
-    fn get_note_name(note_number: i32) -> String {
-        let note_names = [
-            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-        ];
-        let octave = (note_number / 12) - 1;
-        let note = note_number % 12;
-        format!("{}{}", note_names[note as usize], octave)
     }
 
     fn center_on_middle_c(&mut self, viewport_height: f32) {
@@ -2512,6 +2466,36 @@ fn resized_note_times(note: &Note, edge: ResizeEdge, delta: f64, min_duration: f
     }
 }
 
+fn note_resize_handle_rects(note_rect: egui::Rect, visual_width: f32) -> (egui::Rect, egui::Rect) {
+    let width = visual_width.min(note_rect.width() / 2.0);
+    let left =
+        egui::Rect::from_min_size(note_rect.left_top(), egui::vec2(width, note_rect.height()));
+    let right = egui::Rect::from_min_size(
+        egui::pos2(note_rect.right() - width, note_rect.top()),
+        egui::vec2(width, note_rect.height()),
+    );
+    (left, right)
+}
+
+fn midi_note_octave(note_number: u8) -> i16 {
+    i16::from(note_number) / 12 - 1
+}
+
+fn resize_edge_at(pointer_x: f32, note_rect: egui::Rect, hit_width: f32) -> Option<ResizeEdge> {
+    let left_distance = pointer_x - note_rect.left();
+    let right_distance = note_rect.right() - pointer_x;
+    let hits_left = (0.0..=hit_width).contains(&left_distance);
+    let hits_right = (0.0..=hit_width).contains(&right_distance);
+
+    match (hits_left, hits_right) {
+        (true, true) if left_distance <= right_distance => Some(ResizeEdge::Left),
+        (true, true) => Some(ResizeEdge::Right),
+        (true, false) => Some(ResizeEdge::Left),
+        (false, true) => Some(ResizeEdge::Right),
+        (false, false) => None,
+    }
+}
+
 fn apply_note_gesture_preview(note: &mut Note, gesture: &NoteGesture) {
     match gesture {
         NoteGesture::Move {
@@ -2675,6 +2659,45 @@ mod tests {
         let delta = calculate_clamped_resize_delta(&notes, -1.0, ResizeEdge::Right, 0.1);
 
         assert!((delta + 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn note_resize_handles_are_small_but_edge_hit_targets_remain_generous() {
+        let note_rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(30.0, 12.0));
+        let (left_handle, right_handle) = note_resize_handle_rects(note_rect, 2.0);
+
+        assert_eq!(left_handle.width(), 2.0);
+        assert_eq!(right_handle.width(), 2.0);
+        assert!(matches!(
+            resize_edge_at(17.5, note_rect, 8.0),
+            Some(ResizeEdge::Left)
+        ));
+        assert!(matches!(
+            resize_edge_at(32.5, note_rect, 8.0),
+            Some(ResizeEdge::Right)
+        ));
+        assert!(resize_edge_at(25.0, note_rect, 8.0).is_none());
+    }
+
+    #[test]
+    fn octave_labels_include_the_lowest_midi_octave_without_underflow() {
+        assert_eq!(midi_note_octave(0), -1);
+        assert_eq!(midi_note_octave(60), 4);
+        assert_eq!(midi_note_octave(127), 9);
+    }
+
+    #[test]
+    fn narrow_notes_choose_the_nearest_resize_edge() {
+        let note_rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(6.0, 12.0));
+
+        assert!(matches!(
+            resize_edge_at(11.0, note_rect, 8.0),
+            Some(ResizeEdge::Left)
+        ));
+        assert!(matches!(
+            resize_edge_at(15.0, note_rect, 8.0),
+            Some(ResizeEdge::Right)
+        ));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::core::{
     midi_channel_index, CommandManager, DawCommand, DawState, EditorView, MessageType,
-    MidiEngineCommand, MidiEventStore, MidiMessage, Project, RecordingMode,
+    MidiEngineCommand, MidiEventStore, MidiMessage, MidiOutputPortInfo, Project, RecordingMode,
     RecordingSessionContext, SnapMode, StatusMessage, Track, TrackType,
 };
 use crate::ui::piano_roll::PianoRoll;
@@ -8,7 +8,7 @@ use crate::ui::Timeline;
 use eframe::egui;
 use eframe::emath::Align;
 use egui::Key;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
@@ -18,7 +18,7 @@ const TRANSPORT_ICON_BUTTON_SIZE: egui::Vec2 = egui::Vec2::new(28.0, 28.0);
 pub struct SupersawApp {
     state: DawState,
     command_manager: CommandManager,
-    midi_output_ports: Vec<(String, usize)>,
+    midi_output_ports: Vec<MidiOutputPortInfo>,
     midi_input_ports: Vec<(String, usize)>,
     file_dialog: Option<FileDialog>,
     save_as_name: String,
@@ -27,6 +27,7 @@ pub struct SupersawApp {
     last_bpm_sent: Option<f64>,
     scheduled_through_beat: Option<f64>,
     pending_midi_routes: HashMap<String, Vec<String>>,
+    connected_midi_outputs: HashSet<String>,
 
     // Views
     timeline: Timeline,
@@ -52,6 +53,30 @@ enum ProjectActionDecision {
     Save,
     Discard,
     Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MidiRouteAction {
+    NoOp,
+    Disconnect,
+    RouteConnectedOutput,
+    QueueConnection,
+    QueueExistingConnection,
+}
+
+fn midi_route_action(
+    current_device: Option<&str>,
+    requested_device: Option<&str>,
+    output_is_connected: bool,
+    connection_is_pending: bool,
+) -> MidiRouteAction {
+    match requested_device {
+        None if current_device.is_none() => MidiRouteAction::NoOp,
+        None => MidiRouteAction::Disconnect,
+        Some(_) if output_is_connected => MidiRouteAction::RouteConnectedOutput,
+        Some(_) if connection_is_pending => MidiRouteAction::QueueExistingConnection,
+        Some(_) => MidiRouteAction::QueueConnection,
+    }
 }
 
 fn recorded_events_to_midi(
@@ -513,7 +538,7 @@ impl SupersawApp {
         timeline.update_midi_ports(
             self.midi_output_ports
                 .iter()
-                .map(|(name, _)| name.clone())
+                .map(|port| port.name.clone())
                 .collect(),
         );
         timeline.update_midi_input_ports(
@@ -571,7 +596,7 @@ impl SupersawApp {
             }
         }
     }
-    fn scan_midi_output_ports() -> Vec<(String, usize)> {
+    fn scan_midi_output_ports() -> Vec<MidiOutputPortInfo> {
         crate::core::MidiEngineHandle::scan_midi_output_ports()
     }
 
@@ -579,26 +604,20 @@ impl SupersawApp {
         crate::core::MidiEngineHandle::scan_midi_input_ports()
     }
 
-    fn connect_midi_output_port(
-        &mut self,
-        port_name: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Find the port index
-        if let Some((_, port_index)) = self
+    fn connect_midi_output_port(&self, port_name: &str) -> Result<(), String> {
+        let port = self
             .midi_output_ports
             .iter()
-            .find(|(name, _)| name == port_name)
-        {
-            if let Some(engine) = &self.state.midi_engine {
-                engine.lock().send_command(MidiEngineCommand::AddOutputPort(
-                    port_name.to_string(),
-                    *port_index,
-                ));
-                return Ok(());
-            }
-        }
+            .find(|port| port.name == port_name)
+            .cloned()
+            .ok_or_else(|| format!("MIDI output '{port_name}' was not found"))?;
+        let engine = self
+            .state
+            .midi_engine
+            .as_ref()
+            .ok_or_else(|| "MIDI engine is unavailable".to_string())?;
 
-        Err("MIDI port not found".into())
+        engine.lock().connect_output_port(&port)
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -609,7 +628,7 @@ impl SupersawApp {
         timeline.update_midi_ports(
             midi_output_ports
                 .iter()
-                .map(|(name, _)| name.clone())
+                .map(|port| port.name.clone())
                 .collect(),
         );
         timeline.update_midi_input_ports(
@@ -630,6 +649,7 @@ impl SupersawApp {
             last_bpm_sent: None,
             scheduled_through_beat: None,
             pending_midi_routes: HashMap::new(),
+            connected_midi_outputs: HashSet::new(),
             timeline,
             piano_roll: PianoRoll::default(),
             command_manager: CommandManager::default(),
@@ -1127,7 +1147,7 @@ impl SupersawApp {
                             self.timeline.update_midi_ports(
                                 self.midi_output_ports
                                     .iter()
-                                    .map(|(name, _)| name.clone())
+                                    .map(|port| port.name.clone())
                                     .collect(),
                             );
                             self.timeline.update_midi_input_ports(
@@ -1451,8 +1471,10 @@ impl eframe::App for SupersawApp {
                             let _ = sender.try_send((port_id, midi_message, timestamp));
                         }
                     }
-                    crate::core::MidiEngineMessage::PortStatusChanged(port_name, true) => {
+                    crate::core::MidiEngineMessage::OutputPortStatusChanged(port_name, true) => {
+                        self.connected_midi_outputs.insert(port_name.clone());
                         if let Some(track_ids) = self.pending_midi_routes.remove(&port_name) {
+                            let mut outputs_to_remove = HashSet::new();
                             for track_id in track_ids {
                                 if let Some(track) = self
                                     .state
@@ -1462,26 +1484,42 @@ impl eframe::App for SupersawApp {
                                     .find(|track| track.id == track_id)
                                 {
                                     let TrackType::Midi { device_name, .. } = &mut track.track_type;
-                                    *device_name = Some(port_name.clone());
-                                    self.command_manager.mark_project_dirty();
+                                    if device_name.as_deref() != Some(port_name.as_str()) {
+                                        if let Some(previous_output) =
+                                            device_name.replace(port_name.clone())
+                                        {
+                                            outputs_to_remove.insert(previous_output);
+                                        }
+                                        self.command_manager.mark_project_dirty();
+                                    }
                                 }
                                 engine.send_command(MidiEngineCommand::SetPortRouting(
                                     track_id,
                                     port_name.clone(),
                                 ));
                             }
+                            for old_output in outputs_to_remove {
+                                let still_in_use = self.state.project.tracks.iter().any(|track| {
+                                    matches!(
+                                        &track.track_type,
+                                        TrackType::Midi { device_name: Some(name), .. }
+                                            if name == &old_output
+                                    )
+                                });
+                                if !still_in_use {
+                                    engine.send_command(MidiEngineCommand::RemoveOutputPort(
+                                        old_output,
+                                    ));
+                                }
+                            }
                             self.state
                                 .status
                                 .success(format!("Connected to MIDI port: {port_name}"));
                         }
                     }
-                    crate::core::MidiEngineMessage::PortConnectionFailed(port_name, error) => {
-                        self.pending_midi_routes.remove(&port_name);
-                        self.state.status.error(format!(
-                            "Failed to connect to MIDI port {port_name}: {error}"
-                        ));
+                    crate::core::MidiEngineMessage::OutputPortStatusChanged(port_name, false) => {
+                        self.connected_midi_outputs.remove(&port_name);
                     }
-                    _ => {} // Handle other messages as needed
                 }
             }
         }
@@ -1810,7 +1848,7 @@ impl eframe::App for SupersawApp {
         self.timeline.update_midi_ports(
             self.midi_output_ports
                 .iter()
-                .map(|(name, _)| name.clone())
+                .map(|port| port.name.clone())
                 .collect(),
         );
 
@@ -1866,32 +1904,31 @@ impl eframe::App for SupersawApp {
                             .find(|track| track.id == track_id)
                             .and_then(|track| {
                                 let TrackType::Midi { device_name, .. } = &track.track_type;
-                                device_name.as_deref()
+                                device_name.clone()
                             });
-                        if current_device == requested_device {
-                            continue;
-                        }
+                        let route_action = midi_route_action(
+                            current_device.as_deref(),
+                            requested_device,
+                            requested_device
+                                .is_some_and(|name| self.connected_midi_outputs.contains(name)),
+                            requested_device
+                                .is_some_and(|name| self.pending_midi_routes.contains_key(name)),
+                        );
 
-                        if device_name.is_empty() {
-                            // Disconnect - remove port from engine
-                            if let Some(track) =
-                                self.state.project.tracks.iter().find(|t| t.id == track_id)
-                            {
-                                let TrackType::Midi {
-                                    device_name: current_device,
-                                    ..
-                                } = &track.track_type;
-                                if let Some(current) = current_device {
-                                    if let Some(engine) = &self.state.midi_engine {
-                                        let used_by_another_track =
+                        match route_action {
+                            MidiRouteAction::NoOp => {}
+                            MidiRouteAction::Disconnect => {
+                                if let Some(current_device) = current_device.as_deref() {
+                                    let used_by_another_track =
                                         self.state.project.tracks.iter().any(|other| {
                                             other.id != track_id
                                                 && matches!(
                                                     &other.track_type,
                                                     TrackType::Midi { device_name: Some(name), .. }
-                                                        if name == current
+                                                        if name == current_device
                                                 )
                                         });
+                                    if let Some(engine) = &self.state.midi_engine {
                                         let engine = engine.lock();
                                         engine.send_command(MidiEngineCommand::ClearPortRouting(
                                             track_id.clone(),
@@ -1899,48 +1936,94 @@ impl eframe::App for SupersawApp {
                                         if !used_by_another_track {
                                             engine.send_command(
                                                 MidiEngineCommand::RemoveOutputPort(
-                                                    current.clone(),
+                                                    current_device.to_string(),
                                                 ),
                                             );
                                         }
                                     }
                                 }
-                            }
 
-                            self.state
-                                .status
-                                .info("MIDI output disconnected".to_string());
-
-                            // Update track device name
-                            if let Some(track) = self
-                                .state
-                                .project
-                                .tracks
-                                .iter_mut()
-                                .find(|t| t.id == track_id)
-                            {
-                                let TrackType::Midi {
-                                    device_name: dev_name,
-                                    ..
-                                } = &mut track.track_type;
-                                *dev_name = None;
-                                self.command_manager.mark_project_dirty();
+                                if let Some(track) = self
+                                    .state
+                                    .project
+                                    .tracks
+                                    .iter_mut()
+                                    .find(|track| track.id == track_id)
+                                {
+                                    let TrackType::Midi { device_name, .. } = &mut track.track_type;
+                                    if device_name.take().is_some() {
+                                        self.command_manager.mark_project_dirty();
+                                    }
+                                }
+                                self.state.status.info("MIDI output disconnected");
                             }
-                        } else {
-                            // Connect to the port
-                            self.pending_midi_routes
-                                .entry(device_name.clone())
-                                .or_default()
-                                .push(track_id.clone());
-                            if let Err(e) = self.connect_midi_output_port(&device_name) {
-                                self.pending_midi_routes.remove(&device_name);
-                                self.state
-                                    .status
-                                    .error(format!("Failed to connect to MIDI port: {}", e));
-                            } else {
-                                self.state
-                                    .status
-                                    .info(format!("Connecting to MIDI port: {device_name}"));
+                            MidiRouteAction::RouteConnectedOutput => {
+                                let Some(requested_device) = requested_device else {
+                                    continue;
+                                };
+                                let previous_output = self
+                                    .state
+                                    .project
+                                    .tracks
+                                    .iter_mut()
+                                    .find(|track| track.id == track_id)
+                                    .and_then(|track| {
+                                        let TrackType::Midi { device_name, .. } = &mut track.track_type;
+                                        if device_name.as_deref() == Some(requested_device) {
+                                            None
+                                        } else {
+                                            let previous = device_name.replace(requested_device.to_string());
+                                            self.command_manager.mark_project_dirty();
+                                            previous
+                                        }
+                                    });
+                                if let Some(engine) = &self.state.midi_engine {
+                                    let engine = engine.lock();
+                                    engine.send_command(MidiEngineCommand::SetPortRouting(
+                                        track_id.clone(),
+                                        requested_device.to_string(),
+                                    ));
+                                    if let Some(previous_output) = previous_output {
+                                        let still_in_use = self.state.project.tracks.iter().any(|track| {
+                                            matches!(
+                                                &track.track_type,
+                                                TrackType::Midi { device_name: Some(name), .. }
+                                                    if name == &previous_output
+                                            )
+                                        });
+                                        if !still_in_use {
+                                            engine.send_command(MidiEngineCommand::RemoveOutputPort(
+                                                previous_output,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            MidiRouteAction::QueueConnection
+                            | MidiRouteAction::QueueExistingConnection => {
+                                let Some(requested_device) = requested_device else {
+                                    continue;
+                                };
+                                let routes = self
+                                    .pending_midi_routes
+                                    .entry(requested_device.to_string())
+                                    .or_default();
+                                if !routes.contains(&track_id) {
+                                    routes.push(track_id.clone());
+                                }
+
+                                if route_action == MidiRouteAction::QueueConnection {
+                                    if let Err(error) = self.connect_midi_output_port(requested_device) {
+                                        self.pending_midi_routes.remove(requested_device);
+                                        self.state.status.error(format!(
+                                            "Failed to connect to MIDI port {requested_device}: {error}"
+                                        ));
+                                    } else {
+                                        self.state
+                                            .status
+                                            .info(format!("Connecting to MIDI port: {requested_device}"));
+                                    }
+                                }
                             }
                         }
                     }
@@ -2635,5 +2718,33 @@ mod tests {
         let note = store.get_notes().next().unwrap();
         assert_eq!(note.start_time, 1.0);
         assert_eq!(note.duration, 1.0);
+    }
+
+    #[test]
+    fn loaded_route_is_reconnected_when_its_persisted_name_is_not_live() {
+        assert_eq!(
+            midi_route_action(Some("External MIDI"), Some("External MIDI"), false, false),
+            MidiRouteAction::QueueConnection
+        );
+        assert_eq!(
+            midi_route_action(Some("External MIDI"), Some("External MIDI"), false, true),
+            MidiRouteAction::QueueExistingConnection
+        );
+    }
+
+    #[test]
+    fn routing_uses_live_connection_state_and_keeps_disconnect_noops_quiet() {
+        assert_eq!(
+            midi_route_action(None, Some("External MIDI"), true, false),
+            MidiRouteAction::RouteConnectedOutput
+        );
+        assert_eq!(
+            midi_route_action(None, None, false, false),
+            MidiRouteAction::NoOp
+        );
+        assert_eq!(
+            midi_route_action(Some("External MIDI"), None, false, false),
+            MidiRouteAction::Disconnect
+        );
     }
 }

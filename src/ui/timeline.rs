@@ -8,6 +8,44 @@ use eframe::epaint::StrokeKind;
 
 const ADD_TRACK_AREA_HEIGHT: f32 = 50.0;
 const TAKE_ACTION_BUTTON_SIZE: egui::Vec2 = egui::vec2(18.0, 18.0);
+const DEFAULT_TIMELINE_NUDGE_SECONDS: f64 = 1.0;
+const LOOP_MARKER_HEIGHT: f32 = 12.0;
+const LOOP_HANDLE_HIT_RADIUS: f32 = 6.0;
+const MIN_LOOP_LENGTH: f64 = 0.1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineSeekDirection {
+    Backward,
+    Forward,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackSelectionDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineKeyboardAction {
+    SeekStart,
+    Seek(TimelineSeekDirection),
+    SelectTrack(TrackSelectionDirection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopDragTarget {
+    Start,
+    End,
+    Region,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoopDrag {
+    target: LoopDragTarget,
+    initial_start: f64,
+    initial_end: f64,
+    start_x: f32,
+}
 
 pub struct Timeline {
     pixels_per_second: f32,
@@ -36,6 +74,7 @@ pub struct Timeline {
     editing_take_name: Option<(String, String, String)>, // (track_id, take_id, current_text)
     take_name_needs_focus: bool,
     playback_schedule_dirty: bool,
+    loop_drag: Option<LoopDrag>,
 }
 
 impl Default for Timeline {
@@ -62,6 +101,7 @@ impl Default for Timeline {
             editing_take_name: None,
             take_name_needs_focus: false,
             playback_schedule_dirty: false,
+            loop_drag: None,
         }
     }
 }
@@ -184,6 +224,7 @@ impl Timeline {
         self.handle_file_drops(ui, state);
         self.handle_delete_clip(ui, state);
         self.handle_escape_key(ui);
+        self.handle_timeline_keyboard_navigation(ui, state);
 
         // Draw components
         self.draw_track_headers(ui, header_rect, state);
@@ -444,97 +485,190 @@ impl Timeline {
         }
     }
 
+    fn handle_timeline_keyboard_navigation(&mut self, ui: &egui::Ui, state: &DawState) {
+        if self.editing_track_name.is_some()
+            || self.editing_take_name.is_some()
+            || ui.ctx().wants_keyboard_input()
+        {
+            return;
+        }
+
+        // Consume at most one shortcut per frame. This keeps an event from being
+        // handled again by another timeline interaction and lets egui's native
+        // key-repeat behavior provide predictable repeated nudges while a key is held.
+        let action = ui.ctx().input_mut(|input| {
+            let modifiers = input.modifiers;
+            if modifiers.command || modifiers.ctrl || modifiers.alt {
+                return None;
+            }
+
+            if input.consume_key(modifiers, egui::Key::Home) {
+                Some(TimelineKeyboardAction::SeekStart)
+            } else if input.consume_key(modifiers, egui::Key::ArrowLeft) {
+                Some(TimelineKeyboardAction::Seek(
+                    TimelineSeekDirection::Backward,
+                ))
+            } else if input.consume_key(modifiers, egui::Key::ArrowRight) {
+                Some(TimelineKeyboardAction::Seek(TimelineSeekDirection::Forward))
+            } else if input.consume_key(modifiers, egui::Key::ArrowUp) {
+                Some(TimelineKeyboardAction::SelectTrack(
+                    TrackSelectionDirection::Previous,
+                ))
+            } else if input.consume_key(modifiers, egui::Key::ArrowDown) {
+                Some(TimelineKeyboardAction::SelectTrack(
+                    TrackSelectionDirection::Next,
+                ))
+            } else {
+                None
+            }
+        });
+
+        match action {
+            Some(TimelineKeyboardAction::SeekStart) => {
+                self.command_collector
+                    .add_command(DawCommand::SeekTime { time: 0.0 });
+            }
+            Some(TimelineKeyboardAction::Seek(direction)) => {
+                self.command_collector.add_command(DawCommand::SeekTime {
+                    time: timeline_nudge_time(
+                        state.current_time,
+                        state.project.bpm,
+                        state.snap_mode,
+                        direction,
+                    ),
+                });
+            }
+            Some(TimelineKeyboardAction::SelectTrack(direction)) => {
+                let track_ids: Vec<_> = state
+                    .project
+                    .tracks
+                    .iter()
+                    .map(|track| track.id.clone())
+                    .collect();
+                if let Some(track_id) =
+                    adjacent_track_id(&track_ids, state.selected_track.as_deref(), direction)
+                {
+                    self.command_collector
+                        .add_command(DawCommand::SelectTrack { track_id });
+                }
+            }
+            None => {}
+        }
+    }
+
     fn handle_loop_region(&mut self, ui: &mut egui::Ui, rect: egui::Rect, state: &mut DawState) {
-        if state.loop_enabled {
-            let loop_start_x =
-                rect.left() + state.loop_start as f32 * self.pixels_per_second - self.scroll_offset;
-            let loop_end_x =
-                rect.left() + state.loop_end as f32 * self.pixels_per_second - self.scroll_offset;
+        if !state.loop_enabled {
+            self.loop_drag = None;
+            return;
+        }
 
-            let loop_rect = egui::Rect::from_min_max(
-                egui::pos2(loop_start_x, rect.top()),
-                egui::pos2(loop_end_x, rect.bottom()),
-            );
+        let loop_start_x =
+            rect.left() + state.loop_start as f32 * self.pixels_per_second - self.scroll_offset;
+        let loop_end_x =
+            rect.left() + state.loop_end as f32 * self.pixels_per_second - self.scroll_offset;
+        let loop_rect = egui::Rect::from_min_max(
+            egui::pos2(loop_start_x, rect.top()),
+            egui::pos2(loop_end_x, rect.bottom()),
+        );
+        let marker_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top()),
+            egui::pos2(rect.right(), rect.top() + LOOP_MARKER_HEIGHT),
+        );
+        let interaction_rect = loop_rect.intersect(marker_rect);
 
-            ui.painter().rect_filled(
-                loop_rect,
-                0.0,
-                ui.visuals().selection.bg_fill.linear_multiply(0.2),
-            );
+        ui.painter().rect_filled(
+            loop_rect,
+            0.0,
+            ui.visuals().selection.bg_fill.linear_multiply(0.2),
+        );
+        ui.painter().rect_filled(
+            interaction_rect,
+            0.0,
+            ui.visuals().selection.bg_fill.linear_multiply(0.35),
+        );
 
-            let marker_height = 10.0;
-            let marker_width = 2.0;
-
+        let marker_width = 2.0;
+        for marker_x in [loop_start_x, loop_end_x] {
             ui.painter().rect_filled(
                 egui::Rect::from_min_max(
-                    egui::pos2(loop_start_x - marker_width / 2.0, rect.top()),
+                    egui::pos2(marker_x - marker_width / 2.0, rect.top()),
                     egui::pos2(
-                        loop_start_x + marker_width / 2.0,
-                        rect.top() + marker_height,
+                        marker_x + marker_width / 2.0,
+                        rect.top() + LOOP_MARKER_HEIGHT,
                     ),
                 ),
                 0.0,
                 ui.visuals().selection.stroke.color,
             );
+        }
 
-            ui.painter().rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(loop_end_x - marker_width / 2.0, rect.top()),
-                    egui::pos2(loop_end_x + marker_width / 2.0, rect.top() + marker_height),
+        if !interaction_rect.is_positive() {
+            return;
+        }
+
+        // One stable ID owns the entire loop marker. Splitting the marker into
+        // overlapping body/start/end responses made handle ownership frame-order
+        // dependent in egui.
+        let response = ui.interact(
+            interaction_rect,
+            ui.id().with("loop-region"),
+            egui::Sense::drag(),
+        );
+
+        if let (true, Some(pointer_position)) =
+            (response.drag_started(), response.interact_pointer_pos())
+        {
+            self.loop_drag = Some(LoopDrag {
+                target: loop_drag_target(
+                    pointer_position.x,
+                    loop_start_x,
+                    loop_end_x,
+                    LOOP_HANDLE_HIT_RADIUS,
                 ),
-                0.0,
-                ui.visuals().selection.stroke.color,
-            );
+                initial_start: state.loop_start,
+                initial_end: state.loop_end,
+                start_x: pointer_position.x,
+            });
+        }
 
-            let start_handle = egui::Rect::from_min_max(
-                egui::pos2(loop_start_x - 5.0, rect.top()),
-                egui::pos2(loop_start_x + 5.0, rect.top() + marker_height),
-            );
-            let end_handle = egui::Rect::from_min_max(
-                egui::pos2(loop_end_x - 5.0, rect.top()),
-                egui::pos2(loop_end_x + 5.0, rect.top() + marker_height),
-            );
+        if let Some(loop_drag) = self.loop_drag {
+            if let (true, Some(pointer_position)) =
+                (response.dragged(), response.interact_pointer_pos())
+            {
+                let drag_delta =
+                    f64::from((pointer_position.x - loop_drag.start_x) / self.pixels_per_second);
+                (state.loop_start, state.loop_end) = loop_bounds_after_drag(
+                    loop_drag,
+                    drag_delta,
+                    self.snap_enabled,
+                    state.project.bpm,
+                    state.snap_mode,
+                );
+            }
 
-            let start_response = ui.allocate_rect(start_handle, egui::Sense::drag());
-            let end_response = ui.allocate_rect(end_handle, egui::Sense::drag());
+            if response.drag_stopped() {
+                self.loop_drag = None;
+            }
+        }
 
-            // Handle start handle dragging
-            if start_response.dragged() {
-                let delta = start_response.drag_delta().x / self.pixels_per_second;
-
-                let new_start_snap = if self.snap_enabled {
-                    TimeUtils::snap_time(
-                        (state.loop_start + delta as f64).max(0.0),
-                        state.project.bpm,
-                        state.snap_mode,
+        if response.hovered() {
+            let target = ui
+                .input(|input| input.pointer.hover_pos())
+                .map(|pointer_position| {
+                    loop_drag_target(
+                        pointer_position.x,
+                        loop_start_x,
+                        loop_end_x,
+                        LOOP_HANDLE_HIT_RADIUS,
                     )
+                });
+            ui.output_mut(|output| {
+                output.cursor_icon = if matches!(target, Some(LoopDragTarget::Region)) {
+                    egui::CursorIcon::Grab
                 } else {
-                    (state.loop_start + delta as f64).max(0.0)
+                    egui::CursorIcon::ResizeHorizontal
                 };
-
-                state.loop_start = new_start_snap;
-            }
-
-            // Handle end handle dragging
-            if end_response.dragged() {
-                let delta = end_response.drag_delta().x / self.pixels_per_second;
-                let new_end_snap = if self.snap_enabled {
-                    TimeUtils::snap_time(
-                        (state.loop_end + delta as f64).max(state.loop_start + 0.1),
-                        state.project.bpm,
-                        state.snap_mode,
-                    )
-                } else {
-                    (state.loop_end + delta as f64).max(state.loop_start + 0.1)
-                };
-
-                state.loop_end = new_end_snap;
-            }
-
-            // Show cursor change when hovering over loop handles
-            if start_response.hovered() || end_response.hovered() {
-                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
-            }
+            });
         }
     }
 
@@ -2242,10 +2376,117 @@ fn vertical_scroll_limit(track_count: usize, track_height: f32, viewport_height:
     (content_height - viewport_height).max(0.0)
 }
 
+fn timeline_nudge_time(
+    current_time: f64,
+    bpm: f64,
+    snap_mode: SnapMode,
+    direction: TimelineSeekDirection,
+) -> f64 {
+    let current_time = current_time.max(0.0);
+    let snap_division = snap_mode.get_division(bpm);
+
+    if snap_division.is_finite() && snap_division > 0.0 {
+        let grid_position = current_time / snap_division;
+        return match direction {
+            TimelineSeekDirection::Backward => {
+                ((grid_position.ceil() - 1.0) * snap_division).max(0.0)
+            }
+            TimelineSeekDirection::Forward => (grid_position.floor() + 1.0) * snap_division,
+        };
+    }
+
+    let fallback_step = if bpm.is_finite() && bpm > 0.0 {
+        60.0 / bpm
+    } else {
+        DEFAULT_TIMELINE_NUDGE_SECONDS
+    };
+
+    match direction {
+        TimelineSeekDirection::Backward => (current_time - fallback_step).max(0.0),
+        TimelineSeekDirection::Forward => current_time + fallback_step,
+    }
+}
+
+fn adjacent_track_id(
+    track_ids: &[String],
+    selected_track: Option<&str>,
+    direction: TrackSelectionDirection,
+) -> Option<String> {
+    let selected_index = selected_track
+        .and_then(|selected_track| track_ids.iter().position(|id| id == selected_track));
+
+    match (selected_index, direction) {
+        (Some(index), TrackSelectionDirection::Previous) => index
+            .checked_sub(1)
+            .and_then(|index| track_ids.get(index))
+            .cloned(),
+        (Some(index), TrackSelectionDirection::Next) => track_ids.get(index + 1).cloned(),
+        (None, TrackSelectionDirection::Previous) => track_ids.last().cloned(),
+        (None, TrackSelectionDirection::Next) => track_ids.first().cloned(),
+    }
+}
+
+fn loop_drag_target(
+    pointer_x: f32,
+    loop_start_x: f32,
+    loop_end_x: f32,
+    handle_hit_radius: f32,
+) -> LoopDragTarget {
+    let start_distance = (pointer_x - loop_start_x).abs();
+    let end_distance = (pointer_x - loop_end_x).abs();
+
+    if start_distance <= handle_hit_radius && start_distance <= end_distance {
+        LoopDragTarget::Start
+    } else if end_distance <= handle_hit_radius {
+        LoopDragTarget::End
+    } else {
+        LoopDragTarget::Region
+    }
+}
+
+fn loop_bounds_after_drag(
+    loop_drag: LoopDrag,
+    drag_delta: f64,
+    snap_enabled: bool,
+    bpm: f64,
+    snap_mode: SnapMode,
+) -> (f64, f64) {
+    let initial_start = loop_drag.initial_start.max(0.0);
+    let initial_end = loop_drag.initial_end.max(initial_start + MIN_LOOP_LENGTH);
+    let snap_time = |time: f64| {
+        let time = time.max(0.0);
+        if snap_enabled {
+            TimeUtils::snap_time(time, bpm, snap_mode).max(0.0)
+        } else {
+            time
+        }
+    };
+
+    match loop_drag.target {
+        LoopDragTarget::Start => (
+            snap_time(initial_start + drag_delta).min(initial_end - MIN_LOOP_LENGTH),
+            initial_end,
+        ),
+        LoopDragTarget::End => (
+            initial_start,
+            snap_time(initial_end + drag_delta).max(initial_start + MIN_LOOP_LENGTH),
+        ),
+        LoopDragTarget::Region => {
+            let length = initial_end - initial_start;
+            let start = snap_time(initial_start + drag_delta);
+            (start, start + length)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{active_take, take_display_label, vertical_scroll_limit};
-    use crate::core::Take;
+    use super::{
+        active_take, adjacent_track_id, loop_bounds_after_drag, loop_drag_target,
+        take_display_label, timeline_nudge_time, vertical_scroll_limit, LoopDrag, LoopDragTarget,
+        TimelineSeekDirection, TrackSelectionDirection, MIN_LOOP_LENGTH,
+    };
+    use crate::core::{SnapMode, Take};
 
     fn take(id: &str, name: &str, is_muted: bool) -> Take {
         Take {
@@ -2296,6 +2537,146 @@ mod tests {
         assert_eq!(
             take_display_label(&take("take-2", "Chorus", true)),
             "Chorus (muted)"
+        );
+    }
+
+    #[test]
+    fn loop_handles_win_over_the_region_and_choose_the_nearest_edge() {
+        assert_eq!(
+            loop_drag_target(101.0, 100.0, 140.0, 6.0),
+            LoopDragTarget::Start
+        );
+        assert_eq!(
+            loop_drag_target(139.0, 100.0, 140.0, 6.0),
+            LoopDragTarget::End
+        );
+        assert_eq!(
+            loop_drag_target(120.0, 100.0, 140.0, 6.0),
+            LoopDragTarget::Region
+        );
+        assert_eq!(
+            loop_drag_target(104.0, 100.0, 106.0, 6.0),
+            LoopDragTarget::End
+        );
+    }
+
+    #[test]
+    fn loop_edge_drags_keep_a_positive_length_and_zero_boundary() {
+        let start_drag = LoopDrag {
+            target: LoopDragTarget::Start,
+            initial_start: 1.0,
+            initial_end: 2.0,
+            start_x: 0.0,
+        };
+        let end_drag = LoopDrag {
+            target: LoopDragTarget::End,
+            initial_start: 1.0,
+            initial_end: 2.0,
+            start_x: 0.0,
+        };
+
+        assert_eq!(
+            loop_bounds_after_drag(start_drag, 10.0, false, 120.0, SnapMode::Beat),
+            (2.0 - MIN_LOOP_LENGTH, 2.0)
+        );
+        assert_eq!(
+            loop_bounds_after_drag(end_drag, -10.0, false, 120.0, SnapMode::Beat),
+            (1.0, 1.0 + MIN_LOOP_LENGTH)
+        );
+        assert_eq!(
+            loop_bounds_after_drag(start_drag, -10.0, false, 120.0, SnapMode::Beat),
+            (0.0, 2.0)
+        );
+    }
+
+    #[test]
+    fn loop_region_drag_uses_initial_bounds_and_snaps_without_accumulating() {
+        let drag = LoopDrag {
+            target: LoopDragTarget::Region,
+            initial_start: 1.0,
+            initial_end: 2.5,
+            start_x: 0.0,
+        };
+
+        assert_eq!(
+            loop_bounds_after_drag(drag, 0.26, true, 120.0, SnapMode::Beat),
+            (1.5, 3.0)
+        );
+        assert_eq!(
+            loop_bounds_after_drag(drag, -10.0, true, 120.0, SnapMode::Beat),
+            (0.0, 1.5)
+        );
+    }
+
+    #[test]
+    fn timeline_nudges_to_the_next_or_previous_snap_boundary() {
+        assert_eq!(
+            timeline_nudge_time(0.49, 120.0, SnapMode::Beat, TimelineSeekDirection::Forward),
+            0.5
+        );
+        assert_eq!(
+            timeline_nudge_time(0.49, 120.0, SnapMode::Beat, TimelineSeekDirection::Backward),
+            0.0
+        );
+        assert_eq!(
+            timeline_nudge_time(0.5, 120.0, SnapMode::Beat, TimelineSeekDirection::Forward),
+            1.0
+        );
+        assert_eq!(
+            timeline_nudge_time(0.0, 120.0, SnapMode::Beat, TimelineSeekDirection::Backward),
+            0.0
+        );
+    }
+
+    #[test]
+    fn timeline_nudge_without_snap_uses_one_beat_and_never_seeks_negative() {
+        assert_eq!(
+            timeline_nudge_time(0.75, 120.0, SnapMode::None, TimelineSeekDirection::Forward),
+            1.25
+        );
+        assert_eq!(
+            timeline_nudge_time(0.25, 120.0, SnapMode::None, TimelineSeekDirection::Backward),
+            0.0
+        );
+    }
+
+    #[test]
+    fn adjacent_track_navigation_respects_selection_and_boundaries() {
+        let track_ids = vec!["drums".to_owned(), "bass".to_owned(), "lead".to_owned()];
+
+        assert_eq!(
+            adjacent_track_id(&track_ids, Some("bass"), TrackSelectionDirection::Previous),
+            Some("drums".to_owned())
+        );
+        assert_eq!(
+            adjacent_track_id(&track_ids, Some("bass"), TrackSelectionDirection::Next),
+            Some("lead".to_owned())
+        );
+        assert_eq!(
+            adjacent_track_id(&track_ids, Some("drums"), TrackSelectionDirection::Previous),
+            None
+        );
+        assert_eq!(
+            adjacent_track_id(&track_ids, Some("lead"), TrackSelectionDirection::Next),
+            None
+        );
+    }
+
+    #[test]
+    fn adjacent_track_navigation_chooses_an_endpoint_without_a_selection() {
+        let track_ids = vec!["drums".to_owned(), "bass".to_owned()];
+
+        assert_eq!(
+            adjacent_track_id(&track_ids, None, TrackSelectionDirection::Previous),
+            Some("bass".to_owned())
+        );
+        assert_eq!(
+            adjacent_track_id(&track_ids, None, TrackSelectionDirection::Next),
+            Some("drums".to_owned())
+        );
+        assert_eq!(
+            adjacent_track_id(&[], None, TrackSelectionDirection::Next),
+            None
         );
     }
 }

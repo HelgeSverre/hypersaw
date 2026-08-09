@@ -6,7 +6,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam::channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
 
 use crate::core::MidiMessage;
@@ -29,7 +29,6 @@ pub enum MidiEngineCommand {
     SetTrackSolo(String, bool),
     SetPortRouting(String, String), // (track_id, port_id)
     ClearPortRouting(String),
-    AddOutputPort(String, usize), // (name, midir port number)
     RemoveOutputPort(String),
     AddInputPort(String, usize), // (name, midir port number)
     RemoveInputPort(String),
@@ -45,10 +44,9 @@ pub enum MidiEngineCommand {
 /// Messages from MIDI engine to UI
 #[derive(Debug, Clone)]
 pub enum MidiEngineMessage {
-    PositionUpdate(f64),                  // Current position in beats
-    PortStatusChanged(String, bool),      // (port_id, connected)
-    PortConnectionFailed(String, String), // (port_id, error)
-    MidiInput(String, MidiMessage, u64),  // (port_id, message, timestamp)
+    PositionUpdate(f64),                   // Current position in beats
+    OutputPortStatusChanged(String, bool), // (port_id, connected)
+    MidiInput(String, MidiMessage, u64),   // (port_id, message, timestamp)
 }
 
 /// A scheduled MIDI event
@@ -86,6 +84,28 @@ struct MidiOutputPort {
     connection: Box<dyn MidiOutputConnection>,
 }
 
+const OUTPUT_CONNECTION_QUEUE_CAPACITY: usize = 32;
+const OUTPUT_INIT_ATTEMPTS: usize = 2;
+const OUTPUT_INIT_RETRY_DELAY: Duration = Duration::from_millis(8);
+const MAX_STABLE_PORT_ID_LENGTH: usize = 256;
+
+/// Display information and a short-lived identity cache for a MIDI output.
+///
+/// The opaque `id` comes from `midir` and is only used to find a currently
+/// scanned port again. Project files continue to persist the human-readable
+/// output name so they remain portable across machines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidiOutputPortInfo {
+    pub name: String,
+    pub id: Option<String>,
+    pub index: usize,
+}
+
+struct PendingOutputConnection {
+    name: String,
+    connection: Box<dyn MidiOutputConnection>,
+}
+
 /// The small boundary between scheduling/routing and the platform MIDI backend.
 ///
 /// Keeping this boundary local lets the engine's delivery behavior be verified
@@ -105,6 +125,7 @@ impl MidiOutputConnection for midir::MidiOutputConnection {
 pub struct MidiEngine {
     // Thread communication
     command_rx: Receiver<MidiEngineCommand>,
+    output_connection_rx: Receiver<PendingOutputConnection>,
     message_tx: Sender<MidiEngineMessage>,
 
     // Timing
@@ -150,9 +171,11 @@ impl MidiEngine {
         command_rx: Receiver<MidiEngineCommand>,
         message_tx: Sender<MidiEngineMessage>,
     ) -> Self {
+        let (_output_connection_tx, output_connection_rx) = unbounded();
         Self::new_with_shutdown(
             sample_rate,
             command_rx,
+            output_connection_rx,
             message_tx,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
@@ -162,12 +185,14 @@ impl MidiEngine {
     fn new_with_shutdown(
         sample_rate: u32,
         command_rx: Receiver<MidiEngineCommand>,
+        output_connection_rx: Receiver<PendingOutputConnection>,
         message_tx: Sender<MidiEngineMessage>,
         shutdown: Arc<AtomicBool>,
         capture_sample_clock: Arc<AtomicU64>,
     ) -> Self {
         Self {
             command_rx,
+            output_connection_rx,
             message_tx,
             sample_rate,
             current_sample: AtomicU64::new(0),
@@ -205,6 +230,8 @@ impl MidiEngine {
 
     /// Process incoming commands from UI
     fn process_commands(&mut self) {
+        self.process_output_connections();
+
         while let Ok(command) = self.command_rx.try_recv() {
             match command {
                 MidiEngineCommand::Start => {
@@ -250,34 +277,11 @@ impl MidiEngine {
                 MidiEngineCommand::ClearPortRouting(track_id) => {
                     self.track_routing.lock().remove(&track_id);
                 }
-                MidiEngineCommand::AddOutputPort(name, port_number) => {
-                    let result = midir::MidiOutput::new("Hypersaw")
-                        .map_err(|error| error.to_string())
-                        .and_then(|midi_out| {
-                            let ports = midi_out.ports();
-                            let port = ports.get(port_number).ok_or_else(|| {
-                                format!("MIDI output index {port_number} is no longer available")
-                            })?;
-                            midi_out
-                                .connect(port, &name)
-                                .map_err(|error| error.to_string())
-                        });
-                    match result {
-                        Ok(connection) => {
-                            self.add_output_connection(name, Box::new(connection));
-                        }
-                        Err(error) => {
-                            let _ = self
-                                .message_tx
-                                .try_send(MidiEngineMessage::PortConnectionFailed(name, error));
-                        }
-                    }
-                }
                 MidiEngineCommand::RemoveOutputPort(name) => {
                     self.output_ports.lock().remove(&name);
                     let _ = self
                         .message_tx
-                        .try_send(MidiEngineMessage::PortStatusChanged(name, false));
+                        .try_send(MidiEngineMessage::OutputPortStatusChanged(name, false));
                 }
                 MidiEngineCommand::AddInputPort(name, port_number) => {
                     if let Ok(midi_in) = midir::MidiInput::new("Hypersaw") {
@@ -318,18 +322,12 @@ impl MidiEngine {
                                         _connection: connection,
                                     },
                                 );
-                                let _ = self
-                                    .message_tx
-                                    .try_send(MidiEngineMessage::PortStatusChanged(name, true));
                             }
                         }
                     }
                 }
                 MidiEngineCommand::RemoveInputPort(name) => {
                     self.input_ports.lock().remove(&name);
-                    let _ = self
-                        .message_tx
-                        .try_send(MidiEngineMessage::PortStatusChanged(name, false));
                 }
                 MidiEngineCommand::SetMetronomeEnabled(enabled) => {
                     self.metronome_enabled.store(enabled, Ordering::SeqCst);
@@ -351,6 +349,13 @@ impl MidiEngine {
                 }
                 _ => {} // Continue is not implemented yet
             }
+        }
+    }
+
+    /// Install connections prepared outside the real-time command loop.
+    fn process_output_connections(&self) {
+        while let Ok(connection) = self.output_connection_rx.try_recv() {
+            self.add_output_connection(connection.name, connection.connection);
         }
     }
 
@@ -442,7 +447,7 @@ impl MidiEngine {
             .insert(name.clone(), MidiOutputPort { connection });
         let _ = self
             .message_tx
-            .try_send(MidiEngineMessage::PortStatusChanged(name, true));
+            .try_send(MidiEngineMessage::OutputPortStatusChanged(name, true));
     }
 
     /// Send all notes off to all ports using CC 123 (All Notes Off)
@@ -589,6 +594,7 @@ impl MidiEngine {
 /// Handle for communicating with the MIDI engine
 pub struct MidiEngineHandle {
     command_tx: Sender<MidiEngineCommand>,
+    output_connection_tx: Sender<PendingOutputConnection>,
     message_rx: Receiver<MidiEngineMessage>,
     thread: Option<thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
@@ -602,11 +608,16 @@ impl MidiEngineHandle {
         let (command_tx, command_rx) = bounded(1000);
         // Message buffer: up to 500 pending messages
         let (message_tx, message_rx) = bounded(500);
+        // Connections are opened on the caller thread and handed to the
+        // scheduler through this small non-blocking mailbox.
+        let (output_connection_tx, output_connection_rx) =
+            bounded(OUTPUT_CONNECTION_QUEUE_CAPACITY);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let engine = MidiEngine::new_with_shutdown(
             sample_rate,
             command_rx,
+            output_connection_rx,
             message_tx,
             shutdown.clone(),
             capture_sample_clock,
@@ -622,6 +633,7 @@ impl MidiEngineHandle {
 
         Self {
             command_tx,
+            output_connection_tx,
             message_rx,
             thread: Some(thread),
             shutdown,
@@ -638,15 +650,40 @@ impl MidiEngineHandle {
         self.message_rx.try_recv().ok()
     }
 
+    /// Open a MIDI output on the caller thread and hand the live connection to
+    /// the engine. This keeps platform MIDI initialization out of the 1 ms
+    /// scheduling loop.
+    pub fn connect_output_port(&self, port: &MidiOutputPortInfo) -> Result<(), String> {
+        let connection = open_midi_output_connection(port)?;
+        let pending_connection = PendingOutputConnection {
+            name: port.name.clone(),
+            connection: Box::new(connection),
+        };
+
+        self.output_connection_tx
+            .try_send(pending_connection)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    "MIDI engine is busy connecting other output ports".to_string()
+                }
+                TrySendError::Disconnected(_) => "MIDI engine is not running".to_string(),
+            })
+    }
+
     /// Scan available MIDI output ports
-    pub fn scan_midi_output_ports() -> Vec<(String, usize)> {
+    pub fn scan_midi_output_ports() -> Vec<MidiOutputPortInfo> {
         let mut ports = Vec::new();
 
         if let Ok(midi_out) = midir::MidiOutput::new("Hypersaw Scanner") {
             let midi_ports = midi_out.ports();
             for (i, port) in midi_ports.iter().enumerate() {
                 if let Ok(name) = midi_out.port_name(port) {
-                    ports.push((name, i));
+                    let id = port.id();
+                    ports.push(MidiOutputPortInfo {
+                        name,
+                        id: (id.len() <= MAX_STABLE_PORT_ID_LENGTH).then_some(id),
+                        index: i,
+                    });
                 }
             }
         }
@@ -669,6 +706,84 @@ impl MidiEngineHandle {
 
         ports
     }
+}
+
+fn open_midi_output_connection(
+    port_info: &MidiOutputPortInfo,
+) -> Result<midir::MidiOutputConnection, String> {
+    let midi_out = initialize_midi_output()?;
+    let ports = midi_out.ports();
+    let port_names: Vec<_> = ports
+        .iter()
+        .map(|port| midi_out.port_name(port).ok())
+        .collect();
+    let port_ids: Vec<_> = ports
+        .iter()
+        .map(|port| {
+            let id = port.id();
+            (id.len() <= MAX_STABLE_PORT_ID_LENGTH).then_some(id)
+        })
+        .collect();
+    let port_index = output_port_index(
+        &port_names,
+        &port_ids,
+        &port_info.name,
+        port_info.id.as_deref(),
+        port_info.index,
+    )
+    .ok_or_else(|| format!("MIDI output '{}' is no longer available", port_info.name))?;
+    let port = ports
+        .get(port_index)
+        .ok_or_else(|| format!("MIDI output '{}' is no longer available", port_info.name))?;
+
+    midi_out
+        .connect(port, &port_info.name)
+        .map_err(|error| error.to_string())
+}
+
+fn initialize_midi_output() -> Result<midir::MidiOutput, String> {
+    let mut last_error = "MIDI support could not be initialized".to_string();
+
+    for attempt in 0..OUTPUT_INIT_ATTEMPTS {
+        match midir::MidiOutput::new("Hypersaw") {
+            Ok(output) => return Ok(output),
+            Err(error) => {
+                last_error = error.to_string();
+                if attempt + 1 < OUTPUT_INIT_ATTEMPTS {
+                    thread::sleep(OUTPUT_INIT_RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "MIDI output initialization failed after {OUTPUT_INIT_ATTEMPTS} attempts: {last_error}"
+    ))
+}
+
+fn output_port_index(
+    port_names: &[Option<String>],
+    port_ids: &[Option<String>],
+    requested_name: &str,
+    cached_id: Option<&str>,
+    cached_index: usize,
+) -> Option<usize> {
+    cached_id
+        .and_then(|cached_id| {
+            port_ids
+                .iter()
+                .position(|port_id| port_id.as_deref() == Some(cached_id))
+        })
+        .filter(|&index| port_names.get(index).and_then(Option::as_deref) == Some(requested_name))
+        .or_else(|| {
+            (port_names.get(cached_index).and_then(Option::as_deref) == Some(requested_name))
+                .then_some(cached_index)
+        })
+        .or_else(|| {
+            port_names
+                .iter()
+                .position(|port_name| port_name.as_deref() == Some(requested_name))
+        })
 }
 
 impl Drop for MidiEngineHandle {
@@ -902,6 +1017,28 @@ mod tests {
         )
     }
 
+    fn engine_with_output_connection_channel() -> (
+        MidiEngine,
+        Sender<PendingOutputConnection>,
+        Receiver<MidiEngineMessage>,
+    ) {
+        let (_command_tx, command_rx) = unbounded();
+        let (message_tx, message_rx) = unbounded();
+        let (output_connection_tx, output_connection_rx) = unbounded();
+        (
+            MidiEngine::new_with_shutdown(
+                48_000,
+                command_rx,
+                output_connection_rx,
+                message_tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+            ),
+            output_connection_tx,
+            message_rx,
+        )
+    }
+
     fn schedule_note(
         command_tx: &Sender<MidiEngineCommand>,
         track_id: &str,
@@ -964,7 +1101,9 @@ mod tests {
         let statuses: Vec<_> = message_rx
             .try_iter()
             .filter_map(|message| match message {
-                MidiEngineMessage::PortStatusChanged(name, connected) => Some((name, connected)),
+                MidiEngineMessage::OutputPortStatusChanged(name, connected) => {
+                    Some((name, connected))
+                }
                 _ => None,
             })
             .collect();
@@ -976,6 +1115,46 @@ mod tests {
                 ("device".to_string(), true),
             ]
         );
+    }
+
+    #[test]
+    fn prepared_output_connections_are_installed_without_backend_work_in_the_engine_loop() {
+        let (mut engine, output_connection_tx, message_rx) =
+            engine_with_output_connection_channel();
+        let output = RecordingMidiOutput::default();
+
+        output_connection_tx
+            .send(PendingOutputConnection {
+                name: "device".to_string(),
+                connection: Box::new(output),
+            })
+            .unwrap();
+        engine.process_commands();
+
+        assert!(matches!(
+            message_rx.try_recv().unwrap(),
+            MidiEngineMessage::OutputPortStatusChanged(name, true) if name == "device"
+        ));
+    }
+
+    #[test]
+    fn stable_output_id_is_validated_then_falls_back_to_name_lookup() {
+        let names = vec![Some("Drums".to_string()), Some("Lead".to_string())];
+        let ids = vec![
+            Some("stable-drums".to_string()),
+            Some("stable-lead".to_string()),
+        ];
+
+        assert_eq!(
+            output_port_index(&names, &ids, "Lead", Some("stable-lead"), 0),
+            Some(1)
+        );
+        assert_eq!(
+            output_port_index(&names, &ids, "Lead", Some("stale"), 0),
+            Some(1)
+        );
+        assert_eq!(output_port_index(&names, &ids, "Drums", None, 0), Some(0));
+        assert_eq!(output_port_index(&names, &ids, "Missing", None, 0), None);
     }
 
     #[test]
