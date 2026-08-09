@@ -17,7 +17,8 @@ Known constraints:
 - Playback scheduling is still coordinated by the egui application layer.
 - Undo covers note edits and track mute, but not most track, clip, take, automation, or tempo
   mutations.
-- There are 51 unit tests, but no CI or end-to-end recording/project tests.
+- There are 67 unit tests, including deterministic recording-workflow and fake MIDI-output
+  coverage, but no CI or automated full-UI/project workflow tests.
 
 ## P0: Recording v1
 
@@ -29,7 +30,7 @@ Known constraints:
 - [x] Persist a per-track MIDI input port and optional channel filter.
 - [x] Use the persisted input configuration when arming and monitoring a track.
 - [x] Add codec tests for every supported channel and system message.
-- [ ] Add fake-port tests for disconnect, reconnect, monitoring, mute, and solo behavior.
+- [x] Add fake-port tests for disconnect, reconnect, monitoring, mute, and solo behavior.
 
 ### Recording semantics
 
@@ -40,13 +41,14 @@ Known constraints:
   clips.
 - [x] Define and test note behavior at punch and loop boundaries.
 - [x] Record loop passes as stacked takes and select the newest completed pass.
-- [ ] Expose take rename, mute, delete, and active-take selection consistently in the UI.
-- [ ] Add integration tests for count-in, quantize-on-record, Overdub, Replace, Punch, and loop
-  recording.
+- [x] Expose take rename, mute, delete, and active-take selection consistently in the UI.
+- [x] Add deterministic workflow-level tests for count-in, quantize-on-record, Overdub, Replace,
+  Punch, and loop recording.
 
 Punch and loop ranges use half-open intervals. Notes begun inside a punch are closed at punch-out
 if still held; notes crossing a loop boundary are split into trimmed note fragments, and an event
 exactly on the loop boundary belongs to the next pass.
+Count-in elapsed time is independent of transport position so loop wrapping cannot stall it.
 
 ## P1: Project and Undo Safety
 
@@ -78,6 +80,7 @@ exactly on the loop boundary belongs to the next pass.
 - [ ] Extract recording conversion and project I/O orchestration from the egui update loop.
 - [ ] Add CI for formatting, tests, and Clippy on supported platforms.
 - [ ] Expand tests around loop/seek scheduling, project round trips, recording, and undo.
+- [ ] Add controller/UI integration tests for the complete recording lifecycle.
 - [ ] Remove or integrate dead prototype modules (`midi_editing`, `undo_data`, and `keymap`).
 - [ ] Resolve the existing Rust/Clippy warning backlog and the `block 0.1.6`
   future-compatibility warning.

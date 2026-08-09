@@ -7,6 +7,7 @@ use eframe::egui;
 use eframe::epaint::StrokeKind;
 
 const ADD_TRACK_AREA_HEIGHT: f32 = 50.0;
+const TAKE_ACTION_BUTTON_SIZE: egui::Vec2 = egui::vec2(18.0, 18.0);
 
 pub struct Timeline {
     pixels_per_second: f32,
@@ -31,6 +32,9 @@ pub struct Timeline {
     // Track name editing state
     editing_track_name: Option<(String, String)>, // (track_id, current_text)
     track_name_needs_focus: bool,
+    // Take name editing state
+    editing_take_name: Option<(String, String, String)>, // (track_id, take_id, current_text)
+    take_name_needs_focus: bool,
     playback_schedule_dirty: bool,
 }
 
@@ -55,6 +59,8 @@ impl Default for Timeline {
             show_device_panel: true,
             editing_track_name: None,
             track_name_needs_focus: false,
+            editing_take_name: None,
+            take_name_needs_focus: false,
             playback_schedule_dirty: false,
         }
     }
@@ -857,11 +863,8 @@ impl Timeline {
 
         // Content area with padding (accounting for drag handle and color stripe)
         let content_rect = egui::Rect::from_min_size(
-            rect.min + egui::vec2(DRAG_HANDLE_WIDTH + 8.0, 6.0),
-            egui::vec2(
-                rect.width() - DRAG_HANDLE_WIDTH - 14.0,
-                rect.height() - 12.0,
-            ),
+            rect.min + egui::vec2(DRAG_HANDLE_WIDTH + 8.0, 4.0),
+            egui::vec2(rect.width() - DRAG_HANDLE_WIDTH - 14.0, rect.height() - 8.0),
         );
 
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
@@ -1164,106 +1167,247 @@ impl Timeline {
                     });
                 }
 
-                // Right-click context menu for takes
-                drag_response.context_menu(|ui| {
-                    ui.label("Take Management");
-                    ui.separator();
+                drag_response.context_menu(|ui| self.draw_take_context_menu(ui, track));
 
-                    if !track.takes.is_empty() {
-                        ui.menu_button("Select Take", |ui| {
-                            for take in &track.takes {
-                                let is_active = track.active_take.as_ref() == Some(&take.id);
-                                if ui.selectable_label(is_active, &take.name).clicked() {
-                                    self.command_collector.add_command(DawCommand::SelectTake {
-                                        track_id: track.id.clone(),
-                                        take_id: take.id.clone(),
-                                    });
-                                    ui.close_menu();
-                                }
-                            }
-                        });
+                self.draw_take_management_controls(ui, track);
+            });
+        });
+    }
 
-                        ui.menu_button("Delete Take", |ui| {
-                            for take in &track.takes {
-                                if ui.button(&take.name).clicked() {
-                                    self.command_collector.add_command(DawCommand::DeleteTake {
-                                        track_id: track.id.clone(),
-                                        take_id: take.id.clone(),
-                                    });
-                                    ui.close_menu();
-                                }
-                            }
-                        });
+    fn draw_take_context_menu(&mut self, ui: &mut egui::Ui, track: &Track) {
+        ui.label("Take Management");
+        ui.separator();
 
-                        ui.separator();
-                    }
+        if track.takes.is_empty() {
+            ui.label("No takes recorded");
+            return;
+        }
 
-                    if ui.button("Clear All Takes").clicked() {
-                        // Delete all takes
-                        for take in track.takes.clone() {
-                            self.command_collector.add_command(DawCommand::DeleteTake {
-                                track_id: track.id.clone(),
-                                take_id: take.id,
-                            });
-                        }
-                        ui.close_menu();
-                    }
+        ui.menu_button("Select active take", |ui| {
+            for take in &track.takes {
+                let is_active = track.active_take.as_deref() == Some(take.id.as_str());
+                let response = ui.push_id(("take-selection", take.id.as_str()), |ui| {
+                    ui.selectable_label(is_active, take_display_label(take))
                 });
-
-                // Show takes if any exist
-                if !track.takes.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-
-                        ui.label("Takes:");
-
-                        // Takes dropdown
-                        let active_take_name = track
-                            .active_take
-                            .as_ref()
-                            .and_then(|take_id| track.takes.iter().find(|t| t.id == *take_id))
-                            .map(|t| t.name.clone())
-                            .unwrap_or_else(|| "None".to_string());
-
-                        egui::ComboBox::new(format!("takes_{}", track.id), "")
-                            .width(ui.available_width())
-                            .selected_text(&active_take_name)
-                            .show_ui(ui, |ui| {
-                                // Option to have no active take
-                                if ui
-                                    .selectable_label(track.active_take.is_none(), "None")
-                                    .clicked()
-                                {
-                                    self.command_collector.add_command(DawCommand::SelectTake {
-                                        track_id: track.id.clone(),
-                                        take_id: String::new(),
-                                    });
-                                }
-
-                                ui.separator();
-
-                                // List all takes
-                                for take in &track.takes {
-                                    let is_active = track.active_take.as_ref() == Some(&take.id);
-                                    let label = if take.is_muted {
-                                        format!("{} (muted)", take.name)
-                                    } else {
-                                        take.name.clone()
-                                    };
-
-                                    if ui.selectable_label(is_active, &label).clicked() {
-                                        self.command_collector.add_command(
-                                            DawCommand::SelectTake {
-                                                track_id: track.id.clone(),
-                                                take_id: take.id.clone(),
-                                            },
-                                        );
-                                    }
-                                }
-                            });
+                if response.inner.clicked() {
+                    self.command_collector.add_command(DawCommand::SelectTake {
+                        track_id: track.id.clone(),
+                        take_id: take.id.clone(),
                     });
+                    ui.close_menu();
+                }
+            }
+        });
+
+        if let Some(take) = active_take(&track.takes, track.active_take.as_deref()) {
+            ui.separator();
+            ui.label(format!("Active: {}", take_display_label(take)));
+
+            if ui.button("Rename active take").clicked() {
+                self.begin_take_name_edit(&track.id, take);
+                ui.close_menu();
+            }
+
+            let mute_label = if take.is_muted {
+                "Unmute active take"
+            } else {
+                "Mute active take"
+            };
+            if ui.button(mute_label).clicked() {
+                self.command_collector.add_command(DawCommand::MuteTake {
+                    track_id: track.id.clone(),
+                    take_id: take.id.clone(),
+                    muted: !take.is_muted,
+                });
+                ui.close_menu();
+            }
+
+            if ui.button("Delete active take").clicked() {
+                self.command_collector.add_command(DawCommand::DeleteTake {
+                    track_id: track.id.clone(),
+                    take_id: take.id.clone(),
+                });
+                ui.close_menu();
+            }
+        }
+
+        ui.separator();
+        if ui.button("Delete all takes").clicked() {
+            for take in &track.takes {
+                self.command_collector.add_command(DawCommand::DeleteTake {
+                    track_id: track.id.clone(),
+                    take_id: take.id.clone(),
+                });
+            }
+            ui.close_menu();
+        }
+    }
+
+    fn draw_take_management_controls(&mut self, ui: &mut egui::Ui, track: &Track) {
+        let is_editing_this_track = self
+            .editing_take_name
+            .as_ref()
+            .is_some_and(|(track_id, _, _)| track_id == &track.id);
+        if is_editing_this_track {
+            self.draw_take_name_editor(ui, track);
+            return;
+        }
+
+        if track.takes.is_empty() {
+            return;
+        }
+
+        let active_take = active_take(&track.takes, track.active_take.as_deref());
+        let active_take_id = active_take.map(|take| take.id.clone());
+        let active_take_muted = active_take.is_some_and(|take| take.is_muted);
+        let active_take_name = active_take
+            .map(take_display_label)
+            .unwrap_or_else(|| "No active take".to_string());
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label("Take:");
+
+            ui.push_id(("take-controls", track.id.as_str()), |ui| {
+                let selector_width = (ui.available_width()
+                    - TAKE_ACTION_BUTTON_SIZE.x * 3.0
+                    - ui.spacing().item_spacing.x * 3.0)
+                    .max(80.0);
+
+                egui::ComboBox::from_id_salt(("take-selector", track.id.as_str()))
+                    .width(selector_width)
+                    .selected_text(active_take_name)
+                    .show_ui(ui, |ui| {
+                        for take in &track.takes {
+                            let is_active = track.active_take.as_deref() == Some(take.id.as_str());
+                            let response = ui.push_id(("take-selection", take.id.as_str()), |ui| {
+                                ui.selectable_label(is_active, take_display_label(take))
+                            });
+                            if response.inner.clicked() {
+                                self.command_collector.add_command(DawCommand::SelectTake {
+                                    track_id: track.id.clone(),
+                                    take_id: take.id.clone(),
+                                });
+                                ui.close_menu();
+                            }
+                        }
+                    });
+
+                let mute_response = ui
+                    .add_enabled_ui(active_take_id.is_some(), |ui| {
+                        ui.add_sized(
+                            TAKE_ACTION_BUTTON_SIZE,
+                            egui::Button::new("M").selected(active_take_muted),
+                        )
+                    })
+                    .inner
+                    .on_hover_text(if active_take_muted {
+                        "Unmute active take"
+                    } else {
+                        "Mute active take"
+                    });
+                if mute_response.clicked() {
+                    if let Some(take_id) = &active_take_id {
+                        self.command_collector.add_command(DawCommand::MuteTake {
+                            track_id: track.id.clone(),
+                            take_id: take_id.clone(),
+                            muted: !active_take_muted,
+                        });
+                    }
+                }
+
+                let rename_response = ui
+                    .add_enabled_ui(active_take_id.is_some(), |ui| {
+                        ui.add_sized(TAKE_ACTION_BUTTON_SIZE, egui::Button::new("✎"))
+                    })
+                    .inner
+                    .on_hover_text("Rename active take");
+                if rename_response.clicked() {
+                    if let Some(take) = active_take {
+                        self.begin_take_name_edit(&track.id, take);
+                    }
+                }
+
+                let delete_response = ui
+                    .add_enabled_ui(active_take_id.is_some(), |ui| {
+                        ui.add_sized(TAKE_ACTION_BUTTON_SIZE, egui::Button::new("×"))
+                    })
+                    .inner
+                    .on_hover_text("Delete active take");
+                if delete_response.clicked() {
+                    if let Some(take_id) = &active_take_id {
+                        self.command_collector.add_command(DawCommand::DeleteTake {
+                            track_id: track.id.clone(),
+                            take_id: take_id.clone(),
+                        });
+                    }
                 }
             });
+        });
+    }
+
+    fn begin_take_name_edit(&mut self, track_id: &str, take: &Take) {
+        self.editing_take_name = Some((track_id.to_owned(), take.id.clone(), take.name.clone()));
+        self.take_name_needs_focus = true;
+    }
+
+    fn draw_take_name_editor(&mut self, ui: &mut egui::Ui, track: &Track) {
+        let Some((editing_track_id, take_id, _)) = self.editing_take_name.as_ref() else {
+            return;
+        };
+        if editing_track_id != &track.id {
+            return;
+        }
+
+        let take_id = take_id.clone();
+        let Some(take) = track.takes.iter().find(|take| take.id == take_id) else {
+            self.editing_take_name = None;
+            self.take_name_needs_focus = false;
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.label("Rename take:");
+            let editor_width = ui.available_width().max(50.0);
+            let response = {
+                let Some((_, _, edit_text)) = self.editing_take_name.as_mut() else {
+                    return;
+                };
+                ui.push_id(
+                    ("take-name-editor", track.id.as_str(), take_id.as_str()),
+                    |ui| ui.add(egui::TextEdit::singleline(edit_text).desired_width(editor_width)),
+                )
+                .inner
+            };
+
+            if self.take_name_needs_focus {
+                response.request_focus();
+                self.take_name_needs_focus = false;
+            }
+
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.editing_take_name = None;
+                self.take_name_needs_focus = false;
+                return;
+            }
+
+            if response.lost_focus() || ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                let new_name = self
+                    .editing_take_name
+                    .as_ref()
+                    .map(|(_, _, name)| name.trim().to_owned())
+                    .unwrap_or_default();
+                self.editing_take_name = None;
+                self.take_name_needs_focus = false;
+
+                if !new_name.is_empty() && new_name != take.name {
+                    self.command_collector.add_command(DawCommand::RenameTake {
+                        track_id: track.id.clone(),
+                        take_id,
+                        new_name,
+                    });
+                }
+            }
         });
     }
 
@@ -2081,6 +2225,18 @@ impl Timeline {
     }
 }
 
+fn active_take<'a>(takes: &'a [Take], active_take_id: Option<&str>) -> Option<&'a Take> {
+    active_take_id.and_then(|take_id| takes.iter().find(|take| take.id == take_id))
+}
+
+fn take_display_label(take: &Take) -> String {
+    if take.is_muted {
+        format!("{} (muted)", take.name)
+    } else {
+        take.name.clone()
+    }
+}
+
 fn vertical_scroll_limit(track_count: usize, track_height: f32, viewport_height: f32) -> f32 {
     let content_height = track_count as f32 * track_height + ADD_TRACK_AREA_HEIGHT;
     (content_height - viewport_height).max(0.0)
@@ -2088,7 +2244,19 @@ fn vertical_scroll_limit(track_count: usize, track_height: f32, viewport_height:
 
 #[cfg(test)]
 mod tests {
-    use super::vertical_scroll_limit;
+    use super::{active_take, take_display_label, vertical_scroll_limit};
+    use crate::core::Take;
+
+    fn take(id: &str, name: &str, is_muted: bool) -> Take {
+        Take {
+            id: id.to_owned(),
+            track_id: "track-1".to_owned(),
+            clip_id: format!("clip-{id}"),
+            name: name.to_owned(),
+            timestamp: 0,
+            is_muted,
+        }
+    }
 
     #[test]
     fn one_track_does_not_scroll_when_content_fits() {
@@ -2099,5 +2267,35 @@ mod tests {
     #[test]
     fn overflowing_tracks_scroll_only_to_the_content_end() {
         assert_eq!(vertical_scroll_limit(10, 80.0, 500.0), 350.0);
+    }
+
+    #[test]
+    fn active_take_matches_the_selected_take_id() {
+        let takes = vec![
+            take("take-1", "Verse", false),
+            take("take-2", "Chorus", false),
+        ];
+
+        assert_eq!(
+            active_take(&takes, Some("take-2")).map(|take| take.name.as_str()),
+            Some("Chorus")
+        );
+    }
+
+    #[test]
+    fn missing_active_take_is_not_treated_as_a_selection() {
+        let takes = vec![take("take-1", "Verse", false)];
+
+        assert!(active_take(&takes, Some("deleted-take")).is_none());
+        assert!(active_take(&takes, None).is_none());
+    }
+
+    #[test]
+    fn muted_take_labels_expose_their_state() {
+        assert_eq!(take_display_label(&take("take-1", "Verse", false)), "Verse");
+        assert_eq!(
+            take_display_label(&take("take-2", "Chorus", true)),
+            "Chorus (muted)"
+        );
     }
 }

@@ -173,6 +173,40 @@ fn inclusive_upper_bound(value: f64) -> f64 {
     }
 }
 
+fn count_in_duration_seconds(bars: u32, bpm: f64) -> Option<f64> {
+    (bpm.is_finite() && bpm > 0.0).then_some(f64::from(bars) * 4.0 * 60.0 / bpm)
+}
+
+fn count_in_is_complete(elapsed_seconds: f64, bars: u32, bpm: f64) -> bool {
+    count_in_duration_seconds(bars, bpm)
+        .is_some_and(|duration| elapsed_seconds.max(0.0) >= duration)
+}
+
+fn take_completed_count_in_session(state: &mut DawState) -> Option<RecordingSessionContext> {
+    if !state.count_in_active
+        || !count_in_is_complete(
+            state.count_in_elapsed,
+            state.count_in_bars,
+            state.project.bpm,
+        )
+    {
+        return None;
+    }
+
+    state.count_in_active = false;
+    state.count_in_start_time = None;
+    state.count_in_elapsed = 0.0;
+
+    let track_id = state.recording_track.clone()?;
+    let mut session = state.pending_recording_session.take().unwrap_or_else(|| {
+        crate::core::commands::recording_session_context(state, &track_id, state.recording_mode)
+    });
+    // Count-in completion defines only the actual capture origin; editing
+    // intent was frozen when the count-in began.
+    session.transport_start_seconds = state.current_time;
+    Some(session)
+}
+
 fn apply_recording_to_target(
     target: &mut MidiEventStore,
     clip_start_seconds: f64,
@@ -432,6 +466,7 @@ impl SupersawApp {
         self.state.track_scroll_y = 0.0;
         self.state.count_in_active = false;
         self.state.count_in_start_time = None;
+        self.state.count_in_elapsed = 0.0;
         self.state.pending_recording_session = None;
 
         self.command_manager.clear();
@@ -827,11 +862,12 @@ impl SupersawApp {
 
             // Count-in status (only when active)
             if self.state.count_in_active {
-                if let Some(start_time) = self.state.count_in_start_time {
-                    let count_in_duration =
-                        (self.state.count_in_bars as f64 * 4.0 * 60.0) / self.state.project.bpm;
-                    let elapsed = self.state.current_time - start_time;
-                    let remaining_beats = ((count_in_duration - elapsed) * self.state.project.bpm
+                if let Some(count_in_duration) =
+                    count_in_duration_seconds(self.state.count_in_bars, self.state.project.bpm)
+                {
+                    let remaining_beats = ((count_in_duration - self.state.count_in_elapsed)
+                        .max(0.0)
+                        * self.state.project.bpm
                         / 60.0)
                         .ceil() as u32;
                     ui.colored_label(egui::Color32::YELLOW, format!("⏱ {}", remaining_beats));
@@ -1293,60 +1329,30 @@ impl eframe::App for SupersawApp {
         self.state.update_playhead();
 
         // Check count-in completion
-        if self.state.count_in_active {
-            if let Some(start_time) = self.state.count_in_start_time {
-                let count_in_duration =
-                    (self.state.count_in_bars as f64 * 4.0 * 60.0) / self.state.project.bpm;
-                let elapsed = self.state.current_time - start_time;
+        if let Some(session) = take_completed_count_in_session(&mut self.state) {
+            // Check if metronome should continue during recording
+            let should_disable_metronome = if let Some(rc) = &self.state.recording_coordinator {
+                let config = rc.lock().get_config();
+                !config.metronome_during_record && !self.state.metronome
+            } else {
+                !self.state.metronome
+            };
 
-                if elapsed >= count_in_duration {
-                    // Count-in complete, start actual recording
-                    self.state.count_in_active = false;
-                    self.state.count_in_start_time = None;
-
-                    // Check if metronome should continue during recording
-                    let should_disable_metronome =
-                        if let Some(rc) = &self.state.recording_coordinator {
-                            let config = rc.lock().get_config();
-                            !config.metronome_during_record && !self.state.metronome
-                        } else {
-                            !self.state.metronome
-                        };
-
-                    // Disable metronome if it was only for count-in
-                    if should_disable_metronome {
-                        if let Some(engine) = &self.state.midi_engine {
-                            engine.lock().send_command(
-                                crate::core::MidiEngineCommand::SetMetronomeEnabled(false),
-                            );
-                        }
-                    }
-
-                    // Start actual recording
-                    if let Some(track_id) = &self.state.recording_track.clone() {
-                        let mut session = self
-                            .state
-                            .pending_recording_session
-                            .take()
-                            .unwrap_or_else(|| {
-                                crate::core::commands::recording_session_context(
-                                    &self.state,
-                                    track_id,
-                                    self.state.recording_mode,
-                                )
-                            });
-                        // Count-in completion defines only the actual capture
-                        // origin; editing intent was frozen when count-in began.
-                        session.transport_start_seconds = self.state.current_time;
-                        if let Some(recording_coordinator) = &self.state.recording_coordinator {
-                            recording_coordinator
-                                .lock()
-                                .start_recording_session(session);
-                        }
-                        self.state.status.info("Recording started after count-in");
-                    }
+            // Disable metronome if it was only for count-in
+            if should_disable_metronome {
+                if let Some(engine) = &self.state.midi_engine {
+                    engine
+                        .lock()
+                        .send_command(crate::core::MidiEngineCommand::SetMetronomeEnabled(false));
                 }
             }
+
+            if let Some(recording_coordinator) = &self.state.recording_coordinator {
+                recording_coordinator
+                    .lock()
+                    .start_recording_session(session);
+            }
+            self.state.status.info("Recording started after count-in");
         }
 
         // Update MIDI engine and recording coordinator with tempo changes (only when BPM changes)
@@ -2024,6 +2030,55 @@ mod tests {
         }
     }
 
+    fn recorded_note(key: u8, start_beat: f64, end_beat: f64) -> Vec<RecordedEvent> {
+        vec![
+            recorded_event(
+                start_beat,
+                MidiMessage::NoteOn {
+                    channel: 0,
+                    key,
+                    velocity: 100,
+                },
+            ),
+            recorded_event(
+                end_beat,
+                MidiMessage::NoteOff {
+                    channel: 0,
+                    key,
+                    velocity: 0,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn count_in_completion_uses_elapsed_time_across_a_transport_loop() {
+        let mut state = DawState::new();
+        state.project.bpm = 120.0;
+        state.count_in_bars = 1;
+        state.count_in_active = true;
+        state.count_in_start_time = Some(3.5);
+        state.count_in_elapsed = 2.0;
+        state.current_time = 0.25;
+        state.recording_track = Some("track".to_string());
+        state.pending_recording_session = Some(RecordingSessionContext::new(
+            "track".to_string(),
+            Some("clip".to_string()),
+            RecordingMode::Replace,
+            3.5,
+            None,
+            Some((0.0, 4.0)),
+        ));
+
+        let completed = take_completed_count_in_session(&mut state).expect("completed count-in");
+
+        assert!(!state.count_in_active);
+        assert_eq!(state.count_in_elapsed, 0.0);
+        assert_eq!(completed.mode, RecordingMode::Replace);
+        assert_eq!(completed.target_clip_id.as_deref(), Some("clip"));
+        assert_eq!(completed.transport_start_seconds, 0.25);
+    }
+
     #[test]
     fn unquantized_recording_builds_notes_for_the_piano_roll() {
         let events = vec![
@@ -2075,6 +2130,18 @@ mod tests {
 
         let store = recorded_events_to_midi(&events, 480, 120.0, SnapMode::None, true, 1.0, None);
         assert_eq!(store.get_notes().count(), 1);
+    }
+
+    #[test]
+    fn recording_workflow_quantizes_to_the_selected_grid() {
+        let events = recorded_note(64, 0.42, 0.92);
+
+        let store =
+            recorded_events_to_midi(&events, 480, 120.0, SnapMode::Halfbeat, true, 1.0, None);
+
+        let note = store.get_notes().next().expect("quantized note");
+        assert_eq!(note.start_time, 0.25);
+        assert_eq!(note.duration, 0.25);
     }
 
     #[test]
@@ -2269,6 +2336,150 @@ mod tests {
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].start_time, 0.0);
         assert_eq!(notes[1].start_time, 1.25);
+    }
+
+    #[test]
+    fn recording_workflow_overdub_converts_and_merges_captured_events() {
+        let mut target = MidiEventStore::new(480);
+        target.add_note(note("existing", 60, 0.0, 0.5));
+        let source = recorded_events_to_midi(
+            &recorded_note(64, 0.5, 1.0),
+            480,
+            60.0,
+            SnapMode::None,
+            false,
+            1.0,
+            None,
+        );
+        let session = RecordingSessionContext::new(
+            "track".to_string(),
+            Some("clip".to_string()),
+            RecordingMode::Overdub,
+            2.0,
+            None,
+            None,
+        );
+
+        apply_recording_to_target(&mut target, 1.0, &session, &source);
+
+        let mut notes: Vec<_> = target.get_notes().collect();
+        notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
+        assert_eq!(notes.len(), 2);
+        assert_eq!((notes[0].key, notes[0].start_time), (60, 0.0));
+        assert_eq!((notes[1].key, notes[1].start_time), (64, 1.5));
+    }
+
+    #[test]
+    fn recording_workflow_replace_preserves_material_outside_the_capture() {
+        let mut target = MidiEventStore::new(480);
+        target.add_note(note("crossing", 60, 0.0, 4.0));
+        let source = recorded_events_to_midi(
+            &recorded_note(72, 0.0, 1.0),
+            480,
+            60.0,
+            SnapMode::None,
+            false,
+            1.0,
+            None,
+        );
+        let session = RecordingSessionContext::new(
+            "track".to_string(),
+            Some("clip".to_string()),
+            RecordingMode::Replace,
+            1.0,
+            None,
+            None,
+        );
+
+        apply_recording_to_target(&mut target, 0.0, &session, &source);
+
+        let mut notes: Vec<_> = target.get_notes().collect();
+        notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
+        assert_eq!(notes.len(), 3);
+        assert_eq!(
+            (notes[0].key, notes[0].start_time, notes[0].duration),
+            (60, 0.0, 1.0)
+        );
+        assert_eq!(
+            (notes[1].key, notes[1].start_time, notes[1].duration),
+            (72, 1.0, 1.0)
+        );
+        assert_eq!(
+            (notes[2].key, notes[2].start_time, notes[2].duration),
+            (60, 2.0, 2.0)
+        );
+    }
+
+    #[test]
+    fn recording_workflow_punch_filters_and_replaces_the_punch_interval() {
+        let mut target = MidiEventStore::new(480);
+        target.add_note(note("crossing", 60, 0.0, 4.0));
+        let source = recorded_events_to_midi(
+            &recorded_note(72, 1.25, 1.75),
+            480,
+            60.0,
+            SnapMode::None,
+            false,
+            1.0,
+            Some(2.0),
+        );
+        let session = RecordingSessionContext::new(
+            "track".to_string(),
+            Some("clip".to_string()),
+            RecordingMode::PunchInOut,
+            0.0,
+            Some((1.0, 2.0)),
+            None,
+        );
+
+        apply_recording_to_target(&mut target, 0.0, &session, &source);
+
+        let mut notes: Vec<_> = target.get_notes().collect();
+        notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
+        assert_eq!(notes.len(), 3);
+        assert_eq!(
+            (notes[0].key, notes[0].start_time, notes[0].duration),
+            (60, 0.0, 1.0)
+        );
+        assert_eq!(
+            (notes[1].key, notes[1].start_time, notes[1].duration),
+            (72, 1.25, 0.5)
+        );
+        assert_eq!(
+            (notes[2].key, notes[2].start_time, notes[2].duration),
+            (60, 2.0, 2.0)
+        );
+    }
+
+    #[test]
+    fn recording_workflow_loop_stacks_passes_from_captured_events() {
+        let source = recorded_events_to_midi(
+            &recorded_note(60, 2.5, 3.5),
+            480,
+            60.0,
+            SnapMode::None,
+            false,
+            1.0,
+            None,
+        );
+        let session = RecordingSessionContext::new(
+            "track".to_string(),
+            None,
+            RecordingMode::Overdub,
+            1.0,
+            None,
+            Some((0.0, 4.0)),
+        );
+
+        let passes = build_recording_passes(&source, &session, 480);
+
+        assert_eq!(passes.len(), 2);
+        assert!(passes[0].completed);
+        assert!(!passes[1].completed);
+        let first_note = passes[0].midi_data.get_notes().next().unwrap();
+        let second_note = passes[1].midi_data.get_notes().next().unwrap();
+        assert_eq!((first_note.start_time, first_note.duration), (3.5, 0.5));
+        assert_eq!((second_note.start_time, second_note.duration), (0.0, 0.5));
     }
 
     #[test]

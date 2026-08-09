@@ -136,22 +136,23 @@ The custom arrangement and piano-roll canvases rely on explicit egui gesture sta
   keyboard input.
 - Escape is editor-local for cancellation/deselection. Cmd/Ctrl+1 returns to Arrangement.
 - Unsaved-project confirmation uses `egui::Modal` and suppresses background editor input.
-- Symbol-based transport controls reserve a fixed 28×28 point footprint.
+- Symbol-based transport controls reserve a fixed 28×28 point footprint; compact take actions
+  reserve a fixed 18×18 point footprint.
 - Repaints are continuous only while required by playback, recording, routing, or status expiry.
 
 ## Verification Baseline
 
-The repository currently has 51 unit tests covering live MIDI codecs, scheduling queues, routing,
-recording batching and session semantics, interval merge/replace, loop-pass boundaries, project
-asset persistence, recorded-note conversion, piano-roll gesture math, and timeline scroll limits.
+The repository currently has 67 unit tests covering live MIDI codecs, fake-output lifecycle,
+scheduling queues, routing and monitoring, recording batching and session semantics, count-in,
+quantize-on-record, every recording mode, loop-pass boundaries, take deletion, project asset
+persistence, recorded-note conversion, piano-roll gesture math, and timeline behavior.
 
 Important gaps:
 
 - no CI configuration;
 - no command-level undo matrix;
-- no full recording-mode or loop-pass integration tests;
-- no fake MIDI-port disconnect/reconnect tests;
-- no project workflow or UI interaction tests; and
+- no controller-level or full-UI recording/project workflow tests;
+- no egui interaction tests for take controls or editor focus; and
 - no cross-platform release/packaging matrix.
 
 ## Known Technical Debt
@@ -164,11 +165,10 @@ Important gaps:
 
 ## Implementation Order
 
-1. Finish fake-port/end-to-end verification and the remaining Recording v1 take controls.
-2. Complete destructive-operation undo and project Save/Save As safety.
-3. Add CI and integration coverage around recording, scheduling, undo, and persistence.
-4. Extract framework-neutral transport, scheduling, recording, and project controllers.
-5. Add higher-level MIDI editing, effects, and step-sequencer workflows.
-6. Revisit a GPUI vertical-slice experiment only after the controller extraction.
+1. Complete destructive-operation undo and project Save/Save As safety.
+2. Add CI and integration coverage around scheduling, undo, persistence, and UI interaction.
+3. Extract framework-neutral transport, scheduling, recording, and project controllers.
+4. Add higher-level MIDI editing, effects, and step-sequencer workflows.
+5. Revisit a GPUI vertical-slice experiment only after the controller extraction.
 
 The detailed, checkbox-level roadmap lives in [`../TODOS.md`](../TODOS.md).

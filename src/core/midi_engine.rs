@@ -83,7 +83,22 @@ impl Ord for ScheduledEvent {
 
 /// MIDI output port wrapper
 struct MidiOutputPort {
-    connection: midir::MidiOutputConnection,
+    connection: Box<dyn MidiOutputConnection>,
+}
+
+/// The small boundary between scheduling/routing and the platform MIDI backend.
+///
+/// Keeping this boundary local lets the engine's delivery behavior be verified
+/// without requiring a physical MIDI device.
+trait MidiOutputConnection: Send {
+    fn send_message(&mut self, message: &MidiMessage) -> Result<(), String>;
+}
+
+impl MidiOutputConnection for midir::MidiOutputConnection {
+    fn send_message(&mut self, message: &MidiMessage) -> Result<(), String> {
+        self.send(&encode_midi_message(message))
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// The main MIDI engine
@@ -249,12 +264,7 @@ impl MidiEngine {
                         });
                     match result {
                         Ok(connection) => {
-                            self.output_ports
-                                .lock()
-                                .insert(name.clone(), MidiOutputPort { connection });
-                            let _ = self
-                                .message_tx
-                                .try_send(MidiEngineMessage::PortStatusChanged(name, true));
+                            self.add_output_connection(name, Box::new(connection));
                         }
                         Err(error) => {
                             let _ = self
@@ -419,21 +429,20 @@ impl MidiEngine {
 
             let mut ports = self.output_ports.lock();
             if let Some(port) = ports.get_mut(&port_id) {
-                if let Err(e) = Self::send_midi_message(&mut port.connection, &event.message) {
+                if let Err(e) = port.connection.send_message(&event.message) {
                     eprintln!("Failed to send MIDI message: {}", e);
                 }
             }
         } // ports lock released per iteration
     }
 
-    /// Send a MIDI message to a port
-    fn send_midi_message(
-        conn: &mut midir::MidiOutputConnection,
-        message: &MidiMessage,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let bytes = encode_midi_message(message);
-        conn.send(&bytes)?;
-        Ok(())
+    fn add_output_connection(&self, name: String, connection: Box<dyn MidiOutputConnection>) {
+        self.output_ports
+            .lock()
+            .insert(name.clone(), MidiOutputPort { connection });
+        let _ = self
+            .message_tx
+            .try_send(MidiEngineMessage::PortStatusChanged(name, true));
     }
 
     /// Send all notes off to all ports using CC 123 (All Notes Off)
@@ -447,7 +456,7 @@ impl MidiEngine {
                     controller: 123,
                     value: 0,
                 };
-                let _ = Self::send_midi_message(&mut port.connection, &msg);
+                let _ = port.connection.send_message(&msg);
             }
         }
     }
@@ -855,10 +864,202 @@ fn align_midir_timestamp(
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct RecordingMidiOutput {
+        messages: Arc<Mutex<Vec<MidiMessage>>>,
+    }
+
+    impl RecordingMidiOutput {
+        fn messages(&self) -> Vec<MidiMessage> {
+            self.messages.lock().clone()
+        }
+    }
+
+    impl MidiOutputConnection for RecordingMidiOutput {
+        fn send_message(&mut self, message: &MidiMessage) -> Result<(), String> {
+            self.messages.lock().push(message.clone());
+            Ok(())
+        }
+    }
+
     fn engine_with_sender() -> (MidiEngine, Sender<MidiEngineCommand>) {
         let (command_tx, command_rx) = unbounded();
         let (message_tx, _message_rx) = unbounded();
         (MidiEngine::new(48_000, command_rx, message_tx), command_tx)
+    }
+
+    fn engine_with_channels() -> (
+        MidiEngine,
+        Sender<MidiEngineCommand>,
+        Receiver<MidiEngineMessage>,
+    ) {
+        let (command_tx, command_rx) = unbounded();
+        let (message_tx, message_rx) = unbounded();
+        (
+            MidiEngine::new(48_000, command_rx, message_tx),
+            command_tx,
+            message_rx,
+        )
+    }
+
+    fn schedule_note(
+        command_tx: &Sender<MidiEngineCommand>,
+        track_id: &str,
+        port_id: &str,
+        key: u8,
+    ) {
+        command_tx
+            .send(MidiEngineCommand::ScheduleEvent {
+                time_in_beats: 0.0,
+                port_id: port_id.to_string(),
+                message: MidiMessage::NoteOn {
+                    channel: 0,
+                    key,
+                    velocity: 100,
+                },
+                track_id: track_id.to_string(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn disconnected_port_drops_events_and_reconnect_uses_existing_track_routing() {
+        let (mut engine, command_tx, message_rx) = engine_with_channels();
+        let first_connection = RecordingMidiOutput::default();
+        engine.add_output_connection("device".to_string(), Box::new(first_connection.clone()));
+
+        command_tx
+            .send(MidiEngineCommand::SetPortRouting(
+                "track".to_string(),
+                "device".to_string(),
+            ))
+            .unwrap();
+        schedule_note(&command_tx, "track", "unused", 60);
+        engine.process_commands();
+        engine.process_events(0);
+        assert_eq!(first_connection.messages().len(), 1);
+
+        command_tx
+            .send(MidiEngineCommand::RemoveOutputPort("device".to_string()))
+            .unwrap();
+        schedule_note(&command_tx, "track", "unused", 61);
+        engine.process_commands();
+        engine.process_events(0);
+        assert_eq!(first_connection.messages().len(), 1);
+
+        let reconnected = RecordingMidiOutput::default();
+        engine.add_output_connection("device".to_string(), Box::new(reconnected.clone()));
+        schedule_note(&command_tx, "track", "unused", 62);
+        engine.process_commands();
+        engine.process_events(0);
+
+        assert_eq!(
+            reconnected.messages(),
+            [MidiMessage::NoteOn {
+                channel: 0,
+                key: 62,
+                velocity: 100,
+            }]
+        );
+        let statuses: Vec<_> = message_rx
+            .try_iter()
+            .filter_map(|message| match message {
+                MidiEngineMessage::PortStatusChanged(name, connected) => Some((name, connected)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ("device".to_string(), true),
+                ("device".to_string(), false),
+                ("device".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn track_routing_targets_the_configured_output_and_can_be_cleared() {
+        let (mut engine, command_tx, _message_rx) = engine_with_channels();
+        let scheduled_port = RecordingMidiOutput::default();
+        let routed_port = RecordingMidiOutput::default();
+        engine.add_output_connection("scheduled".to_string(), Box::new(scheduled_port.clone()));
+        engine.add_output_connection("routed".to_string(), Box::new(routed_port.clone()));
+
+        command_tx
+            .send(MidiEngineCommand::SetPortRouting(
+                "track".to_string(),
+                "routed".to_string(),
+            ))
+            .unwrap();
+        schedule_note(&command_tx, "track", "scheduled", 60);
+        engine.process_commands();
+        engine.process_events(0);
+        assert!(scheduled_port.messages().is_empty());
+        assert_eq!(routed_port.messages().len(), 1);
+
+        command_tx
+            .send(MidiEngineCommand::ClearPortRouting("track".to_string()))
+            .unwrap();
+        schedule_note(&command_tx, "track", "scheduled", 61);
+        engine.process_commands();
+        engine.process_events(0);
+        assert_eq!(scheduled_port.messages().len(), 1);
+        assert_eq!(routed_port.messages().len(), 1);
+    }
+
+    #[test]
+    fn muting_a_track_prevents_delivery_until_it_is_unmuted() {
+        let (mut engine, command_tx, _message_rx) = engine_with_channels();
+        let output = RecordingMidiOutput::default();
+        engine.add_output_connection("port".to_string(), Box::new(output.clone()));
+
+        command_tx
+            .send(MidiEngineCommand::SetTrackMute("track".to_string(), true))
+            .unwrap();
+        schedule_note(&command_tx, "track", "port", 60);
+        engine.process_commands();
+        engine.process_events(0);
+        assert!(output.messages().is_empty());
+
+        command_tx
+            .send(MidiEngineCommand::SetTrackMute("track".to_string(), false))
+            .unwrap();
+        schedule_note(&command_tx, "track", "port", 61);
+        engine.process_commands();
+        engine.process_events(0);
+        assert_eq!(output.messages().len(), 1);
+    }
+
+    #[test]
+    fn soloing_a_track_filters_other_tracks_and_respects_mute() {
+        let (mut engine, command_tx, _message_rx) = engine_with_channels();
+        let output = RecordingMidiOutput::default();
+        engine.add_output_connection("port".to_string(), Box::new(output.clone()));
+
+        command_tx
+            .send(MidiEngineCommand::SetTrackSolo("solo".to_string(), true))
+            .unwrap();
+        schedule_note(&command_tx, "other", "port", 60);
+        schedule_note(&command_tx, "solo", "port", 61);
+        engine.process_commands();
+        engine.process_events(0);
+        assert_eq!(
+            output.messages(),
+            [MidiMessage::NoteOn {
+                channel: 0,
+                key: 61,
+                velocity: 100,
+            }]
+        );
+
+        command_tx
+            .send(MidiEngineCommand::SetTrackMute("solo".to_string(), true))
+            .unwrap();
+        schedule_note(&command_tx, "solo", "port", 62);
+        engine.process_commands();
+        engine.process_events(0);
+        assert_eq!(output.messages().len(), 1);
     }
 
     #[test]

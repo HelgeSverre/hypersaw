@@ -689,6 +689,36 @@ mod tests {
     }
 
     #[test]
+    fn monitoring_follows_the_armed_port_and_stops_when_disabled() {
+        let (mut recorder, event_rx) = recorder();
+        recorder.handle_command(RecordingCommand::ArmTrack {
+            track_id: "track".to_string(),
+            input_port: "Keyboard".to_string(),
+            channel_filter: None,
+        });
+        recorder.handle_command(RecordingCommand::SetInputMonitoring {
+            track_id: "track".to_string(),
+            enabled: true,
+        });
+
+        recorder.handle_midi_event("Other".to_string(), note_on(), 0);
+        assert!(event_rx.try_recv().is_err());
+
+        recorder.handle_midi_event("Keyboard".to_string(), note_on(), 1);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(RecordingEvent::MonitoringEvent { track_id, .. }) if track_id == "track"
+        ));
+
+        recorder.handle_command(RecordingCommand::SetInputMonitoring {
+            track_id: "track".to_string(),
+            enabled: false,
+        });
+        recorder.handle_midi_event("Keyboard".to_string(), note_on(), 2);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn default_armed_port_accepts_events_from_connected_input() {
         let (mut recorder, event_rx) = recorder();
         recorder.handle_command(RecordingCommand::ArmTrack {

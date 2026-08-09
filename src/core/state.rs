@@ -40,6 +40,7 @@ pub struct DawState {
     pub count_in_bars: u32,
     pub count_in_active: bool,
     pub count_in_start_time: Option<f64>,
+    pub count_in_elapsed: f64,
     pub pending_recording_session: Option<RecordingSessionContext>,
 }
 
@@ -84,12 +85,23 @@ impl DawState {
             count_in_bars: 1,
             count_in_active: false,
             count_in_start_time: None,
+            count_in_elapsed: 0.0,
             pending_recording_session: None,
         }
     }
 
     pub fn update_playhead(&mut self) {
         let now = std::time::Instant::now();
+        let delta_time = self
+            .last_update
+            .map(|last_update| now.duration_since(last_update).as_secs_f64())
+            .unwrap_or_default();
+
+        // Count-in uses elapsed playback time rather than transport position.
+        // Loop wrapping cannot stall it, while pausing transport pauses it.
+        if self.count_in_active && self.playing {
+            self.count_in_elapsed += delta_time;
+        }
 
         if self.playing {
             // When engine is active AND playing, it's the source of truth for playhead time
@@ -102,9 +114,7 @@ impl DawState {
             }
 
             // Fallback: update time locally if no engine
-            if let Some(last_update) = self.last_update {
-                let delta_time = now.duration_since(last_update).as_secs_f64();
-
+            if self.last_update.is_some() {
                 self.current_time += delta_time;
 
                 let loop_length = self.loop_end - self.loop_start;
@@ -119,5 +129,28 @@ impl DawState {
         }
 
         self.last_update = Some(now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn count_in_elapsed_time_pauses_and_resumes_with_transport() {
+        let mut state = DawState::new();
+        state.count_in_active = true;
+        state.count_in_elapsed = 0.5;
+        state.playing = false;
+        state.last_update = Some(Instant::now() - Duration::from_secs(1));
+
+        state.update_playhead();
+        assert_eq!(state.count_in_elapsed, 0.5);
+
+        state.playing = true;
+        state.last_update = Some(Instant::now() - Duration::from_secs(1));
+        state.update_playhead();
+        assert!(state.count_in_elapsed >= 1.5);
     }
 }

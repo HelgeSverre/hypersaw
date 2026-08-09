@@ -1185,6 +1185,7 @@ impl Command for DawCommand {
                         // Start count-in
                         state.count_in_active = true;
                         state.count_in_start_time = Some(state.current_time);
+                        state.count_in_elapsed = 0.0;
                         state.pending_recording_session = Some(session);
 
                         // Enable metronome during count-in
@@ -1235,6 +1236,7 @@ impl Command for DawCommand {
                     // Cancel count-in
                     state.count_in_active = false;
                     state.count_in_start_time = None;
+                    state.count_in_elapsed = 0.0;
                     state.pending_recording_session = None;
 
                     // Disable metronome if it was only for count-in
@@ -1425,21 +1427,45 @@ impl Command for DawCommand {
 
             DawCommand::DeleteTake { track_id, take_id } => {
                 if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
-                    let take_name = track
+                    let Some(take_index) = track.takes.iter().position(|take| take.id == *take_id)
+                    else {
+                        return Ok(());
+                    };
+                    let removed_take = track.takes.remove(take_index);
+                    let clip_is_still_a_take = track
                         .takes
                         .iter()
-                        .find(|t| t.id == *take_id)
-                        .map(|t| t.name.clone())
-                        .unwrap_or_default();
+                        .any(|take| take.clip_id == removed_take.clip_id);
 
-                    track.takes.retain(|t| t.id != *take_id);
-
-                    // If this was the active take, clear it
-                    if track.active_take == Some(take_id.clone()) {
-                        track.active_take = None;
+                    // A recorded take owns its arrangement clip. Once no take
+                    // references it, leaving it behind would bypass filtering.
+                    if !clip_is_still_a_take {
+                        track.clips.retain(|clip| {
+                            !matches!(clip, Clip::Midi { id, .. } if id == &removed_take.clip_id)
+                        });
                     }
 
-                    state.status.info(format!("Deleted take: {}", take_name));
+                    // Keep another recorded pass audible after deleting the
+                    // active one, preferring the newest remaining take.
+                    if track.active_take == Some(take_id.clone()) {
+                        track.active_take = track.takes.last().map(|take| take.id.clone());
+                    }
+                    if !clip_is_still_a_take
+                        && state.selected_clip.as_deref() == Some(removed_take.clip_id.as_str())
+                    {
+                        state.selected_clip =
+                            track.active_take.as_ref().and_then(|active_take_id| {
+                                track
+                                    .takes
+                                    .iter()
+                                    .find(|take| &take.id == active_take_id)
+                                    .map(|take| take.clip_id.clone())
+                            });
+                    }
+
+                    state
+                        .status
+                        .info(format!("Deleted take: {}", removed_take.name));
                 }
                 Ok(())
             }
@@ -2070,5 +2096,57 @@ mod tests {
         assert_eq!(pending.mode, RecordingMode::PunchInOut);
         assert_eq!(pending.punch_range, Some((1.0, 3.0)));
         assert_eq!(pending.loop_range, Some((0.0, 4.0)));
+    }
+
+    #[test]
+    fn deleting_the_active_take_removes_its_clip_and_selects_the_newest_remaining_take() {
+        let mut state = DawState::new();
+        let mut track = midi_track("track-1");
+        for clip_id in ["clip-1", "clip-2"] {
+            track.clips.push(Clip::Midi {
+                id: clip_id.to_string(),
+                start_time: 0.0,
+                length: 1.0,
+                file_path: PathBuf::new(),
+                midi_data: Some(MidiEventStore::new(480)),
+                loaded: true,
+                automation_lanes: Vec::new(),
+            });
+        }
+        track.takes = vec![
+            Take {
+                id: "take-1".to_string(),
+                track_id: track.id.clone(),
+                clip_id: "clip-1".to_string(),
+                name: "Take 1".to_string(),
+                timestamp: 1,
+                is_muted: false,
+            },
+            Take {
+                id: "take-2".to_string(),
+                track_id: track.id.clone(),
+                clip_id: "clip-2".to_string(),
+                name: "Take 2".to_string(),
+                timestamp: 2,
+                is_muted: false,
+            },
+        ];
+        track.active_take = Some("take-2".to_string());
+        state.selected_clip = Some("clip-2".to_string());
+        state.project.tracks.push(track);
+
+        DawCommand::DeleteTake {
+            track_id: "track-1".to_string(),
+            take_id: "take-2".to_string(),
+        }
+        .execute(&mut state)
+        .unwrap();
+
+        let track = &state.project.tracks[0];
+        assert_eq!(track.takes.len(), 1);
+        assert_eq!(track.clips.len(), 1);
+        assert_eq!(track.active_take.as_deref(), Some("take-1"));
+        assert_eq!(state.selected_clip.as_deref(), Some("clip-1"));
+        assert!(matches!(&track.clips[0], Clip::Midi { id, .. } if id == "clip-1"));
     }
 }
