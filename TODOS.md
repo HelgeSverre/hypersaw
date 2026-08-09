@@ -2,7 +2,8 @@
 
 > Hypersaw is a hardware-first, MIDI-focused DAW. Audio editing remains explicitly deferred.
 >
-> Status reviewed against `feature/midi-recording` on 2026-08-09, after commit `fef2523`.
+> Status reviewed against `feature/midi-recording` on 2026-08-09 after the Recording v1
+> correctness and session-semantics implementation.
 
 ## Current Status
 
@@ -13,37 +14,39 @@ surface; it is making recording and hardware I/O reliable enough for regular use
 Known constraints:
 
 - The MIDI engine and recorder use a hardcoded 44.1 kHz internal sample clock.
-- Per-track recording input and channel filters are not persisted; arming uses the default
-  wildcard input.
 - Playback scheduling is still coordinated by the egui application layer.
 - Undo covers note edits and track mute, but not most track, clip, take, automation, or tempo
   mutations.
-- There are 23 unit tests, but no CI or end-to-end recording/project tests.
+- There are 51 unit tests, but no CI or end-to-end recording/project tests.
 
 ## P0: Recording v1
 
 ### MIDI I/O correctness
 
-- [ ] Fix live pitch-bend decoding/encoding around the MIDI center value (-8192..8191).
-- [ ] Support the message types already represented by the model: aftertouch, SysEx, MIDI
+- [x] Fix live pitch-bend decoding/encoding around the MIDI center value (-8192..8191).
+- [x] Support the message types already represented by the model: aftertouch, SysEx, MIDI
   clock, start, stop, and continue.
-- [ ] Persist a per-track MIDI input port and optional channel filter.
-- [ ] Use the persisted input configuration when arming and monitoring a track.
-- [ ] Add codec tests for every supported channel and system message.
+- [x] Persist a per-track MIDI input port and optional channel filter.
+- [x] Use the persisted input configuration when arming and monitoring a track.
+- [x] Add codec tests for every supported channel and system message.
 - [ ] Add fake-port tests for disconnect, reconnect, monitoring, mute, and solo behavior.
 
 ### Recording semantics
 
-- [ ] Carry the recording mode, transport start, and punch range in the committed recording
+- [x] Carry the recording mode, transport start, and punch range in the committed recording
   result instead of reading mutable UI state after the session ends.
-- [ ] Make Overdub merge into the intended clip instead of always creating a separate clip.
-- [ ] Make Replace overwrite only the recorded interval instead of deleting whole overlapping
+- [x] Make Overdub merge into the intended clip instead of always creating a separate clip.
+- [x] Make Replace overwrite only the recorded interval instead of deleting whole overlapping
   clips.
-- [ ] Define and test note behavior at punch and loop boundaries.
-- [ ] Record loop passes as stacked takes and select the newest completed pass.
+- [x] Define and test note behavior at punch and loop boundaries.
+- [x] Record loop passes as stacked takes and select the newest completed pass.
 - [ ] Expose take rename, mute, delete, and active-take selection consistently in the UI.
 - [ ] Add integration tests for count-in, quantize-on-record, Overdub, Replace, Punch, and loop
   recording.
+
+Punch and loop ranges use half-open intervals. Notes begun inside a punch are closed at punch-out
+if still held; notes crossing a loop boundary are split into trimmed note fragments, and an event
+exactly on the loop boundary belongs to the next pass.
 
 ## P1: Project and Undo Safety
 

@@ -91,9 +91,8 @@ Current limitations:
 
 ## Recording Model
 
-Each armed track has an input-port selector and optional channel filter in the recording
-runtime. The current command/UI path arms tracks with the wildcard `default` port and no channel
-filter, so the configuration is not yet persisted per track.
+Each MIDI track persists an input-port selector and optional one-based channel filter. Arming,
+monitoring, and recording use that routing; an unset port is the wildcard `default` input.
 
 The recorder:
 
@@ -103,9 +102,11 @@ The recorder:
 4. buffers events until a committed stop; and
 5. delivers one coherent `EventsRecorded` batch to the UI.
 
-The UI pairs note-on/off messages, optionally quantizes them, writes a MIDI asset, creates a clip,
-and creates a take. Overdub, Replace, Punch, and loop-pass semantics still need a stricter session
-result contract and integration tests; see `TODOS.md`.
+The committed result carries immutable mode, transport, target-clip, punch, and loop context. The
+UI pairs note-on/off messages, optionally quantizes them, merges Overdub into its selected target,
+replaces only the selected interval for Replace/Punch, and writes loop passes as stacked takes.
+Punch and loop ranges are half-open; boundary-crossing loop notes are split into trimmed
+fragments. End-to-end recording integration tests remain on the roadmap.
 
 ## Persistence
 
@@ -140,9 +141,9 @@ The custom arrangement and piano-roll canvases rely on explicit egui gesture sta
 
 ## Verification Baseline
 
-The repository currently has 23 unit tests covering selected MIDI conversions, scheduling queue
-behavior, recording batching, project asset persistence, recorded-note conversion, piano-roll
-gesture math, and timeline scroll limits.
+The repository currently has 51 unit tests covering live MIDI codecs, scheduling queues, routing,
+recording batching and session semantics, interval merge/replace, loop-pass boundaries, project
+asset persistence, recorded-note conversion, piano-roll gesture math, and timeline scroll limits.
 
 Important gaps:
 
@@ -160,12 +161,10 @@ Important gaps:
 - `midi_editing`, `undo_data`, and `keymap` are unused or prototype modules.
 - The compiler and Clippy report a substantial dead-code/style warning backlog.
 - `block 0.1.6`, pulled in transitively, has a future-Rust compatibility warning.
-- MIDI message I/O is incomplete for aftertouch, SysEx, and transport/clock messages, and live
-  pitch-bend conversion needs correction.
 
 ## Implementation Order
 
-1. Complete MIDI I/O correctness and Recording v1 semantics.
+1. Finish fake-port/end-to-end verification and the remaining Recording v1 take controls.
 2. Complete destructive-operation undo and project Save/Save As safety.
 3. Add CI and integration coverage around recording, scheduling, undo, and persistence.
 4. Extract framework-neutral transport, scheduling, recording, and project controllers.

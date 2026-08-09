@@ -121,6 +121,12 @@ pub enum TrackType {
     Midi {
         channel: u8,
         device_name: Option<String>,
+        /// Optional MIDI input port used while recording this track.
+        #[serde(default)]
+        input_device_name: Option<String>,
+        /// Optional one-based MIDI input channel filter. `None` receives all channels.
+        #[serde(default)]
+        input_channel: Option<u8>,
     },
 }
 
@@ -357,6 +363,8 @@ impl Project {
             track_type: TrackType::Midi {
                 channel: 1,
                 device_name: None,
+                input_device_name: None,
+                input_channel: None,
             },
             clips: vec![clip],
             is_muted: false,
@@ -412,6 +420,8 @@ mod tests {
             track_type: TrackType::Midi {
                 channel: 1,
                 device_name: None,
+                input_device_name: None,
+                input_channel: None,
             },
             clips: vec![Clip::Midi {
                 id: clip_id.clone(),
@@ -445,6 +455,26 @@ mod tests {
         assert_eq!(asset_count, 1);
 
         fs::remove_dir_all(test_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_midi_tracks_default_input_routing() -> Result<(), Box<dyn Error>> {
+        let legacy_track = r##"{
+            "type": "Midi",
+            "channel": 1,
+            "device_name": null
+        }"##;
+
+        let track_type: TrackType = serde_json::from_str(legacy_track)?;
+        let TrackType::Midi {
+            input_device_name,
+            input_channel,
+            ..
+        } = track_type;
+
+        assert_eq!(input_device_name, None);
+        assert_eq!(input_channel, None);
         Ok(())
     }
 }

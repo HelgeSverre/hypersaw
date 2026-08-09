@@ -120,6 +120,7 @@ pub struct MidiEngine {
     metronome_port: Mutex<Option<String>>, // Dedicated metronome output port
     time_signature: Mutex<(u32, u32)>, // (numerator, denominator)
     last_metronome_beat: AtomicU64, // Last beat where metronome clicked
+    capture_sample_clock: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -139,6 +140,7 @@ impl MidiEngine {
             command_rx,
             message_tx,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
         )
     }
 
@@ -147,6 +149,7 @@ impl MidiEngine {
         command_rx: Receiver<MidiEngineCommand>,
         message_tx: Sender<MidiEngineMessage>,
         shutdown: Arc<AtomicBool>,
+        capture_sample_clock: Arc<AtomicU64>,
     ) -> Self {
         Self {
             command_rx,
@@ -168,6 +171,7 @@ impl MidiEngine {
             metronome_port: Mutex::new(None),      // No default metronome port
             time_signature: Mutex::new((4, 4)),    // Default 4/4
             last_metronome_beat: AtomicU64::new(0),
+            capture_sample_clock,
             shutdown,
         }
     }
@@ -272,91 +276,28 @@ impl MidiEngine {
                             let port_name = name.clone();
                             let message_tx = self.message_tx.clone();
                             let sample_rate = self.sample_rate;
+                            let capture_sample_clock = self.capture_sample_clock.clone();
+                            let mut timestamp_origin = None;
 
                             if let Ok(connection) = midi_in.connect(
                                 &ports[port_number],
                                 &name,
                                 move |timestamp, message, _| {
-                                    // Parse MIDI message
-                                    if message.len() >= 2 {
-                                        let status = message[0];
-                                        let channel = status & 0x0F;
-                                        let msg_type = status & 0xF0;
-
-                                        let midi_msg = match msg_type {
-                                            0x80 => {
-                                                // Note off
-                                                if message.len() >= 3 {
-                                                    Some(MidiMessage::NoteOff {
-                                                        channel,
-                                                        key: message[1],
-                                                        velocity: message[2],
-                                                    })
-                                                } else {
-                                                    None
-                                                }
-                                            }
-                                            0x90 => {
-                                                // Note on
-                                                if message.len() >= 3 {
-                                                    // NoteOn with velocity 0 should be treated as NoteOff
-                                                    if message[2] == 0 {
-                                                        Some(MidiMessage::NoteOff {
-                                                            channel,
-                                                            key: message[1],
-                                                            velocity: 0,
-                                                        })
-                                                    } else {
-                                                        Some(MidiMessage::NoteOn {
-                                                            channel,
-                                                            key: message[1],
-                                                            velocity: message[2],
-                                                        })
-                                                    }
-                                                } else {
-                                                    None
-                                                }
-                                            }
-                                            0xB0 => {
-                                                // Control change
-                                                if message.len() >= 3 {
-                                                    Some(MidiMessage::ControlChange {
-                                                        channel,
-                                                        controller: message[1],
-                                                        value: message[2],
-                                                    })
-                                                } else {
-                                                    None
-                                                }
-                                            }
-                                            0xE0 => {
-                                                // Pitch bend
-                                                if message.len() >= 3 {
-                                                    let value = ((message[2] as u16) << 7)
-                                                        | (message[1] as u16);
-                                                    Some(MidiMessage::PitchBend {
-                                                        channel,
-                                                        value: value as i16,
-                                                    })
-                                                } else {
-                                                    None
-                                                }
-                                            }
-                                            _ => None,
-                                        };
-
-                                        if let Some(msg) = midi_msg {
-                                            // `midir` timestamps are microseconds. Convert them
-                                            // to the sample-clock units used by the recorder.
-                                            let sample_timestamp =
-                                                midir_timestamp_to_samples(timestamp, sample_rate);
-                                            let _ =
-                                                message_tx.try_send(MidiEngineMessage::MidiInput(
-                                                    port_name.clone(),
-                                                    msg,
-                                                    sample_timestamp,
-                                                ));
-                                        }
+                                    if let Some(msg) = parse_midi_message(message) {
+                                        // Align this connection's arbitrary `midir` origin to
+                                        // the recorder's shared monotonic sample clock while
+                                        // preserving device-provided timing between messages.
+                                        let sample_timestamp = align_midir_timestamp(
+                                            timestamp,
+                                            capture_sample_clock.load(Ordering::Acquire),
+                                            sample_rate,
+                                            &mut timestamp_origin,
+                                        );
+                                        let _ = message_tx.try_send(MidiEngineMessage::MidiInput(
+                                            port_name.clone(),
+                                            msg,
+                                            sample_timestamp,
+                                        ));
                                     }
                                 },
                                 (),
@@ -490,42 +431,7 @@ impl MidiEngine {
         conn: &mut midir::MidiOutputConnection,
         message: &MidiMessage,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let bytes = match message {
-            MidiMessage::NoteOn {
-                channel,
-                key,
-                velocity,
-            } => {
-                vec![0x90 | channel, *key, *velocity]
-            }
-            MidiMessage::NoteOff {
-                channel,
-                key,
-                velocity,
-            } => {
-                vec![0x80 | channel, *key, *velocity]
-            }
-            MidiMessage::ControlChange {
-                channel,
-                controller,
-                value,
-            } => {
-                vec![0xB0 | channel, *controller, *value]
-            }
-            MidiMessage::ProgramChange { channel, program } => {
-                vec![0xC0 | channel, *program]
-            }
-            MidiMessage::PitchBend { channel, value } => {
-                let value = *value as u16;
-                vec![
-                    0xE0 | channel,
-                    (value & 0x7F) as u8,
-                    ((value >> 7) & 0x7F) as u8,
-                ]
-            }
-            _ => return Ok(()), // TODO: Implement other message types
-        };
-
+        let bytes = encode_midi_message(message);
         conn.send(&bytes)?;
         Ok(())
     }
@@ -621,6 +527,7 @@ impl MidiEngine {
 
         let mut last_time = Instant::now();
         let mut last_position_update = Instant::now();
+        let capture_clock_origin = Instant::now();
 
         while !self.shutdown.load(Ordering::Acquire) {
             let start = Instant::now();
@@ -628,12 +535,18 @@ impl MidiEngine {
             // Process commands from UI
             self.process_commands();
 
-            // Update timing
-            if self.is_playing.load(Ordering::SeqCst) {
-                let now = Instant::now();
-                let elapsed = now.duration_since(last_time);
-                let elapsed_samples = (elapsed.as_secs_f64() * self.sample_rate as f64) as u64;
+            // The capture clock advances even while transport is stopped, so
+            // recording silence and punch windows have a stable origin.
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_time);
+            let elapsed_samples = (elapsed.as_secs_f64() * self.sample_rate as f64) as u64;
+            self.capture_sample_clock.store(
+                (capture_clock_origin.elapsed().as_secs_f64() * self.sample_rate as f64) as u64,
+                Ordering::Release,
+            );
 
+            // Update transport timing
+            if self.is_playing.load(Ordering::SeqCst) {
                 let current = self
                     .current_sample
                     .fetch_add(elapsed_samples, Ordering::SeqCst)
@@ -652,11 +565,8 @@ impl MidiEngine {
                         .try_send(MidiEngineMessage::PositionUpdate(beats));
                     last_position_update = now;
                 }
-
-                last_time = now;
-            } else {
-                last_time = Instant::now();
             }
+            last_time = now;
 
             // Sleep for remainder of period
             let elapsed = start.elapsed();
@@ -677,7 +587,7 @@ pub struct MidiEngineHandle {
 
 impl MidiEngineHandle {
     /// Start a new MIDI engine
-    pub fn start(sample_rate: u32) -> Self {
+    pub fn start(sample_rate: u32, capture_sample_clock: Arc<AtomicU64>) -> Self {
         // Use bounded channels to prevent unbounded memory growth
         // Command buffer: up to 1000 pending commands
         let (command_tx, command_rx) = bounded(1000);
@@ -685,8 +595,13 @@ impl MidiEngineHandle {
         let (message_tx, message_rx) = bounded(500);
 
         let shutdown = Arc::new(AtomicBool::new(false));
-        let engine =
-            MidiEngine::new_with_shutdown(sample_rate, command_rx, message_tx, shutdown.clone());
+        let engine = MidiEngine::new_with_shutdown(
+            sample_rate,
+            command_rx,
+            message_tx,
+            shutdown.clone(),
+            capture_sample_clock,
+        );
 
         let thread = thread::Builder::new()
             .name("midi_engine".to_string())
@@ -756,10 +671,184 @@ impl Drop for MidiEngineHandle {
     }
 }
 
+/// Converts a complete MIDI wire message into the application's message model.
+///
+/// Messages with invalid lengths, data bytes, or unsupported status bytes are ignored. MIDI
+/// input callbacks deliver complete messages, so this intentionally does not implement running
+/// status or assemble fragmented SysEx packets.
+fn parse_midi_message(bytes: &[u8]) -> Option<MidiMessage> {
+    let (&status, data) = bytes.split_first()?;
+
+    match status {
+        0xF0 => parse_sysex(data),
+        0xF8 if data.is_empty() => Some(MidiMessage::MidiClock),
+        0xFA if data.is_empty() => Some(MidiMessage::MidiStart),
+        0xFC if data.is_empty() => Some(MidiMessage::MidiStop),
+        0xFB if data.is_empty() => Some(MidiMessage::MidiContinue),
+        status if status < 0xF0 => parse_channel_message(status, data),
+        _ => None,
+    }
+}
+
+fn parse_channel_message(status: u8, data: &[u8]) -> Option<MidiMessage> {
+    let channel = status & 0x0F;
+    let message_type = status & 0xF0;
+
+    match message_type {
+        0x80 if valid_data_bytes(data, 2) => Some(MidiMessage::NoteOff {
+            channel,
+            key: data[0],
+            velocity: data[1],
+        }),
+        0x90 if valid_data_bytes(data, 2) => {
+            let key = data[0];
+            let velocity = data[1];
+            if velocity == 0 {
+                Some(MidiMessage::NoteOff {
+                    channel,
+                    key,
+                    velocity,
+                })
+            } else {
+                Some(MidiMessage::NoteOn {
+                    channel,
+                    key,
+                    velocity,
+                })
+            }
+        }
+        0xA0 if valid_data_bytes(data, 2) => Some(MidiMessage::Aftertouch {
+            channel,
+            key: data[0],
+            pressure: data[1],
+        }),
+        0xB0 if valid_data_bytes(data, 2) => Some(MidiMessage::ControlChange {
+            channel,
+            controller: data[0],
+            value: data[1],
+        }),
+        0xC0 if valid_data_bytes(data, 1) => Some(MidiMessage::ProgramChange {
+            channel,
+            program: data[0],
+        }),
+        0xE0 if valid_data_bytes(data, 2) => {
+            let raw_value = u16::from(data[0]) | (u16::from(data[1]) << 7);
+            Some(MidiMessage::PitchBend {
+                channel,
+                value: raw_value as i16 - 8_192,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn valid_data_bytes(data: &[u8], expected_len: usize) -> bool {
+    data.len() == expected_len && data.iter().all(|byte| *byte <= 0x7F)
+}
+
+fn parse_sysex(data: &[u8]) -> Option<MidiMessage> {
+    let (end, payload) = data.split_last()?;
+    if *end != 0xF7 || payload.iter().any(|byte| *byte > 0x7F) {
+        return None;
+    }
+
+    Some(MidiMessage::SysEx(payload.to_vec()))
+}
+
+/// Converts an application MIDI message into a complete wire message.
+///
+/// The model uses wider unsigned fields than the MIDI wire format. Values outside the wire range
+/// are truncated to their low 7 bits, channels to their low 4 bits, and pitch bend is clamped to
+/// its signed 14-bit range before being re-centered for transmission.
+fn encode_midi_message(message: &MidiMessage) -> Vec<u8> {
+    match message {
+        MidiMessage::NoteOn {
+            channel,
+            key,
+            velocity,
+        } => vec![
+            channel_status(0x90, *channel),
+            data_byte(*key),
+            data_byte(*velocity),
+        ],
+        MidiMessage::NoteOff {
+            channel,
+            key,
+            velocity,
+        } => vec![
+            channel_status(0x80, *channel),
+            data_byte(*key),
+            data_byte(*velocity),
+        ],
+        MidiMessage::ControlChange {
+            channel,
+            controller,
+            value,
+        } => vec![
+            channel_status(0xB0, *channel),
+            data_byte(*controller),
+            data_byte(*value),
+        ],
+        MidiMessage::ProgramChange { channel, program } => {
+            vec![channel_status(0xC0, *channel), data_byte(*program)]
+        }
+        MidiMessage::PitchBend { channel, value } => {
+            let raw_value = (i32::from(*value).clamp(-8_192, 8_191) + 8_192) as u16;
+            vec![
+                channel_status(0xE0, *channel),
+                (raw_value & 0x7F) as u8,
+                ((raw_value >> 7) & 0x7F) as u8,
+            ]
+        }
+        MidiMessage::Aftertouch {
+            channel,
+            key,
+            pressure,
+        } => vec![
+            channel_status(0xA0, *channel),
+            data_byte(*key),
+            data_byte(*pressure),
+        ],
+        MidiMessage::SysEx(data) => {
+            let mut bytes = Vec::with_capacity(data.len() + 2);
+            bytes.push(0xF0);
+            bytes.extend(data.iter().map(|byte| data_byte(*byte)));
+            bytes.push(0xF7);
+            bytes
+        }
+        MidiMessage::MidiClock => vec![0xF8],
+        MidiMessage::MidiStart => vec![0xFA],
+        MidiMessage::MidiStop => vec![0xFC],
+        MidiMessage::MidiContinue => vec![0xFB],
+    }
+}
+
+fn channel_status(message_type: u8, channel: u8) -> u8 {
+    message_type | (channel & 0x0F)
+}
+
+fn data_byte(value: u8) -> u8 {
+    value & 0x7F
+}
+
 fn midir_timestamp_to_samples(timestamp_microseconds: u64, sample_rate: u32) -> u64 {
     let sample_rate = u64::from(sample_rate);
     (timestamp_microseconds / 1_000_000) * sample_rate
         + (timestamp_microseconds % 1_000_000) * sample_rate / 1_000_000
+}
+
+fn align_midir_timestamp(
+    timestamp_microseconds: u64,
+    capture_sample_now: u64,
+    sample_rate: u32,
+    origin: &mut Option<(u64, u64)>,
+) -> u64 {
+    let (midir_origin, sample_origin) =
+        *origin.get_or_insert((timestamp_microseconds, capture_sample_now));
+    sample_origin.saturating_add(midir_timestamp_to_samples(
+        timestamp_microseconds.saturating_sub(midir_origin),
+        sample_rate,
+    ))
 }
 
 #[cfg(test)]
@@ -831,5 +920,168 @@ mod tests {
     fn midir_microseconds_are_converted_to_samples() {
         assert_eq!(midir_timestamp_to_samples(1_000_000, 48_000), 48_000);
         assert_eq!(midir_timestamp_to_samples(500_000, 48_000), 24_000);
+    }
+
+    #[test]
+    fn each_midir_connection_is_aligned_to_the_shared_capture_clock() {
+        let mut origin = None;
+        assert_eq!(
+            align_midir_timestamp(5_000_000, 10_000, 48_000, &mut origin),
+            10_000
+        );
+        assert_eq!(
+            align_midir_timestamp(5_500_000, 99_999, 48_000, &mut origin),
+            34_000
+        );
+    }
+
+    #[test]
+    fn pitch_bend_round_trips_at_its_full_signed_range() {
+        for value in [-8_192, 0, 8_191] {
+            let message = MidiMessage::PitchBend { channel: 12, value };
+            let bytes = encode_midi_message(&message);
+
+            assert_eq!(bytes[0], 0xEC);
+            assert_eq!(parse_midi_message(&bytes), Some(message));
+        }
+
+        assert_eq!(
+            encode_midi_message(&MidiMessage::PitchBend {
+                channel: 0,
+                value: -8_192,
+            }),
+            [0xE0, 0, 0]
+        );
+        assert_eq!(
+            encode_midi_message(&MidiMessage::PitchBend {
+                channel: 0,
+                value: 0,
+            }),
+            [0xE0, 0, 64]
+        );
+        assert_eq!(
+            encode_midi_message(&MidiMessage::PitchBend {
+                channel: 0,
+                value: 8_191,
+            }),
+            [0xE0, 127, 127]
+        );
+    }
+
+    #[test]
+    fn parses_and_encodes_each_supported_channel_message() {
+        let cases = [
+            (
+                [0x92, 60, 100].as_slice(),
+                MidiMessage::NoteOn {
+                    channel: 2,
+                    key: 60,
+                    velocity: 100,
+                },
+            ),
+            (
+                [0x82, 60, 64].as_slice(),
+                MidiMessage::NoteOff {
+                    channel: 2,
+                    key: 60,
+                    velocity: 64,
+                },
+            ),
+            (
+                [0xA2, 60, 72].as_slice(),
+                MidiMessage::Aftertouch {
+                    channel: 2,
+                    key: 60,
+                    pressure: 72,
+                },
+            ),
+            (
+                [0xB2, 74, 99].as_slice(),
+                MidiMessage::ControlChange {
+                    channel: 2,
+                    controller: 74,
+                    value: 99,
+                },
+            ),
+            (
+                [0xC2, 10].as_slice(),
+                MidiMessage::ProgramChange {
+                    channel: 2,
+                    program: 10,
+                },
+            ),
+        ];
+
+        for (bytes, message) in cases {
+            assert_eq!(parse_midi_message(bytes), Some(message.clone()));
+            assert_eq!(encode_midi_message(&message), bytes);
+        }
+    }
+
+    #[test]
+    fn zero_velocity_note_on_is_parsed_as_note_off() {
+        assert_eq!(
+            parse_midi_message(&[0x9A, 60, 0]),
+            Some(MidiMessage::NoteOff {
+                channel: 10,
+                key: 60,
+                velocity: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_and_encodes_sysex_and_realtime_messages() {
+        let sysex = MidiMessage::SysEx(vec![0x7D, 1, 2, 3]);
+        assert_eq!(encode_midi_message(&sysex), [0xF0, 0x7D, 1, 2, 3, 0xF7]);
+        assert_eq!(
+            parse_midi_message(&[0xF0, 0x7D, 1, 2, 3, 0xF7]),
+            Some(sysex)
+        );
+
+        for (status, message) in [
+            (0xF8, MidiMessage::MidiClock),
+            (0xFA, MidiMessage::MidiStart),
+            (0xFC, MidiMessage::MidiStop),
+            (0xFB, MidiMessage::MidiContinue),
+        ] {
+            assert_eq!(parse_midi_message(&[status]), Some(message.clone()));
+            assert_eq!(encode_midi_message(&message), [status]);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_midi_input_without_panicking() {
+        for bytes in [
+            [].as_slice(),
+            [0x90, 60].as_slice(),
+            [0xC0].as_slice(),
+            [0xB0, 1, 0x80].as_slice(),
+            [0xF8, 0].as_slice(),
+            [0xF0, 1, 2].as_slice(),
+            [0xF0, 1, 0xF8, 0xF7].as_slice(),
+            [0xF7].as_slice(),
+        ] {
+            assert_eq!(parse_midi_message(bytes), None, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn output_truncates_non_wire_values_and_clamps_pitch_bend() {
+        assert_eq!(
+            encode_midi_message(&MidiMessage::NoteOn {
+                channel: 31,
+                key: 200,
+                velocity: 255,
+            }),
+            [0x9F, 72, 127]
+        );
+        assert_eq!(
+            encode_midi_message(&MidiMessage::PitchBend {
+                channel: 0,
+                value: 20_000,
+            }),
+            [0xE0, 127, 127]
+        );
     }
 }

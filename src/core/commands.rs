@@ -79,6 +79,14 @@ pub enum DawCommand {
         track_id: String,
         channel: u8,
     },
+    SetTrackMidiInputPort {
+        track_id: String,
+        input_port: Option<String>,
+    },
+    SetTrackMidiInputChannel {
+        track_id: String,
+        channel: Option<u8>,
+    },
     MuteTrack {
         track_id: String,
     },
@@ -274,6 +282,8 @@ impl DawCommand {
             Self::AddTrack { .. }
                 | Self::DeleteTrack { .. }
                 | Self::SetTrackMidiChannel { .. }
+                | Self::SetTrackMidiInputPort { .. }
+                | Self::SetTrackMidiInputChannel { .. }
                 | Self::SoloTrack { .. }
                 | Self::UnsoloTrack { .. }
                 | Self::ArmTrack { .. }
@@ -320,6 +330,8 @@ impl DawCommand {
                 | Self::AddTrack { .. }
                 | Self::DeleteTrack { .. }
                 | Self::SetTrackMidiChannel { .. }
+                | Self::SetTrackMidiInputPort { .. }
+                | Self::SetTrackMidiInputChannel { .. }
                 | Self::MuteTrack { .. }
                 | Self::UnmuteTrack { .. }
                 | Self::SoloTrack { .. }
@@ -374,6 +386,61 @@ impl DawCommand {
                 | Self::MuteTake { .. }
         )
     }
+}
+
+fn recording_input_routing(track: &Track) -> (String, Option<u8>) {
+    let TrackType::Midi {
+        input_device_name,
+        input_channel,
+        ..
+    } = &track.track_type;
+
+    let input_port = input_device_name
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let channel_filter = input_channel
+        .and_then(|channel| channel.checked_sub(1))
+        .filter(|channel| *channel < 16);
+
+    (input_port, channel_filter)
+}
+
+pub(crate) fn recording_session_context(
+    state: &DawState,
+    track_id: &str,
+    mode: RecordingMode,
+) -> RecordingSessionContext {
+    let target_clip_id = state.selected_clip.as_ref().and_then(|selected_id| {
+        state
+            .project
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .and_then(|track| {
+                track
+                    .clips
+                    .iter()
+                    .any(|clip| matches!(clip, Clip::Midi { id, .. } if id == selected_id))
+                    .then(|| selected_id.clone())
+            })
+    });
+    let punch_range = (mode == RecordingMode::PunchInOut)
+        .then(|| state.punch_in.zip(state.punch_out))
+        .flatten()
+        .filter(|(start, end)| end > start);
+    let loop_range = state
+        .loop_enabled
+        .then_some((state.loop_start, state.loop_end))
+        .filter(|(start, end)| end > start);
+
+    RecordingSessionContext::new(
+        track_id.to_string(),
+        target_clip_id,
+        mode,
+        state.current_time,
+        punch_range,
+        loop_range,
+    )
 }
 
 impl Command for DawCommand {
@@ -434,6 +501,57 @@ impl Command for DawCommand {
                 if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
                     let TrackType::Midi { channel: ch, .. } = &mut track.track_type;
                     *ch = *channel;
+                }
+                Ok(())
+            }
+
+            DawCommand::SetTrackMidiInputPort {
+                track_id,
+                input_port,
+            } => {
+                if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
+                    let TrackType::Midi {
+                        input_device_name, ..
+                    } = &mut track.track_type;
+                    *input_device_name = input_port.clone().filter(|port| !port.is_empty());
+
+                    if track.is_armed {
+                        let (input_port, channel_filter) = recording_input_routing(track);
+                        if let Some(recording_coordinator) = &state.recording_coordinator {
+                            recording_coordinator.lock().send_command(
+                                crate::core::RecordingCommand::ArmTrack {
+                                    track_id: track_id.clone(),
+                                    input_port,
+                                    channel_filter,
+                                },
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            DawCommand::SetTrackMidiInputChannel { track_id, channel } => {
+                if channel.is_some_and(|channel| !(1..=16).contains(&channel)) {
+                    return Err("MIDI input channel must be between 1 and 16".into());
+                }
+
+                if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
+                    let TrackType::Midi { input_channel, .. } = &mut track.track_type;
+                    *input_channel = *channel;
+
+                    if track.is_armed {
+                        let (input_port, channel_filter) = recording_input_routing(track);
+                        if let Some(recording_coordinator) = &state.recording_coordinator {
+                            recording_coordinator.lock().send_command(
+                                crate::core::RecordingCommand::ArmTrack {
+                                    track_id: track_id.clone(),
+                                    input_port,
+                                    channel_filter,
+                                },
+                            );
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -525,11 +643,12 @@ impl Command for DawCommand {
 
                     // Arm the track in recording coordinator
                     if let Some(recording_coordinator) = &state.recording_coordinator {
+                        let (input_port, channel_filter) = recording_input_routing(track);
                         let coordinator = recording_coordinator.lock();
                         coordinator.send_command(crate::core::RecordingCommand::ArmTrack {
                             track_id: track_id.clone(),
-                            input_port: "default".to_string(), // TODO: Get from track settings
-                            channel_filter: None,              // TODO: Get from track settings
+                            input_port,
+                            channel_filter,
                         });
                         // Enable monitoring
                         coordinator.send_command(
@@ -1042,6 +1161,7 @@ impl Command for DawCommand {
 
             // MIDI Recording commands
             DawCommand::StartMidiRecording { track_id, mode } => {
+                let session = recording_session_context(state, track_id, *mode);
                 if let Some(track) = state.project.tracks.iter_mut().find(|t| t.id == *track_id) {
                     // Arm the track if not already armed
                     if !track.is_armed {
@@ -1049,11 +1169,12 @@ impl Command for DawCommand {
 
                         // Arm the track in recording coordinator
                         if let Some(recording_coordinator) = &state.recording_coordinator {
+                            let (input_port, channel_filter) = recording_input_routing(track);
                             recording_coordinator.lock().send_command(
                                 crate::core::RecordingCommand::ArmTrack {
                                     track_id: track_id.clone(),
-                                    input_port: "default".to_string(), // TODO: Get from track settings
-                                    channel_filter: None, // TODO: Get from track settings
+                                    input_port,
+                                    channel_filter,
                                 },
                             );
                         }
@@ -1064,6 +1185,7 @@ impl Command for DawCommand {
                         // Start count-in
                         state.count_in_active = true;
                         state.count_in_start_time = Some(state.current_time);
+                        state.pending_recording_session = Some(session);
 
                         // Enable metronome during count-in
                         if let Some(engine) = &state.midi_engine {
@@ -1086,26 +1208,11 @@ impl Command for DawCommand {
                             .info(format!("Count-in: {} bars", state.count_in_bars));
                     } else {
                         // Start recording immediately
+                        state.pending_recording_session = None;
                         if let Some(recording_coordinator) = &state.recording_coordinator {
-                            let (punch_in, punch_out) = if *mode == RecordingMode::PunchInOut {
-                                (
-                                    state
-                                        .punch_in
-                                        .map(|time| (time - state.current_time).max(0.0)),
-                                    state
-                                        .punch_out
-                                        .map(|time| (time - state.current_time).max(0.0)),
-                                )
-                            } else {
-                                (None, None)
-                            };
-                            recording_coordinator.lock().start_recording(
-                                track_id.clone(),
-                                None, // No specific clip yet
-                                *mode,
-                                punch_in,
-                                punch_out,
-                            );
+                            recording_coordinator
+                                .lock()
+                                .start_recording_session(session);
                         }
 
                         state
@@ -1128,6 +1235,7 @@ impl Command for DawCommand {
                     // Cancel count-in
                     state.count_in_active = false;
                     state.count_in_start_time = None;
+                    state.pending_recording_session = None;
 
                     // Disable metronome if it was only for count-in
                     if !state.metronome {
@@ -1629,12 +1737,13 @@ impl Command for DawCommand {
 
                     // Also arm in recording coordinator
                     if let Some(recording_coordinator) = &state.recording_coordinator {
+                        let (input_port, channel_filter) = recording_input_routing(track);
                         recording_coordinator
                             .lock()
                             .send_command(RecordingCommand::ArmTrack {
                                 track_id: track_id.clone(),
-                                input_port: "default".to_string(),
-                                channel_filter: None,
+                                input_port,
+                                channel_filter,
                             });
                     }
                 }
@@ -1780,6 +1889,8 @@ impl Command for DawCommand {
             DawCommand::StartPlayback => "Start Playback",
             DawCommand::PausePlayback => "Pause Playback",
             DawCommand::SetTrackMidiChannel { .. } => "Set Track MIDI Channel",
+            DawCommand::SetTrackMidiInputPort { .. } => "Set Track MIDI Input Port",
+            DawCommand::SetTrackMidiInputChannel { .. } => "Set Track MIDI Input Channel",
             DawCommand::MuteTrack { .. } => "Mute Track",
             DawCommand::UnmuteTrack { .. } => "Unmute Track",
             DawCommand::SoloTrack { .. } => "Solo Track",
@@ -1830,5 +1941,134 @@ impl CommandCollector {
 
     pub fn take_commands(&mut self) -> Vec<DawCommand> {
         std::mem::take(&mut self.commands)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn midi_track(id: &str) -> Track {
+        Track {
+            id: id.to_string(),
+            name: "MIDI".to_string(),
+            track_type: TrackType::Midi {
+                channel: 1,
+                device_name: None,
+                input_device_name: None,
+                input_channel: None,
+            },
+            clips: Vec::new(),
+            is_muted: false,
+            is_soloed: false,
+            is_armed: false,
+            input_monitoring: false,
+            color: "#ffffff".to_string(),
+            takes: Vec::new(),
+            active_take: None,
+        }
+    }
+
+    #[test]
+    fn input_routing_commands_persist_project_settings() -> Result<(), Box<dyn std::error::Error>> {
+        let track_id = "track-1";
+        let mut state = DawState::new();
+        state.project.tracks.push(midi_track(track_id));
+
+        let port_command = DawCommand::SetTrackMidiInputPort {
+            track_id: track_id.to_string(),
+            input_port: Some("Keyboard".to_string()),
+        };
+        let channel_command = DawCommand::SetTrackMidiInputChannel {
+            track_id: track_id.to_string(),
+            channel: Some(7),
+        };
+
+        port_command.execute(&mut state)?;
+        channel_command.execute(&mut state)?;
+
+        let TrackType::Midi {
+            input_device_name,
+            input_channel,
+            ..
+        } = &state.project.tracks[0].track_type;
+        assert_eq!(input_device_name.as_deref(), Some("Keyboard"));
+        assert_eq!(*input_channel, Some(7));
+        assert!(port_command.changes_project());
+        assert!(port_command.invalidates_redo());
+        assert_eq!(channel_command.name(), "Set Track MIDI Input Channel");
+        Ok(())
+    }
+
+    #[test]
+    fn input_channel_must_be_a_one_based_midi_channel() {
+        let mut state = DawState::new();
+        state.project.tracks.push(midi_track("track-1"));
+
+        let result = DawCommand::SetTrackMidiInputChannel {
+            track_id: "track-1".to_string(),
+            channel: Some(0),
+        }
+        .execute(&mut state);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn input_routing_converts_display_channel_to_midi_channel() {
+        let mut track = midi_track("track-1");
+        let TrackType::Midi {
+            input_device_name,
+            input_channel,
+            ..
+        } = &mut track.track_type;
+        *input_device_name = Some("Keyboard".to_string());
+        *input_channel = Some(1);
+
+        assert_eq!(
+            recording_input_routing(&track),
+            ("Keyboard".to_string(), Some(0))
+        );
+    }
+
+    #[test]
+    fn count_in_preserves_the_original_recording_intent() {
+        let mut state = DawState::new();
+        let mut track = midi_track("track-1");
+        track.clips.push(Clip::Midi {
+            id: "clip-1".to_string(),
+            start_time: 0.0,
+            length: 4.0,
+            file_path: PathBuf::new(),
+            midi_data: Some(MidiEventStore::new(480)),
+            loaded: true,
+            automation_lanes: Vec::new(),
+        });
+        state.project.tracks.push(track);
+        state.selected_clip = Some("clip-1".to_string());
+        state.punch_in = Some(1.0);
+        state.punch_out = Some(3.0);
+        state.loop_enabled = true;
+        state.loop_start = 0.0;
+        state.loop_end = 4.0;
+
+        DawCommand::StartMidiRecording {
+            track_id: "track-1".to_string(),
+            mode: RecordingMode::PunchInOut,
+        }
+        .execute(&mut state)
+        .unwrap();
+
+        // These UI fields may change while the count-in is running.
+        state.selected_clip = None;
+        state.recording_mode = RecordingMode::Overdub;
+        state.punch_in = None;
+        state.loop_enabled = false;
+
+        let pending = state.pending_recording_session.as_ref().unwrap();
+        assert_eq!(pending.target_clip_id.as_deref(), Some("clip-1"));
+        assert_eq!(pending.mode, RecordingMode::PunchInOut);
+        assert_eq!(pending.punch_range, Some((1.0, 3.0)));
+        assert_eq!(pending.loop_range, Some((0.0, 4.0)));
     }
 }

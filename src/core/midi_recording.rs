@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
@@ -15,6 +15,40 @@ pub enum RecordingMode {
     Overdub,    // Add to existing MIDI data
     Replace,    // Overwrite in recording range
     PunchInOut, // Record only between punch points
+}
+
+/// Immutable transport and editing context captured when a recording begins.
+///
+/// Keeping this with the committed event batch prevents UI changes made while
+/// recording from changing how the completed session is applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordingSessionContext {
+    pub track_id: String,
+    pub target_clip_id: Option<String>,
+    pub mode: RecordingMode,
+    pub transport_start_seconds: f64,
+    pub punch_range: Option<(f64, f64)>,
+    pub loop_range: Option<(f64, f64)>,
+}
+
+impl RecordingSessionContext {
+    pub fn new(
+        track_id: String,
+        target_clip_id: Option<String>,
+        mode: RecordingMode,
+        transport_start_seconds: f64,
+        punch_range: Option<(f64, f64)>,
+        loop_range: Option<(f64, f64)>,
+    ) -> Self {
+        Self {
+            track_id,
+            target_clip_id,
+            mode,
+            transport_start_seconds,
+            punch_range: punch_range.filter(|(start, end)| end > start),
+            loop_range: loop_range.filter(|(start, end)| end - start > f64::EPSILON),
+        }
+    }
 }
 
 /// Monitoring modes for input
@@ -64,12 +98,9 @@ impl Default for RecordingConfig {
 /// Commands sent to the recording thread
 #[derive(Debug, Clone)]
 pub enum RecordingCommand {
-    StartRecording {
-        track_id: String,
-        clip_id: Option<String>,
-        mode: RecordingMode,
-        punch_in: Option<f64>,
-        punch_out: Option<f64>,
+    StartRecordingSession {
+        session: RecordingSessionContext,
+        capture_start_sample: u64,
     },
     StopRecording {
         track_id: String,
@@ -96,14 +127,13 @@ pub enum RecordingCommand {
 pub enum RecordingEvent {
     RecordingStarted {
         track_id: String,
-        timestamp: f64,
     },
     RecordingStopped {
         track_id: String,
         events_recorded: usize,
     },
     EventsRecorded {
-        track_id: String,
+        session: RecordingSessionContext,
         events: Vec<RecordedEvent>,
     },
     BufferOverflow {
@@ -127,11 +157,8 @@ pub struct RecordedEvent {
 
 /// Active recording session for a track
 struct ActiveRecording {
-    track_id: String,
-    clip_id: Option<String>,
-    mode: RecordingMode,
-    start_sample: Option<u64>,
-    start_beat: f64,
+    session: RecordingSessionContext,
+    start_sample: u64,
     punch_in_sample: Option<u64>,
     punch_out_sample: Option<u64>,
     events: Vec<RecordedEvent>,
@@ -156,6 +183,9 @@ impl PreRollBuffer {
     }
 
     fn push(&mut self, event: RecordedEvent) {
+        if self.capacity == 0 {
+            return;
+        }
         if self.buffer.len() < self.capacity {
             self.buffer.push(event);
         } else {
@@ -165,21 +195,19 @@ impl PreRollBuffer {
     }
 
     fn get_events_since(&self, timestamp: u64) -> Vec<RecordedEvent> {
-        let mut result = Vec::new();
-
-        // Collect events newer than timestamp
-        for i in 0..self.buffer.len() {
-            let idx = (self.write_index + self.capacity - i - 1) % self.capacity;
-            let event = &self.buffer[idx];
-            if event.timestamp_samples >= timestamp {
-                result.push(event.clone());
-            } else {
-                break;
-            }
-        }
-
-        result.reverse();
-        result
+        let oldest_index = if self.buffer.len() < self.capacity {
+            0
+        } else {
+            self.write_index
+        };
+        (0..self.buffer.len())
+            .map(|offset| (oldest_index + offset) % self.buffer.len())
+            .map(|index| &self.buffer[index])
+            // Timestamps from separate MIDI connections can have different
+            // origins, so do not assume one older value makes the rest old.
+            .filter(|event| event.timestamp_samples >= timestamp)
+            .cloned()
+            .collect()
     }
 }
 
@@ -192,10 +220,10 @@ pub struct RecordingCoordinator {
     // Recording thread handle
     thread_handle: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    capture_sample_clock: Arc<AtomicU64>,
 
-    // Shared state
+    // Shared configuration
     config: Arc<RwLock<RecordingConfig>>,
-    armed_tracks: Arc<RwLock<HashMap<String, ArmedTrackInfo>>>,
 }
 
 #[derive(Clone)]
@@ -206,7 +234,11 @@ struct ArmedTrackInfo {
 }
 
 impl RecordingCoordinator {
-    pub fn new(sample_rate: u32, midi_input_rx: Receiver<(String, MidiMessage, u64)>) -> Self {
+    pub fn new(
+        sample_rate: u32,
+        midi_input_rx: Receiver<(String, MidiMessage, u64)>,
+        capture_sample_clock: Arc<AtomicU64>,
+    ) -> Self {
         let (command_tx, command_rx) = bounded(256);
         let (event_tx, event_rx) = bounded(1024);
 
@@ -239,8 +271,8 @@ impl RecordingCoordinator {
             event_rx,
             thread_handle: Some(thread_handle),
             shutdown,
+            capture_sample_clock,
             config,
-            armed_tracks,
         }
     }
 
@@ -260,31 +292,16 @@ impl RecordingCoordinator {
         self.send_command(RecordingCommand::UpdateConfig(config));
     }
 
-    /// Get current armed tracks
-    pub fn get_armed_tracks(&self) -> Vec<String> {
-        self.armed_tracks.read().keys().cloned().collect()
-    }
-
     /// Get current recording configuration
     pub fn get_config(&self) -> RecordingConfig {
         self.config.read().clone()
     }
 
-    /// Start recording on a track
-    pub fn start_recording(
-        &mut self,
-        track_id: String,
-        clip_id: Option<String>,
-        mode: RecordingMode,
-        punch_in: Option<f64>,
-        punch_out: Option<f64>,
-    ) {
-        self.send_command(RecordingCommand::StartRecording {
-            track_id,
-            clip_id,
-            mode,
-            punch_in,
-            punch_out,
+    /// Start recording with immutable project/transport context.
+    pub fn start_recording_session(&mut self, session: RecordingSessionContext) {
+        self.send_command(RecordingCommand::StartRecordingSession {
+            session,
+            capture_start_sample: self.capture_sample_clock.load(Ordering::Acquire),
         });
     }
 
@@ -303,12 +320,6 @@ impl RecordingCoordinator {
             enabled,
         });
     }
-
-    /// Handle incoming MIDI input
-    pub fn handle_midi_input(&mut self, port_id: String, message: MidiMessage, timestamp: u64) {
-        // The recording thread will receive this through midi_input_rx
-        // which is already connected to the MIDI engine
-    }
 }
 
 impl Drop for RecordingCoordinator {
@@ -323,7 +334,6 @@ impl Drop for RecordingCoordinator {
 /// The actual recording thread implementation
 struct MidiRecorder {
     sample_rate: u32,
-    latest_input_sample: Option<u64>,
 
     // Communication
     command_rx: Receiver<RecordingCommand>,
@@ -358,7 +368,6 @@ impl MidiRecorder {
 
         Self {
             sample_rate,
-            latest_input_sample: None,
             command_rx,
             event_tx,
             midi_input_rx,
@@ -391,15 +400,10 @@ impl MidiRecorder {
 
     fn handle_command(&mut self, command: RecordingCommand) {
         match command {
-            RecordingCommand::StartRecording {
-                track_id,
-                clip_id,
-                mode,
-                punch_in,
-                punch_out,
-            } => {
-                self.start_recording(track_id, clip_id, mode, punch_in, punch_out);
-            }
+            RecordingCommand::StartRecordingSession {
+                session,
+                capture_start_sample,
+            } => self.start_recording(session, capture_start_sample),
             RecordingCommand::StopRecording { track_id, commit } => {
                 self.stop_recording(track_id, commit);
             }
@@ -439,7 +443,6 @@ impl MidiRecorder {
     }
 
     fn handle_midi_event(&mut self, port_id: String, message: MidiMessage, timestamp: u64) {
-        self.latest_input_sample = Some(timestamp);
         let timestamp_beats = timestamp as f64 * self.beats_per_sample;
 
         let recorded_event = RecordedEvent {
@@ -452,29 +455,27 @@ impl MidiRecorder {
         // Always add to pre-roll buffer
         self.pre_roll_buffer.push(recorded_event.clone());
 
-        for (_track_id, recording) in &mut self.active_recordings {
+        for recording in self.active_recordings.values_mut() {
             // Check if this event is for this track's input
             if !input_port_matches(&recording.input_port, &port_id) {
                 continue;
             }
 
-            // Check channel filter
-            if let Some(filter_channel) = recording.channel_filter {
-                match &message {
-                    MidiMessage::NoteOn { channel, .. }
-                    | MidiMessage::NoteOff { channel, .. }
-                    | MidiMessage::ControlChange { channel, .. } => {
-                        if *channel != filter_channel {
-                            continue;
-                        }
-                    }
-                    _ => {}
-                }
+            // System messages are not channel-scoped and pass every channel filter.
+            if recording
+                .channel_filter
+                .zip(message.channel())
+                .is_some_and(|(filter, channel)| filter != channel)
+            {
+                continue;
             }
 
             // Check punch in/out
-            let start_sample = recording.start_sample.get_or_insert(timestamp);
-            let relative_samples = timestamp.saturating_sub(*start_sample);
+            let Some(relative_samples) = timestamp.checked_sub(recording.start_sample) else {
+                // Events queued before the start command belong only to the
+                // explicit pre-roll path; never collapse them onto time zero.
+                continue;
+            };
 
             if let Some(punch_in) = recording.punch_in_sample {
                 if relative_samples < punch_in {
@@ -483,7 +484,7 @@ impl MidiRecorder {
             }
 
             if let Some(punch_out) = recording.punch_out_sample {
-                if relative_samples > punch_out {
+                if relative_samples >= punch_out {
                     continue;
                 }
             }
@@ -508,18 +509,12 @@ impl MidiRecorder {
                 continue;
             }
 
-            // Check channel filter
-            if let Some(filter_channel) = info.channel_filter {
-                match &message {
-                    MidiMessage::NoteOn { channel, .. }
-                    | MidiMessage::NoteOff { channel, .. }
-                    | MidiMessage::ControlChange { channel, .. } => {
-                        if *channel != filter_channel {
-                            continue;
-                        }
-                    }
-                    _ => {}
-                }
+            if info
+                .channel_filter
+                .zip(message.channel())
+                .is_some_and(|(filter, channel)| filter != channel)
+            {
+                continue;
             }
 
             // Send monitoring event
@@ -530,57 +525,73 @@ impl MidiRecorder {
         }
     }
 
-    fn start_recording(
-        &mut self,
-        track_id: String,
-        clip_id: Option<String>,
-        mode: RecordingMode,
-        punch_in: Option<f64>,
-        punch_out: Option<f64>,
-    ) {
+    fn start_recording(&mut self, mut session: RecordingSessionContext, current_sample: u64) {
+        let track_id = session.track_id.clone();
         // Get armed track info
         let armed_info = match self.armed_tracks.read().get(&track_id) {
             Some(info) => info.clone(),
             None => return, // Track not armed
         };
 
-        let current_sample = self.latest_input_sample;
-        let current_beat = current_sample.unwrap_or_default() as f64 * self.beats_per_sample;
-
-        // Punch points are seconds relative to the beginning of this recording
-        // session. Keep this independent from tempo and the absolute transport.
-        let punch_in_sample = punch_in.map(|seconds| (seconds * self.sample_rate as f64) as u64);
-        let punch_out_sample = punch_out.map(|seconds| (seconds * self.sample_rate as f64) as u64);
-
         // Get pre-roll events if configured
         let config = self.config.read();
-        let mut initial_events = Vec::new();
+        let mut pre_roll_events = Vec::new();
 
-        if let Some(current_sample) = current_sample.filter(|_| config.pre_roll_ms > 0) {
+        if config.pre_roll_ms > 0 && session.mode != RecordingMode::PunchInOut {
             let pre_roll_samples =
                 (self.sample_rate as f64 * config.pre_roll_ms as f64 / 1000.0) as u64;
             let pre_roll_start = current_sample.saturating_sub(pre_roll_samples);
-            initial_events = self
+            pre_roll_events = self
                 .pre_roll_buffer
                 .get_events_since(pre_roll_start)
                 .into_iter()
-                .map(|event| RecordedEvent {
-                    timestamp_samples: event.timestamp_samples.saturating_sub(current_sample),
-                    timestamp_beats: event.timestamp_samples.saturating_sub(current_sample) as f64
-                        * self.beats_per_sample,
-                    port_id: event.port_id,
-                    message: event.message,
+                .filter(|event| input_port_matches(&armed_info.input_port, &event.port_id))
+                .filter(|event| {
+                    !armed_info
+                        .channel_filter
+                        .zip(event.message.channel())
+                        .is_some_and(|(filter, channel)| filter != channel)
                 })
-                .collect();
+                .collect::<Vec<_>>();
         }
+        drop(config);
+
+        let recording_origin = pre_roll_events
+            .first()
+            .map(|event| event.timestamp_samples.min(current_sample))
+            .unwrap_or(current_sample);
+        let pre_roll_seconds =
+            current_sample.saturating_sub(recording_origin) as f64 / self.sample_rate as f64;
+        session.transport_start_seconds -= pre_roll_seconds;
+        let initial_events = pre_roll_events
+            .into_iter()
+            .map(|event| RecordedEvent {
+                timestamp_samples: event.timestamp_samples.saturating_sub(recording_origin),
+                timestamp_beats: event.timestamp_samples.saturating_sub(recording_origin) as f64
+                    * self.beats_per_sample,
+                port_id: event.port_id,
+                message: event.message,
+            })
+            .collect();
+
+        // Convert absolute project punch points to this session's sample clock.
+        let (punch_in_sample, punch_out_sample) = session
+            .punch_range
+            .filter(|_| session.mode == RecordingMode::PunchInOut)
+            .map(|(punch_in, punch_out)| {
+                let relative_in = (punch_in - session.transport_start_seconds).max(0.0);
+                let relative_out = (punch_out - session.transport_start_seconds).max(0.0);
+                (
+                    Some((relative_in * self.sample_rate as f64) as u64),
+                    Some((relative_out * self.sample_rate as f64) as u64),
+                )
+            })
+            .unwrap_or((None, None));
 
         // Create active recording
         let recording = ActiveRecording {
-            track_id: track_id.clone(),
-            clip_id,
-            mode,
-            start_sample: current_sample,
-            start_beat: current_beat,
+            session,
+            start_sample: recording_origin,
             punch_in_sample,
             punch_out_sample,
             events: initial_events,
@@ -591,10 +602,9 @@ impl MidiRecorder {
         self.active_recordings.insert(track_id.clone(), recording);
 
         // Notify recording started
-        let _ = self.event_tx.try_send(RecordingEvent::RecordingStarted {
-            track_id,
-            timestamp: current_beat,
-        });
+        let _ = self
+            .event_tx
+            .try_send(RecordingEvent::RecordingStarted { track_id });
     }
 
     fn stop_recording(&mut self, track_id: String, commit: bool) {
@@ -603,7 +613,7 @@ impl MidiRecorder {
 
             if commit && events_count > 0 {
                 self.send_recorded_batch(RecordingEvent::EventsRecorded {
-                    track_id: track_id.clone(),
+                    session: recording.session,
                     events: recording.events,
                 });
             }
@@ -643,11 +653,15 @@ mod tests {
     use super::*;
 
     fn recorder() -> (MidiRecorder, Receiver<RecordingEvent>) {
+        recorder_with_pre_roll(0)
+    }
+
+    fn recorder_with_pre_roll(pre_roll_ms: u32) -> (MidiRecorder, Receiver<RecordingEvent>) {
         let (_command_tx, command_rx) = bounded(1);
         let (_input_tx, midi_input_rx) = bounded(1);
         let (event_tx, event_rx) = bounded(8);
         let config = Arc::new(RwLock::new(RecordingConfig {
-            pre_roll_ms: 0,
+            pre_roll_ms,
             ..RecordingConfig::default()
         }));
         let armed_tracks = Arc::new(RwLock::new(HashMap::new()));
@@ -683,11 +697,15 @@ mod tests {
             channel_filter: None,
         });
         recorder.start_recording(
-            "track".to_string(),
-            None,
-            RecordingMode::Overdub,
-            None,
-            None,
+            RecordingSessionContext::new(
+                "track".to_string(),
+                None,
+                RecordingMode::Overdub,
+                0.0,
+                None,
+                None,
+            ),
+            48_000,
         );
         let _ = event_rx.try_recv(); // RecordingStarted
 
@@ -711,13 +729,15 @@ mod tests {
             input_port: "Keyboard".to_string(),
             channel_filter: None,
         });
-        recorder.start_recording(
+        let session = RecordingSessionContext::new(
             "track".to_string(),
-            None,
+            Some("clip".to_string()),
             RecordingMode::Overdub,
+            12.0,
             None,
-            None,
+            Some((8.0, 12.0)),
         );
+        recorder.start_recording(session.clone(), 48_000);
         let _ = event_rx.try_recv(); // RecordingStarted
 
         recorder.handle_midi_event("Keyboard".to_string(), note_on(), 48_000);
@@ -734,11 +754,224 @@ mod tests {
 
         recorder.stop_recording("track".to_string(), true);
         match event_rx.try_recv().unwrap() {
-            RecordingEvent::EventsRecorded { events, .. } => {
+            RecordingEvent::EventsRecorded {
+                session: committed_session,
+                events,
+            } => {
+                assert_eq!(committed_session, session);
                 assert_eq!(events.len(), 2);
                 assert_eq!(events[0].timestamp_samples, 0);
                 assert_eq!(events[1].timestamp_samples, 24_000);
                 assert_eq!(events[1].timestamp_beats, 1.0);
+            }
+            event => panic!("expected recorded batch, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_filter_applies_to_every_channel_message() {
+        let (mut recorder, event_rx) = recorder();
+        recorder.handle_command(RecordingCommand::ArmTrack {
+            track_id: "track".to_string(),
+            input_port: "Keyboard".to_string(),
+            channel_filter: Some(2),
+        });
+        recorder.start_recording(
+            RecordingSessionContext::new(
+                "track".to_string(),
+                None,
+                RecordingMode::Overdub,
+                0.0,
+                None,
+                None,
+            ),
+            0,
+        );
+        let _ = event_rx.try_recv();
+
+        recorder.handle_midi_event(
+            "Keyboard".to_string(),
+            MidiMessage::ProgramChange {
+                channel: 1,
+                program: 4,
+            },
+            0,
+        );
+        recorder.handle_midi_event(
+            "Keyboard".to_string(),
+            MidiMessage::Aftertouch {
+                channel: 2,
+                key: 60,
+                pressure: 80,
+            },
+            1,
+        );
+        recorder.stop_recording("track".to_string(), true);
+
+        match event_rx.try_recv().unwrap() {
+            RecordingEvent::EventsRecorded { events, .. } => {
+                assert_eq!(events.len(), 1);
+                assert!(matches!(events[0].message, MidiMessage::Aftertouch { .. }));
+            }
+            event => panic!("expected recorded batch, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn punch_range_is_half_open() {
+        let (mut recorder, event_rx) = recorder();
+        recorder.handle_command(RecordingCommand::ArmTrack {
+            track_id: "track".to_string(),
+            input_port: "default".to_string(),
+            channel_filter: None,
+        });
+        recorder.start_recording(
+            RecordingSessionContext::new(
+                "track".to_string(),
+                None,
+                RecordingMode::PunchInOut,
+                0.0,
+                Some((0.5, 1.0)),
+                None,
+            ),
+            0,
+        );
+        let _ = event_rx.try_recv();
+
+        // The first played note arrives after punch-in. Its timestamp remains
+        // relative to recording start instead of becoming the clock origin.
+        recorder.handle_midi_event("Keyboard".to_string(), note_on(), 36_000);
+        recorder.handle_midi_event("Keyboard".to_string(), note_on(), 48_000);
+        recorder.stop_recording("track".to_string(), true);
+
+        match event_rx.try_recv().unwrap() {
+            RecordingEvent::EventsRecorded { events, .. } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].timestamp_samples, 36_000);
+            }
+            event => panic!("expected recorded batch, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn partially_filled_pre_roll_buffer_is_read_in_timestamp_order() {
+        let mut buffer = PreRollBuffer::new(3);
+        for timestamp_samples in [1, 2] {
+            buffer.push(RecordedEvent {
+                timestamp_samples,
+                timestamp_beats: 0.0,
+                port_id: "Keyboard".to_string(),
+                message: note_on(),
+            });
+        }
+        assert_eq!(
+            buffer
+                .get_events_since(0)
+                .iter()
+                .map(|event| event.timestamp_samples)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+
+        for timestamp_samples in [3, 4] {
+            buffer.push(RecordedEvent {
+                timestamp_samples,
+                timestamp_beats: 0.0,
+                port_id: "Keyboard".to_string(),
+                message: note_on(),
+            });
+        }
+        assert_eq!(
+            buffer
+                .get_events_since(0)
+                .iter()
+                .map(|event| event.timestamp_samples)
+                .collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn pre_roll_respects_the_armed_port_and_channel_filter() {
+        let (mut recorder, event_rx) = recorder_with_pre_roll(1_000);
+        recorder.handle_command(RecordingCommand::ArmTrack {
+            track_id: "track".to_string(),
+            input_port: "Keyboard".to_string(),
+            channel_filter: Some(2),
+        });
+        recorder.handle_midi_event("Other".to_string(), note_on(), 1);
+        recorder.handle_midi_event(
+            "Keyboard".to_string(),
+            MidiMessage::ProgramChange {
+                channel: 1,
+                program: 10,
+            },
+            2,
+        );
+        recorder.handle_midi_event(
+            "Keyboard".to_string(),
+            MidiMessage::ProgramChange {
+                channel: 2,
+                program: 11,
+            },
+            3,
+        );
+
+        recorder.start_recording(
+            RecordingSessionContext::new(
+                "track".to_string(),
+                None,
+                RecordingMode::Overdub,
+                0.0,
+                None,
+                None,
+            ),
+            3,
+        );
+        let _ = event_rx.try_recv();
+        recorder.stop_recording("track".to_string(), true);
+
+        match event_rx.try_recv().unwrap() {
+            RecordingEvent::EventsRecorded { events, .. } => {
+                assert_eq!(events.len(), 1);
+                assert!(matches!(
+                    events[0].message,
+                    MidiMessage::ProgramChange { program: 11, .. }
+                ));
+            }
+            event => panic!("expected recorded batch, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_event_before_capture_start_is_not_rebased_to_zero() {
+        let (mut recorder, event_rx) = recorder();
+        recorder.handle_command(RecordingCommand::ArmTrack {
+            track_id: "track".to_string(),
+            input_port: "Keyboard".to_string(),
+            channel_filter: None,
+        });
+        recorder.start_recording(
+            RecordingSessionContext::new(
+                "track".to_string(),
+                None,
+                RecordingMode::Overdub,
+                0.0,
+                None,
+                None,
+            ),
+            100,
+        );
+        let _ = event_rx.try_recv();
+
+        recorder.handle_midi_event("Keyboard".to_string(), note_on(), 99);
+        recorder.handle_midi_event("Keyboard".to_string(), note_on(), 101);
+        recorder.stop_recording("track".to_string(), true);
+
+        match event_rx.try_recv().unwrap() {
+            RecordingEvent::EventsRecorded { events, .. } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].timestamp_samples, 1);
             }
             event => panic!("expected recorded batch, got {event:?}"),
         }

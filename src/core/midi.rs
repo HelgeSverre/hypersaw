@@ -1,7 +1,7 @@
 use midly::{MetaMessage, MidiMessage as MidlyMessage, TrackEventKind};
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
@@ -70,6 +70,23 @@ impl MidiMessage {
         }
         self
     }
+
+    /// Return the zero-based MIDI channel for channel-scoped messages.
+    pub fn channel(&self) -> Option<u8> {
+        match self {
+            Self::NoteOn { channel, .. }
+            | Self::NoteOff { channel, .. }
+            | Self::ControlChange { channel, .. }
+            | Self::ProgramChange { channel, .. }
+            | Self::PitchBend { channel, .. }
+            | Self::Aftertouch { channel, .. } => Some(*channel),
+            Self::SysEx(_)
+            | Self::MidiClock
+            | Self::MidiStart
+            | Self::MidiStop
+            | Self::MidiContinue => None,
+        }
+    }
 }
 
 pub fn midi_channel_index(display_channel: u8) -> u8 {
@@ -78,7 +95,20 @@ pub fn midi_channel_index(display_channel: u8) -> u8 {
 
 #[cfg(test)]
 mod message_tests {
-    use super::{MidiEventStore, MidiMessage, Note};
+    use super::{MidiEvent, MidiEventStore, MidiMessage, Note};
+
+    fn note(id: &str, start_time: f64, duration: f64, key: u8) -> Note {
+        Note {
+            id: id.to_string(),
+            channel: 0,
+            key,
+            velocity: 100,
+            start_time,
+            duration,
+            start_tick: (start_time * 960.0) as u32,
+            duration_ticks: (duration * 960.0) as u32,
+        }
+    }
 
     #[test]
     fn with_channel_rewrites_channel_messages() {
@@ -211,6 +241,76 @@ mod message_tests {
             store.event_data["note_on"].message,
             MidiMessage::NoteOn { velocity: 110, .. }
         ));
+    }
+
+    #[test]
+    fn merge_from_preserves_existing_notes_and_offsets_new_material() {
+        let mut target = MidiEventStore::new(480);
+        target.add_note(note("existing", 0.0, 0.5, 60));
+        let mut source = MidiEventStore::new(480);
+        source.add_note(note("source", 0.25, 0.5, 64));
+
+        target.merge_from(&source, 2.0);
+
+        let mut notes: Vec<_> = target.get_notes().collect();
+        notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].start_time, 0.0);
+        assert_eq!(notes[1].start_time, 2.25);
+        assert_ne!(notes[1].id, "source");
+    }
+
+    #[test]
+    fn replace_range_trims_crossing_notes_and_preserves_outside_events() {
+        let mut target = MidiEventStore::new(480);
+        target.add_note(note("crossing", 0.0, 4.0, 60));
+        target.add_event(MidiEvent {
+            id: "before".to_string(),
+            time: 0.5,
+            tick: 480,
+            message: MidiMessage::ControlChange {
+                channel: 0,
+                controller: 1,
+                value: 10,
+            },
+        });
+        target.add_event(MidiEvent {
+            id: "inside".to_string(),
+            time: 1.5,
+            tick: 1440,
+            message: MidiMessage::ControlChange {
+                channel: 0,
+                controller: 1,
+                value: 20,
+            },
+        });
+        let mut replacement = MidiEventStore::new(480);
+        replacement.add_note(note("replacement", 0.0, 0.5, 72));
+
+        target.replace_range_from(1.0, 2.0, &replacement);
+
+        let mut notes: Vec<_> = target.get_notes().collect();
+        notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
+        assert_eq!(notes.len(), 3);
+        assert_eq!((notes[0].start_time, notes[0].duration), (0.0, 1.0));
+        assert_eq!((notes[1].start_time, notes[1].duration), (1.0, 0.5));
+        assert_eq!((notes[2].start_time, notes[2].duration), (2.0, 2.0));
+        assert!(target.event_data.contains_key("before"));
+        assert!(!target.event_data.contains_key("inside"));
+    }
+
+    #[test]
+    fn extract_range_splits_notes_at_loop_boundaries() {
+        let mut source = MidiEventStore::new(480);
+        source.add_note(note("crossing", 0.75, 0.5, 60));
+
+        let first = source.extract_range(0.0, 1.0);
+        let second = source.extract_range(1.0, 2.0);
+        let first_note = first.get_notes().next().unwrap();
+        let second_note = second.get_notes().next().unwrap();
+
+        assert_eq!((first_note.start_time, first_note.duration), (0.75, 0.25));
+        assert_eq!((second_note.start_time, second_note.duration), (0.0, 0.25));
     }
 }
 
@@ -379,6 +479,207 @@ impl MidiEventStore {
 
     pub fn get_note_mut(&mut self, note_id: &str) -> Option<&mut Note> {
         self.notes.get_mut(note_id)
+    }
+
+    /// Merge another store at a seconds-based offset using fresh event/note IDs.
+    pub fn merge_from(&mut self, source: &Self, offset_seconds: f64) {
+        let mut notes: Vec<_> = source.notes.values().cloned().collect();
+        notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
+        for note in notes {
+            let shifted_end = note.start_time + note.duration + offset_seconds;
+            if shifted_end <= 0.0 {
+                continue;
+            }
+
+            let shifted_start = (note.start_time + offset_seconds).max(0.0);
+            self.add_note_with_fresh_id(
+                note.channel,
+                note.key,
+                note.velocity,
+                shifted_start,
+                shifted_end - shifted_start,
+            );
+        }
+
+        let note_event_ids = source.note_event_ids();
+        let mut events: Vec<_> = source
+            .event_data
+            .values()
+            .filter(|event| !note_event_ids.contains(&event.id))
+            .cloned()
+            .collect();
+        events.sort_by(|left, right| left.time.total_cmp(&right.time));
+        for event in events {
+            let shifted_time = event.time + offset_seconds;
+            if shifted_time < 0.0 {
+                continue;
+            }
+            self.add_event(MidiEvent {
+                id: Uuid::new_v4().to_string(),
+                time: shifted_time,
+                tick: self.time_to_tick(shifted_time),
+                message: event.message,
+            });
+        }
+    }
+
+    /// Return material intersecting `[start_time, end_time)`, shifted to zero.
+    /// Notes crossing either boundary are trimmed to the requested interval.
+    pub fn extract_range(&self, start_time: f64, end_time: f64) -> Self {
+        let mut extracted = self.empty_like();
+        if !start_time.is_finite() || !end_time.is_finite() || end_time <= start_time {
+            return extracted;
+        }
+
+        let mut notes: Vec<_> = self.notes.values().collect();
+        notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
+        for note in notes {
+            let note_end = note.start_time + note.duration;
+            let clipped_start = note.start_time.max(start_time);
+            let clipped_end = note_end.min(end_time);
+            if clipped_end <= clipped_start {
+                continue;
+            }
+            extracted.add_note_with_fresh_id(
+                note.channel,
+                note.key,
+                note.velocity,
+                clipped_start - start_time,
+                clipped_end - clipped_start,
+            );
+        }
+
+        let note_event_ids = self.note_event_ids();
+        let mut events: Vec<_> = self
+            .event_data
+            .values()
+            .filter(|event| {
+                !note_event_ids.contains(&event.id)
+                    && event.time >= start_time
+                    && event.time < end_time
+            })
+            .cloned()
+            .collect();
+        events.sort_by(|left, right| left.time.total_cmp(&right.time));
+        for event in events {
+            let time = event.time - start_time;
+            extracted.add_event(MidiEvent {
+                id: Uuid::new_v4().to_string(),
+                time,
+                tick: extracted.time_to_tick(time),
+                message: event.message,
+            });
+        }
+
+        extracted
+    }
+
+    /// Replace only `[start_time, end_time)` and preserve/trim surrounding data.
+    pub fn replace_range_from(&mut self, start_time: f64, end_time: f64, replacement: &Self) {
+        if !start_time.is_finite() || !end_time.is_finite() || end_time <= start_time {
+            return;
+        }
+
+        let overlapping: Vec<_> = self
+            .notes
+            .values()
+            .filter(|note| {
+                note.start_time < end_time && note.start_time + note.duration > start_time
+            })
+            .cloned()
+            .collect();
+
+        for note in overlapping {
+            let note_end = note.start_time + note.duration;
+            self.delete_note(&note.id);
+            if note.start_time < start_time {
+                self.add_note_with_fresh_id(
+                    note.channel,
+                    note.key,
+                    note.velocity,
+                    note.start_time,
+                    start_time - note.start_time,
+                );
+            }
+            if note_end > end_time {
+                self.add_note_with_fresh_id(
+                    note.channel,
+                    note.key,
+                    note.velocity,
+                    end_time,
+                    note_end - end_time,
+                );
+            }
+        }
+
+        let note_event_ids = self.note_event_ids();
+        let event_ids: Vec<_> = self
+            .event_data
+            .values()
+            .filter(|event| {
+                !note_event_ids.contains(&event.id)
+                    && event.time >= start_time
+                    && event.time < end_time
+            })
+            .map(|event| event.id.clone())
+            .collect();
+        for event_id in event_ids {
+            self.delete_event(&event_id);
+        }
+
+        self.merge_from(replacement, start_time);
+    }
+
+    fn empty_like(&self) -> Self {
+        Self {
+            events_by_time: BTreeMap::new(),
+            events_by_tick: BTreeMap::new(),
+            event_data: HashMap::new(),
+            notes: HashMap::new(),
+            tempo_map: self.tempo_map.clone(),
+            time_signatures: self.time_signatures.clone(),
+            ppq: self.ppq,
+        }
+    }
+
+    fn note_event_ids(&self) -> HashSet<EventID> {
+        self.notes
+            .keys()
+            .flat_map(|note_id| [format!("{note_id}_on"), format!("{note_id}_off")])
+            .collect()
+    }
+
+    fn add_note_with_fresh_id(
+        &mut self,
+        channel: u8,
+        key: u8,
+        velocity: u8,
+        start_time: f64,
+        duration: f64,
+    ) {
+        let duration = duration.max(1.0 / 1000.0);
+        self.add_note(Note {
+            id: Uuid::new_v4().to_string(),
+            channel,
+            key,
+            velocity,
+            start_time,
+            duration,
+            start_tick: self.time_to_tick(start_time),
+            duration_ticks: self.time_to_tick(duration),
+        });
+    }
+
+    fn delete_event(&mut self, event_id: &str) {
+        for event_ids in self.events_by_time.values_mut() {
+            event_ids.retain(|id| id != event_id);
+        }
+        self.events_by_time.retain(|_, ids| !ids.is_empty());
+        for event_ids in self.events_by_tick.values_mut() {
+            event_ids.retain(|id| id != event_id);
+        }
+        self.events_by_tick.retain(|_, ids| !ids.is_empty());
+        self.event_data.remove(event_id);
     }
 
     pub fn rebuild_note_maps(&mut self) {

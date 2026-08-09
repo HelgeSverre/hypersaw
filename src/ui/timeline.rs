@@ -18,6 +18,7 @@ pub struct Timeline {
     drag_start: Option<(egui::Pos2, f32)>, // (pointer_pos, clip_start_time)
     command_collector: CommandCollector,
     midi_ports: Vec<String>,
+    midi_input_ports: Vec<String>,
     pending_midi_connections: Vec<(String, String)>, // (track_id, device_name)
     // Resize state
     resize_snap_handler: SnapHandler,
@@ -45,6 +46,7 @@ impl Default for Timeline {
             drag_start: None,
             command_collector: CommandCollector::new(),
             midi_ports: Vec::new(),
+            midi_input_ports: Vec::new(),
             pending_midi_connections: Vec::new(),
             resize_snap_handler: SnapHandler::new(10.0),
             resize_initial_values: None,
@@ -61,6 +63,12 @@ impl Default for Timeline {
 impl Timeline {
     pub fn update_midi_ports(&mut self, ports: Vec<String>) {
         self.midi_ports = ports;
+    }
+
+    /// Updates the MIDI input ports shown by the recording-routing controls.
+    /// Output ports continue to be provided through `update_midi_ports`.
+    pub fn update_midi_input_ports(&mut self, ports: Vec<String>) {
+        self.midi_input_ports = ports;
     }
 
     fn get_clip_id(&self, clip: &Clip) -> String {
@@ -663,6 +671,8 @@ impl Timeline {
                     track_type: TrackType::Midi {
                         channel: 1,
                         device_name: None,
+                        input_device_name: None,
+                        input_channel: None,
                     },
                     name: format!("Track {}", state.project.tracks.len() + 1),
                 });
@@ -1093,6 +1103,7 @@ impl Timeline {
                     let TrackType::Midi {
                         channel,
                         device_name,
+                        ..
                     } = &track.track_type;
 
                     ui.horizontal(|ui| {
@@ -1891,88 +1902,174 @@ impl Timeline {
         // Create UI for panel content
         let content_rect = rect.shrink2(egui::vec2(12.0, 8.0));
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
-            ui.horizontal(|ui| {
+            ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
 
                 if let Some(track_id) = &state.selected_track.clone() {
                     if let Some(track) = state.project.tracks.iter_mut().find(|t| &t.id == track_id)
                     {
                         // Track name heading
-                        ui.heading(&track.name);
-                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.heading(&track.name);
+                            ui.separator();
+                        });
 
                         let TrackType::Midi {
                             device_name,
                             channel,
+                            input_device_name,
+                            input_channel,
                         } = &mut track.track_type;
 
-                        // MIDI Output Device
-                        ui.label("Output:");
-                        let display_text = device_name.as_deref().unwrap_or("No Device");
-                        egui::ComboBox::from_id_salt("device_panel_output")
-                            .selected_text(display_text)
-                            .width(180.0)
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(device_name.is_none(), "No Device")
-                                    .clicked()
-                                {
-                                    self.pending_midi_connections
-                                        .push((track_id.clone(), String::new()));
-                                }
-                                for port in &self.midi_ports {
-                                    let is_selected = device_name.as_ref() == Some(port);
-                                    if ui.selectable_label(is_selected, port).clicked() {
-                                        self.pending_midi_connections
-                                            .push((track_id.clone(), port.clone()));
-                                    }
-                                }
-                            });
-
-                        ui.add_space(8.0);
-
-                        // MIDI Channel
-                        ui.label("Channel:");
-                        let mut new_channel = *channel;
-                        let mut channel_changed = false;
-                        egui::ComboBox::from_id_salt("device_panel_channel")
-                            .selected_text(format!("Ch {}", channel))
-                            .width(70.0)
-                            .show_ui(ui, |ui| {
-                                for ch in 1..=16u8 {
+                        ui.horizontal(|ui| {
+                            // MIDI Output Device
+                            ui.label("Output:");
+                            let display_text = device_name.as_deref().unwrap_or("No Device");
+                            egui::ComboBox::from_id_salt("device_panel_output")
+                                .selected_text(display_text)
+                                .width(180.0)
+                                .show_ui(ui, |ui| {
                                     if ui
-                                        .selectable_value(
-                                            &mut new_channel,
-                                            ch,
-                                            format!("Ch {}", ch),
-                                        )
+                                        .selectable_label(device_name.is_none(), "No Device")
                                         .clicked()
                                     {
-                                        channel_changed = true;
+                                        self.pending_midi_connections
+                                            .push((track_id.clone(), String::new()));
                                     }
-                                }
-                            });
-                        if channel_changed {
-                            self.command_collector
-                                .add_command(DawCommand::SetTrackMidiChannel {
-                                    track_id: track_id.clone(),
-                                    channel: new_channel,
+                                    for port in &self.midi_ports {
+                                        let is_selected = device_name.as_ref() == Some(port);
+                                        if ui.selectable_label(is_selected, port).clicked() {
+                                            self.pending_midi_connections
+                                                .push((track_id.clone(), port.clone()));
+                                        }
+                                    }
                                 });
-                        }
 
-                        ui.add_space(8.0);
+                            ui.add_space(8.0);
 
-                        // Input Monitoring
-                        let mut input_monitoring = track.input_monitoring;
-                        if ui
-                            .checkbox(&mut input_monitoring, "Input Monitor")
-                            .changed()
-                        {
-                            self.command_collector
-                                .add_command(DawCommand::ToggleInputMonitoring {
-                                    track_id: track_id.clone(),
+                            // MIDI Channel
+                            ui.label("Channel:");
+                            let mut new_channel = *channel;
+                            let mut channel_changed = false;
+                            egui::ComboBox::from_id_salt("device_panel_channel")
+                                .selected_text(format!("Ch {}", channel))
+                                .width(70.0)
+                                .show_ui(ui, |ui| {
+                                    for ch in 1..=16u8 {
+                                        if ui
+                                            .selectable_value(
+                                                &mut new_channel,
+                                                ch,
+                                                format!("Ch {}", ch),
+                                            )
+                                            .clicked()
+                                        {
+                                            channel_changed = true;
+                                        }
+                                    }
                                 });
-                        }
+                            if channel_changed {
+                                self.command_collector.add_command(
+                                    DawCommand::SetTrackMidiChannel {
+                                        track_id: track_id.clone(),
+                                        channel: new_channel,
+                                    },
+                                );
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+
+                            // MIDI Input Device
+                            ui.label("Input:");
+                            let input_display_text =
+                                input_device_name.as_deref().unwrap_or("Default");
+                            egui::ComboBox::from_id_salt("device_panel_input")
+                                .selected_text(input_display_text)
+                                .width(180.0)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(input_device_name.is_none(), "Default")
+                                        .clicked()
+                                    {
+                                        self.command_collector.add_command(
+                                            DawCommand::SetTrackMidiInputPort {
+                                                track_id: track_id.clone(),
+                                                input_port: None,
+                                            },
+                                        );
+                                    }
+                                    for port in &self.midi_input_ports {
+                                        let is_selected = input_device_name.as_ref() == Some(port);
+                                        if ui.selectable_label(is_selected, port).clicked() {
+                                            self.command_collector.add_command(
+                                                DawCommand::SetTrackMidiInputPort {
+                                                    track_id: track_id.clone(),
+                                                    input_port: Some(port.clone()),
+                                                },
+                                            );
+                                        }
+                                    }
+                                });
+
+                            ui.add_space(8.0);
+
+                            // MIDI Input Channel
+                            ui.label("Input Ch:");
+                            let mut new_input_channel = *input_channel;
+                            let mut input_channel_changed = false;
+                            egui::ComboBox::from_id_salt("device_panel_input_channel")
+                                .selected_text(
+                                    input_channel
+                                        .map(|channel| format!("Ch {channel}"))
+                                        .unwrap_or_else(|| "All".to_string()),
+                                )
+                                .width(70.0)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_value(&mut new_input_channel, None, "All")
+                                        .clicked()
+                                    {
+                                        input_channel_changed = true;
+                                    }
+                                    for input_channel in 1..=16u8 {
+                                        if ui
+                                            .selectable_value(
+                                                &mut new_input_channel,
+                                                Some(input_channel),
+                                                format!("Ch {input_channel}"),
+                                            )
+                                            .clicked()
+                                        {
+                                            input_channel_changed = true;
+                                        }
+                                    }
+                                });
+                            if input_channel_changed {
+                                self.command_collector.add_command(
+                                    DawCommand::SetTrackMidiInputChannel {
+                                        track_id: track_id.clone(),
+                                        channel: new_input_channel,
+                                    },
+                                );
+                            }
+
+                            ui.add_space(8.0);
+
+                            // Input Monitoring
+                            let mut input_monitoring = track.input_monitoring;
+                            if ui
+                                .checkbox(&mut input_monitoring, "Input Monitor")
+                                .changed()
+                            {
+                                self.command_collector.add_command(
+                                    DawCommand::ToggleInputMonitoring {
+                                        track_id: track_id.clone(),
+                                    },
+                                );
+                            }
+                        });
                     }
                 } else {
                     ui.centered_and_justified(|ui| {

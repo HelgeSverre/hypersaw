@@ -1,9 +1,9 @@
 use crate::core::{
-    EditorView, MidiEngineHandle, Project, RecordingCoordinator, RecordingMode, SnapMode,
-    StatusManager,
+    EditorView, MidiEngineHandle, Project, RecordingCoordinator, RecordingMode,
+    RecordingSessionContext, SnapMode, StatusManager,
 };
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc};
 
 pub struct DawState {
     pub project: Project,
@@ -40,12 +40,14 @@ pub struct DawState {
     pub count_in_bars: u32,
     pub count_in_active: bool,
     pub count_in_start_time: Option<f64>,
+    pub pending_recording_session: Option<RecordingSessionContext>,
 }
 
 impl DawState {
     pub fn new() -> Self {
+        let capture_sample_clock = Arc::new(AtomicU64::new(0));
         // Start MIDI engine
-        let midi_engine = MidiEngineHandle::start(44100); // TODO: Get actual sample rate
+        let midi_engine = MidiEngineHandle::start(44100, capture_sample_clock.clone()); // TODO: Get actual sample rate
         let midi_engine_arc = Arc::new(Mutex::new(midi_engine));
 
         // Create bounded channel for MIDI input from engine to recording (prevent unbounded growth)
@@ -53,7 +55,8 @@ impl DawState {
         let (midi_input_tx, midi_input_rx) = crossbeam::channel::bounded(2000);
 
         // Create recording coordinator
-        let recording_coordinator = RecordingCoordinator::new(44100, midi_input_rx);
+        let recording_coordinator =
+            RecordingCoordinator::new(44100, midi_input_rx, capture_sample_clock);
 
         Self {
             project: Project::new("Untitled".to_string()),
@@ -81,6 +84,7 @@ impl DawState {
             count_in_bars: 1,
             count_in_active: false,
             count_in_start_time: None,
+            pending_recording_session: None,
         }
     }
 

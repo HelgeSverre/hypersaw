@@ -1,7 +1,7 @@
 use crate::core::{
     midi_channel_index, CommandManager, DawCommand, DawState, EditorView, MessageType,
-    MidiEngineCommand, MidiMessage, Project, RecordingMode, SnapMode, StatusMessage, Track,
-    TrackType,
+    MidiEngineCommand, MidiEventStore, MidiMessage, Project, RecordingMode,
+    RecordingSessionContext, SnapMode, StatusMessage, Track, TrackType,
 };
 use crate::ui::piano_roll::PianoRoll;
 use crate::ui::Timeline;
@@ -25,7 +25,6 @@ pub struct SupersawApp {
     last_bpm_sent: Option<f64>,
     scheduled_through_beat: Option<f64>,
     pending_midi_routes: HashMap<String, Vec<String>>,
-    recording_start_times: HashMap<String, f64>,
 
     // Views
     timeline: Timeline,
@@ -59,11 +58,12 @@ fn recorded_events_to_midi(
     snap_mode: SnapMode,
     quantize: bool,
     quantize_strength: f32,
+    capture_end_seconds: Option<f64>,
 ) -> crate::core::MidiEventStore {
     let mut midi_data = crate::core::MidiEventStore::new(ppq);
-    let Some(first_beat) = events.first().map(|event| event.timestamp_beats) else {
+    if events.is_empty() {
         return midi_data;
-    };
+    }
 
     let seconds_per_beat = 60.0 / bpm;
     let grid_seconds = quantize
@@ -73,8 +73,7 @@ fn recorded_events_to_midi(
     let mut note_starts: HashMap<(u8, u8), VecDeque<(f64, u8)>> = HashMap::new();
 
     for recorded_event in events {
-        let relative_seconds =
-            (recorded_event.timestamp_beats - first_beat).max(0.0) * seconds_per_beat;
+        let relative_seconds = recorded_event.timestamp_beats.max(0.0) * seconds_per_beat;
 
         match &recorded_event.message {
             MidiMessage::NoteOn {
@@ -127,7 +126,184 @@ fn recorded_events_to_midi(
         }
     }
 
+    // A stopped recording can leave keys held. Close those notes at the last
+    // captured timestamp so the performance is still editable and replayable.
+    let recording_end = capture_end_seconds.unwrap_or_else(|| {
+        events
+            .last()
+            .map(|event| event.timestamp_beats.max(0.0) * seconds_per_beat)
+            .unwrap_or_default()
+    });
+    for ((channel, key), starts) in note_starts {
+        for (raw_start, velocity) in starts {
+            let start_time = grid_seconds.map_or(raw_start, |grid| {
+                let snapped = (raw_start / grid).round() * grid;
+                raw_start + (snapped - raw_start) * strength
+            });
+            let duration = (recording_end - raw_start).max(1.0 / 1000.0);
+            midi_data.add_note(crate::core::Note {
+                id: Uuid::new_v4().to_string(),
+                channel,
+                key,
+                velocity,
+                start_time,
+                duration,
+                start_tick: midi_data.time_to_tick(start_time),
+                duration_ticks: midi_data.time_to_tick(duration),
+            });
+        }
+    }
+
     midi_data
+}
+
+#[derive(Debug)]
+struct RecordingPass {
+    midi_data: MidiEventStore,
+    start_time: f64,
+    length: f64,
+    completed: bool,
+}
+
+fn inclusive_upper_bound(value: f64) -> f64 {
+    if value.is_finite() && value >= 0.0 {
+        f64::from_bits(value.to_bits().saturating_add(1))
+    } else {
+        value
+    }
+}
+
+fn apply_recording_to_target(
+    target: &mut MidiEventStore,
+    clip_start_seconds: f64,
+    session: &RecordingSessionContext,
+    source: &MidiEventStore,
+) {
+    match session.mode {
+        RecordingMode::Overdub => {
+            target.merge_from(source, session.transport_start_seconds - clip_start_seconds);
+        }
+        RecordingMode::Replace | RecordingMode::PunchInOut => {
+            let source_end = source
+                .get_last_event_time()
+                .map(inclusive_upper_bound)
+                .unwrap_or(1.0 / 1000.0);
+            let (absolute_start, absolute_end, replacement) = if let Some((start, end)) = session
+                .punch_range
+                .filter(|_| session.mode == RecordingMode::PunchInOut)
+            {
+                let relative_start = (start - session.transport_start_seconds).max(0.0);
+                let relative_end = (end - session.transport_start_seconds).max(0.0);
+                (
+                    start,
+                    end,
+                    source.extract_range(relative_start, relative_end),
+                )
+            } else {
+                (
+                    session.transport_start_seconds,
+                    session.transport_start_seconds + source_end,
+                    source.clone(),
+                )
+            };
+            target.replace_range_from(
+                absolute_start - clip_start_seconds,
+                absolute_end - clip_start_seconds,
+                &replacement,
+            );
+        }
+    }
+}
+
+fn build_recording_passes(
+    source: &MidiEventStore,
+    session: &RecordingSessionContext,
+    ppq: u32,
+) -> Vec<RecordingPass> {
+    let Some(last_event_time) = source.get_last_event_time() else {
+        return Vec::new();
+    };
+    let Some((loop_start, loop_end)) = session.loop_range else {
+        return vec![RecordingPass {
+            midi_data: source.clone(),
+            start_time: session.transport_start_seconds,
+            length: last_event_time.max(1.0 / 1000.0),
+            completed: true,
+        }];
+    };
+
+    let loop_length = loop_end - loop_start;
+    if !loop_length.is_finite() || loop_length <= f64::EPSILON {
+        return Vec::new();
+    }
+
+    let starts_before_loop = session.transport_start_seconds < loop_start;
+    let first_position = if starts_before_loop {
+        session.transport_start_seconds
+    } else {
+        loop_start + (session.transport_start_seconds - loop_start).rem_euclid(loop_length)
+    };
+    let first_span = loop_end - first_position;
+    let mut source_start = 0.0;
+    let mut pass_index = 0usize;
+    let mut passes = Vec::new();
+
+    while source_start <= last_event_time {
+        let pass_span = if pass_index == 0 {
+            first_span
+        } else {
+            loop_length
+        };
+        let source_boundary = source_start + pass_span;
+        let completed = last_event_time >= source_boundary;
+        let extraction_end = if completed {
+            source_boundary
+        } else {
+            inclusive_upper_bound(last_event_time)
+        };
+        let extracted = source.extract_range(source_start, extraction_end);
+
+        if extracted.get_events().next().is_some() {
+            let mut positioned = MidiEventStore::new(ppq);
+            let destination_offset = if pass_index == 0 && !starts_before_loop {
+                first_position - loop_start
+            } else {
+                0.0
+            };
+            positioned.merge_from(&extracted, destination_offset);
+            passes.push(RecordingPass {
+                midi_data: positioned,
+                start_time: if pass_index == 0 && starts_before_loop {
+                    session.transport_start_seconds
+                } else {
+                    loop_start
+                },
+                length: if pass_index == 0 && starts_before_loop {
+                    first_span
+                } else {
+                    loop_length
+                },
+                completed,
+            });
+        }
+
+        if !completed {
+            break;
+        }
+        source_start = source_boundary;
+        pass_index += 1;
+    }
+
+    passes
+}
+
+fn recording_asset_path(project_path: Option<&PathBuf>, clip_id: &str) -> PathBuf {
+    let directory = project_path.map_or_else(
+        || std::env::temp_dir().join("hypersaw_recordings"),
+        |path| path.join("midi"),
+    );
+    let _ = std::fs::create_dir_all(&directory);
+    directory.join(format!("{clip_id}.mid"))
 }
 
 impl SupersawApp {
@@ -256,16 +432,22 @@ impl SupersawApp {
         self.state.track_scroll_y = 0.0;
         self.state.count_in_active = false;
         self.state.count_in_start_time = None;
+        self.state.pending_recording_session = None;
 
         self.command_manager.clear();
         self.pending_midi_routes.clear();
-        self.recording_start_times.clear();
         self.last_bpm_sent = Some(self.state.project.bpm);
         self.reset_scheduling_watermark();
 
         let mut timeline = Timeline::default();
         timeline.update_midi_ports(
             self.midi_output_ports
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+        );
+        timeline.update_midi_input_ports(
+            self.midi_input_ports
                 .iter()
                 .map(|(name, _)| name.clone())
                 .collect(),
@@ -360,6 +542,12 @@ impl SupersawApp {
                 .map(|(name, _)| name.clone())
                 .collect(),
         );
+        timeline.update_midi_input_ports(
+            midi_input_ports
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+        );
 
         let mut app = Self {
             state: DawState::new(),
@@ -370,7 +558,6 @@ impl SupersawApp {
             last_bpm_sent: None,
             scheduled_through_beat: None,
             pending_midi_routes: HashMap::new(),
-            recording_start_times: HashMap::new(),
             timeline,
             piano_roll: PianoRoll::default(),
             command_manager: CommandManager::default(),
@@ -434,6 +621,7 @@ impl SupersawApp {
             let TrackType::Midi {
                 channel,
                 device_name,
+                ..
             } = &track.track_type;
             let port_id = device_name.clone().unwrap_or_default();
 
@@ -576,9 +764,6 @@ impl SupersawApp {
                         self.state
                             .status
                             .error(format!("Failed to start recording: {}", e));
-                    } else if !self.state.count_in_active {
-                        self.recording_start_times
-                            .insert(track_id, self.state.current_time);
                     }
                 } else {
                     self.state
@@ -872,6 +1057,12 @@ impl SupersawApp {
                                     .map(|(name, _)| name.clone())
                                     .collect(),
                             );
+                            self.timeline.update_midi_input_ports(
+                                self.midi_input_ports
+                                    .iter()
+                                    .map(|(name, _)| name.clone())
+                                    .collect(),
+                            );
                             self.state
                                 .status
                                 .success("MIDI ports refreshed".to_string());
@@ -928,6 +1119,166 @@ impl SupersawApp {
 
         Ok(())
     }
+
+    fn commit_recording(
+        &mut self,
+        session: RecordingSessionContext,
+        events: Vec<crate::core::RecordedEvent>,
+    ) {
+        if events.is_empty() {
+            return;
+        }
+
+        let quantize_config = self
+            .state
+            .recording_coordinator
+            .as_ref()
+            .map(|coordinator| coordinator.lock().get_config())
+            .unwrap_or_default();
+        let source = recorded_events_to_midi(
+            &events,
+            self.state.project.ppq,
+            self.state.project.bpm,
+            self.state.snap_mode,
+            quantize_config.quantize_on_record,
+            quantize_config.quantize_strength,
+            session
+                .punch_range
+                .filter(|_| session.mode == RecordingMode::PunchInOut)
+                .map(|(_, punch_end)| (punch_end - session.transport_start_seconds).max(0.0)),
+        );
+        if source.get_events().next().is_none() {
+            return;
+        }
+
+        let track_id = session.track_id.clone();
+        let project_path = self.state.project.project_path.clone();
+        let ppq = self.state.project.ppq;
+        let Some(track) = self
+            .state
+            .project
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+        else {
+            self.state.status.error(format!(
+                "Recorded MIDI target track no longer exists: {track_id}"
+            ));
+            return;
+        };
+
+        // A selected target is edited in place for non-loop recording. Loop
+        // recording always creates stacked take clips for each captured pass.
+        if session.loop_range.is_none() {
+            if let Some(target_clip_id) = session.target_clip_id.as_ref() {
+                if let Some(target_clip) = track.clips.iter_mut().find(
+                    |clip| matches!(clip, crate::core::Clip::Midi { id, .. } if id == target_clip_id),
+                ) {
+                    if let Err(error) = target_clip.load_midi() {
+                        self.state.status.error(format!(
+                            "Failed to load the target MIDI clip before recording commit: {error}"
+                        ));
+                        return;
+                    }
+
+                    let crate::core::Clip::Midi {
+                        start_time,
+                        length,
+                        file_path,
+                        midi_data,
+                        ..
+                    } = target_clip;
+                    let target = midi_data.get_or_insert_with(|| MidiEventStore::new(ppq));
+
+                    apply_recording_to_target(target, *start_time, &session, &source);
+
+                    if let Some(last_time) = target.get_last_event_time() {
+                        *length = length.max(last_time);
+                    }
+                    let save_result = target.save_to_file(file_path);
+                    self.state.selected_clip = Some(target_clip_id.clone());
+                    self.command_manager.mark_project_dirty();
+                    match save_result {
+                        Ok(()) => self.state.status.success(match session.mode {
+                            RecordingMode::Overdub => "MIDI overdubbed successfully",
+                            RecordingMode::Replace => "MIDI interval replaced successfully",
+                            RecordingMode::PunchInOut => "MIDI punch recorded successfully",
+                        }),
+                        Err(error) => self
+                            .state
+                            .status
+                            .error(format!("Failed to save recorded MIDI: {error}")),
+                    }
+                    return;
+                }
+            }
+        }
+
+        let passes = build_recording_passes(&source, &session, ppq);
+        if passes.is_empty() {
+            return;
+        }
+
+        let is_loop_recording = session.loop_range.is_some();
+        let mut newest_take = None;
+        let mut newest_completed_take = None;
+        let mut newest_clip = None;
+        let mut save_error = None;
+        for pass in passes {
+            let clip_id = Uuid::new_v4().to_string();
+            let file_path = recording_asset_path(project_path.as_ref(), &clip_id);
+            if let Err(error) = pass.midi_data.save_to_file(&file_path) {
+                save_error.get_or_insert_with(|| error.to_string());
+            }
+
+            track.clips.push(crate::core::Clip::Midi {
+                id: clip_id.clone(),
+                start_time: pass.start_time,
+                length: pass.length,
+                file_path,
+                midi_data: Some(pass.midi_data),
+                loaded: true,
+                automation_lanes: vec![crate::core::AutomationLane::new(
+                    crate::core::AutomationParameter::Velocity,
+                )],
+            });
+
+            let take = crate::core::Take {
+                id: Uuid::new_v4().to_string(),
+                track_id: track_id.clone(),
+                clip_id: clip_id.clone(),
+                name: format!("Take {}", track.takes.len() + 1),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                is_muted: false,
+            };
+            newest_take = Some(take.id.clone());
+            if pass.completed {
+                newest_completed_take = Some(take.id.clone());
+            }
+            track.takes.push(take);
+            newest_clip = Some(clip_id);
+        }
+
+        // Prefer a pass that reached the loop boundary. If the first pass was
+        // stopped early, it is still the only useful take and remains active.
+        track.active_take = newest_completed_take.or(newest_take);
+        self.state.selected_clip = newest_clip;
+        self.command_manager.mark_project_dirty();
+        if let Some(error) = save_error {
+            self.state
+                .status
+                .error(format!("Failed to save recorded MIDI: {error}"));
+        } else {
+            self.state.status.success(if is_loop_recording {
+                "MIDI loop passes recorded as stacked takes"
+            } else {
+                "MIDI recorded successfully"
+            });
+        }
+    }
 }
 
 enum KeyAction {
@@ -973,29 +1324,24 @@ impl eframe::App for SupersawApp {
 
                     // Start actual recording
                     if let Some(track_id) = &self.state.recording_track.clone() {
-                        self.recording_start_times
-                            .insert(track_id.clone(), self.state.current_time);
+                        let mut session = self
+                            .state
+                            .pending_recording_session
+                            .take()
+                            .unwrap_or_else(|| {
+                                crate::core::commands::recording_session_context(
+                                    &self.state,
+                                    track_id,
+                                    self.state.recording_mode,
+                                )
+                            });
+                        // Count-in completion defines only the actual capture
+                        // origin; editing intent was frozen when count-in began.
+                        session.transport_start_seconds = self.state.current_time;
                         if let Some(recording_coordinator) = &self.state.recording_coordinator {
-                            let (punch_in, punch_out) =
-                                if self.state.recording_mode == RecordingMode::PunchInOut {
-                                    (
-                                        self.state
-                                            .punch_in
-                                            .map(|time| (time - self.state.current_time).max(0.0)),
-                                        self.state
-                                            .punch_out
-                                            .map(|time| (time - self.state.current_time).max(0.0)),
-                                    )
-                                } else {
-                                    (None, None)
-                                };
-                            recording_coordinator.lock().start_recording(
-                                track_id.clone(),
-                                None,
-                                self.state.recording_mode,
-                                punch_in,
-                                punch_out,
-                            );
+                            recording_coordinator
+                                .lock()
+                                .start_recording_session(session);
                         }
                         self.state.status.info("Recording started after count-in");
                     }
@@ -1117,9 +1463,6 @@ impl eframe::App for SupersawApp {
             use crate::core::RecordingEvent;
             match event {
                 RecordingEvent::RecordingStarted { track_id, .. } => {
-                    self.recording_start_times
-                        .entry(track_id.clone())
-                        .or_insert(self.state.current_time);
                     self.state
                         .status
                         .info(format!("Recording started on track {}", track_id));
@@ -1128,143 +1471,13 @@ impl eframe::App for SupersawApp {
                     track_id,
                     events_recorded,
                 } => {
-                    self.recording_start_times.remove(&track_id);
                     self.state.status.info(format!(
                         "Recording stopped on track {}: {} events",
                         track_id, events_recorded
                     ));
                 }
-                RecordingEvent::EventsRecorded { track_id, events } => {
-                    // Create a MIDI clip from the recorded events
-                    if let Some(track) = self
-                        .state
-                        .project
-                        .tracks
-                        .iter_mut()
-                        .find(|t| t.id == track_id)
-                    {
-                        if events.is_empty() {
-                            continue;
-                        }
-
-                        // Calculate time bounds
-                        let first_timestamp =
-                            events.first().map(|e| e.timestamp_beats).unwrap_or(0.0);
-                        let last_timestamp = events
-                            .last()
-                            .map(|e| e.timestamp_beats)
-                            .unwrap_or(first_timestamp);
-
-                        // Recorded timestamps are relative to the capture
-                        // session. Placement comes from the transport time
-                        // observed when recording actually started.
-                        let start_time = self
-                            .recording_start_times
-                            .get(&track_id)
-                            .copied()
-                            .unwrap_or(self.state.current_time);
-                        let length = ((last_timestamp - first_timestamp) * 60.0
-                            / self.state.project.bpm)
-                            .max(1.0);
-                        let end_time = start_time + length;
-
-                        // Handle Replace mode - remove overlapping clips
-                        if self.state.recording_mode == crate::core::RecordingMode::Replace {
-                            // Find and remove clips that overlap with the recording range
-                            track.clips.retain(|clip| {
-                                let crate::core::Clip::Midi {
-                                    start_time: clip_start,
-                                    length: clip_length,
-                                    ..
-                                } = clip;
-                                let clip_end = clip_start + clip_length;
-                                clip_end <= start_time || *clip_start >= end_time
-                            });
-                        }
-
-                        // Check if quantization is enabled
-                        let quantize_config = self
-                            .state
-                            .recording_coordinator
-                            .as_ref()
-                            .map(|rc| rc.lock().get_config())
-                            .unwrap_or_default();
-
-                        let midi_data = recorded_events_to_midi(
-                            &events,
-                            self.state.project.ppq,
-                            self.state.project.bpm,
-                            self.state.snap_mode,
-                            quantize_config.quantize_on_record,
-                            quantize_config.quantize_strength,
-                        );
-
-                        // Save recorded MIDI to file
-                        let clip_id = uuid::Uuid::new_v4().to_string();
-
-                        // Determine file path
-                        let file_path = if let Some(project_path) = &self.state.project.project_path
-                        {
-                            // Save in project's midi directory
-                            let midi_dir = project_path.join("midi");
-                            std::fs::create_dir_all(&midi_dir).ok();
-                            midi_dir.join(format!("{}.mid", clip_id))
-                        } else {
-                            // No project path, save in temp location
-                            let temp_dir = std::env::temp_dir().join("hypersaw_recordings");
-                            std::fs::create_dir_all(&temp_dir).ok();
-                            temp_dir.join(format!("{}.mid", clip_id))
-                        };
-
-                        // Save MIDI data to file
-                        if let Err(e) = midi_data.save_to_file(&file_path) {
-                            self.state
-                                .status
-                                .error(format!("Failed to save recorded MIDI: {}", e));
-                        }
-
-                        let clip = crate::core::Clip::Midi {
-                            id: clip_id.clone(),
-                            start_time,
-                            length,
-                            file_path,
-                            midi_data: Some(midi_data),
-                            loaded: true,
-                            automation_lanes: vec![crate::core::AutomationLane::new(
-                                crate::core::AutomationParameter::Velocity,
-                            )],
-                        };
-
-                        track.clips.push(clip);
-                        self.command_manager.mark_project_dirty();
-                        self.state.selected_clip = Some(clip_id.clone());
-
-                        // Create a take for this recording
-                        let take_number = track.takes.len() + 1;
-                        let take = crate::core::Take {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            track_id: track_id.clone(),
-                            clip_id: clip_id.clone(),
-                            name: format!("Take {}", take_number),
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
-                            is_muted: false,
-                        };
-
-                        let take_id = take.id.clone();
-                        track.takes.push(take);
-                        track.active_take = Some(take_id);
-
-                        let mode_str = match self.state.recording_mode {
-                            crate::core::RecordingMode::Replace => "replaced",
-                            _ => "recorded",
-                        };
-                        self.state
-                            .status
-                            .success(format!("MIDI {} successfully", mode_str));
-                    }
+                RecordingEvent::EventsRecorded { session, events } => {
+                    self.commit_recording(session, events);
                 }
                 RecordingEvent::BufferOverflow {
                     track_id,
@@ -1282,21 +1495,14 @@ impl eframe::App for SupersawApp {
                         let crate::core::TrackType::Midi {
                             device_name,
                             channel,
+                            ..
                         } = &track.track_type;
                         let port_id = device_name.clone().unwrap_or_default();
 
                         // Send immediately via MIDI engine
                         if let Some(engine) = &self.state.midi_engine {
                             // Adjust channel if needed
-                            let mut msg = message.clone();
-                            match &mut msg {
-                                MidiMessage::NoteOn { channel: ch, .. }
-                                | MidiMessage::NoteOff { channel: ch, .. }
-                                | MidiMessage::ControlChange { channel: ch, .. } => {
-                                    *ch = midi_channel_index(*channel);
-                                }
-                                _ => {}
-                            }
+                            let msg = message.clone().with_channel(midi_channel_index(*channel));
 
                             engine
                                 .lock()
@@ -1794,7 +2000,7 @@ impl eframe::App for SupersawApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::RecordedEvent;
+    use crate::core::{Note, RecordedEvent};
 
     fn recorded_event(timestamp_beats: f64, message: MidiMessage) -> RecordedEvent {
         RecordedEvent {
@@ -1802,6 +2008,19 @@ mod tests {
             timestamp_beats,
             port_id: "input".to_string(),
             message,
+        }
+    }
+
+    fn note(id: &str, key: u8, start_time: f64, duration: f64) -> Note {
+        Note {
+            id: id.to_string(),
+            channel: 0,
+            key,
+            velocity: 100,
+            start_time,
+            duration,
+            start_tick: (start_time * 960.0) as u32,
+            duration_ticks: (duration * 960.0) as u32,
         }
     }
 
@@ -1826,7 +2045,7 @@ mod tests {
             ),
         ];
 
-        let store = recorded_events_to_midi(&events, 480, 120.0, SnapMode::None, false, 1.0);
+        let store = recorded_events_to_midi(&events, 480, 120.0, SnapMode::None, false, 1.0, None);
         let note = store.get_notes().next().expect("recorded note");
         assert_eq!(note.start_time, 0.0);
         assert_eq!(note.duration, 0.5);
@@ -1854,7 +2073,7 @@ mod tests {
             ),
         ];
 
-        let store = recorded_events_to_midi(&events, 480, 120.0, SnapMode::None, true, 1.0);
+        let store = recorded_events_to_midi(&events, 480, 120.0, SnapMode::None, true, 1.0, None);
         assert_eq!(store.get_notes().count(), 1);
     }
 
@@ -1895,10 +2114,212 @@ mod tests {
             ),
         ];
 
-        let store = recorded_events_to_midi(&events, 480, 60.0, SnapMode::None, false, 1.0);
+        let store = recorded_events_to_midi(&events, 480, 60.0, SnapMode::None, false, 1.0, None);
         let mut notes: Vec<_> = store.get_notes().cloned().collect();
         notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
         assert_eq!(notes[0].duration, 0.5);
         assert_eq!(notes[1].duration, 0.75);
+    }
+
+    #[test]
+    fn recording_conversion_preserves_silence_before_the_first_event() {
+        let events = vec![
+            recorded_event(
+                0.5,
+                MidiMessage::NoteOn {
+                    channel: 0,
+                    key: 60,
+                    velocity: 100,
+                },
+            ),
+            recorded_event(
+                1.0,
+                MidiMessage::NoteOff {
+                    channel: 0,
+                    key: 60,
+                    velocity: 0,
+                },
+            ),
+        ];
+
+        let store = recorded_events_to_midi(&events, 480, 120.0, SnapMode::None, false, 1.0, None);
+        let note = store.get_notes().next().unwrap();
+        assert_eq!(note.start_time, 0.25);
+        assert_eq!(note.duration, 0.25);
+    }
+
+    #[test]
+    fn held_notes_are_closed_when_recording_stops() {
+        let events = vec![recorded_event(
+            0.5,
+            MidiMessage::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 100,
+            },
+        )];
+
+        let store = recorded_events_to_midi(&events, 480, 120.0, SnapMode::None, false, 1.0, None);
+        let note = store.get_notes().next().unwrap();
+        assert_eq!(note.start_time, 0.25);
+        assert_eq!(note.duration, 1.0 / 1000.0);
+    }
+
+    #[test]
+    fn loop_passes_split_crossing_notes_and_stack_at_the_loop_start() {
+        let mut source = MidiEventStore::new(480);
+        source.add_note(crate::core::Note {
+            id: "crossing".to_string(),
+            channel: 0,
+            key: 60,
+            velocity: 100,
+            start_time: 2.5,
+            duration: 1.0,
+            start_tick: 2400,
+            duration_ticks: 960,
+        });
+        let session = RecordingSessionContext::new(
+            "track".to_string(),
+            None,
+            RecordingMode::Overdub,
+            1.0,
+            None,
+            Some((0.0, 4.0)),
+        );
+
+        let passes = build_recording_passes(&source, &session, 480);
+
+        assert_eq!(passes.len(), 2);
+        assert!(passes[0].completed);
+        assert!(!passes[1].completed);
+        assert_eq!((passes[0].start_time, passes[0].length), (0.0, 4.0));
+        let first_note = passes[0].midi_data.get_notes().next().unwrap();
+        let second_note = passes[1].midi_data.get_notes().next().unwrap();
+        assert_eq!((first_note.start_time, first_note.duration), (3.5, 0.5));
+        assert_eq!((second_note.start_time, second_note.duration), (0.0, 0.5));
+    }
+
+    #[test]
+    fn event_on_loop_boundary_belongs_to_the_next_pass() {
+        let mut source = MidiEventStore::new(480);
+        source.add_event(crate::core::MidiEvent {
+            id: "boundary".to_string(),
+            time: 3.0,
+            tick: 2880,
+            message: MidiMessage::MidiClock,
+        });
+        let session = RecordingSessionContext::new(
+            "track".to_string(),
+            None,
+            RecordingMode::Overdub,
+            1.0,
+            None,
+            Some((0.0, 4.0)),
+        );
+
+        let passes = build_recording_passes(&source, &session, 480);
+
+        assert_eq!(passes.len(), 1);
+        let event = passes[0].midi_data.get_events().next().unwrap();
+        assert_eq!(event.time, 0.0);
+    }
+
+    #[test]
+    fn recording_started_before_the_loop_keeps_its_pre_loop_placement() {
+        let mut source = MidiEventStore::new(480);
+        source.add_note(note("pre-loop", 60, 1.0, 0.5));
+        let session = RecordingSessionContext::new(
+            "track".to_string(),
+            None,
+            RecordingMode::Overdub,
+            2.0,
+            None,
+            Some((4.0, 8.0)),
+        );
+
+        let passes = build_recording_passes(&source, &session, 480);
+
+        assert_eq!(passes.len(), 1);
+        assert_eq!((passes[0].start_time, passes[0].length), (2.0, 6.0));
+        assert_eq!(
+            passes[0].midi_data.get_notes().next().unwrap().start_time,
+            1.0
+        );
+    }
+
+    #[test]
+    fn overdub_uses_the_captured_transport_and_target_clip_offset() {
+        let mut target = MidiEventStore::new(480);
+        target.add_note(note("existing", 60, 0.0, 0.5));
+        let mut source = MidiEventStore::new(480);
+        source.add_note(note("recorded", 64, 0.25, 0.5));
+        let session = RecordingSessionContext::new(
+            "track".to_string(),
+            Some("clip".to_string()),
+            RecordingMode::Overdub,
+            2.0,
+            None,
+            None,
+        );
+
+        apply_recording_to_target(&mut target, 1.0, &session, &source);
+
+        let mut notes: Vec<_> = target.get_notes().collect();
+        notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].start_time, 0.0);
+        assert_eq!(notes[1].start_time, 1.25);
+    }
+
+    #[test]
+    fn punch_replaces_only_the_captured_interval() {
+        let mut target = MidiEventStore::new(480);
+        target.add_note(note("crossing", 60, 0.0, 4.0));
+        let mut source = MidiEventStore::new(480);
+        source.add_note(note("recorded", 72, 1.25, 0.5));
+        let session = RecordingSessionContext::new(
+            "track".to_string(),
+            Some("clip".to_string()),
+            RecordingMode::PunchInOut,
+            0.0,
+            Some((1.0, 2.0)),
+            None,
+        );
+
+        apply_recording_to_target(&mut target, 0.0, &session, &source);
+
+        let mut notes: Vec<_> = target.get_notes().collect();
+        notes.sort_by(|left, right| left.start_time.total_cmp(&right.start_time));
+        assert_eq!(notes.len(), 3);
+        assert_eq!(
+            (notes[0].key, notes[0].start_time, notes[0].duration),
+            (60, 0.0, 1.0)
+        );
+        assert_eq!(
+            (notes[1].key, notes[1].start_time, notes[1].duration),
+            (72, 1.25, 0.5)
+        );
+        assert_eq!(
+            (notes[2].key, notes[2].start_time, notes[2].duration),
+            (60, 2.0, 2.0)
+        );
+    }
+
+    #[test]
+    fn punch_closes_a_held_note_at_the_punch_out_boundary() {
+        let events = vec![recorded_event(
+            1.0,
+            MidiMessage::NoteOn {
+                channel: 0,
+                key: 60,
+                velocity: 100,
+            },
+        )];
+
+        let store =
+            recorded_events_to_midi(&events, 480, 60.0, SnapMode::None, false, 1.0, Some(2.0));
+        let note = store.get_notes().next().unwrap();
+        assert_eq!(note.start_time, 1.0);
+        assert_eq!(note.duration, 1.0);
     }
 }
