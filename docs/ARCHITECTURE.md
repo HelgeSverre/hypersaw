@@ -1,267 +1,175 @@
-# Hypersaw - Executive Summary
+# Hypersaw Architecture
 
-**Project:** MIDI-focused Digital Audio Workstation
-**Language:** Rust
-**Framework:** egui (immediate-mode GUI)
-**Current State:** Active Development (Feature Branch: `feature/midi-recording`)
-**Lines of Code:** ~10,881
+**Status:** Active development on `feature/midi-recording`
 
----
+**Last reviewed:** 2026-08-09
 
-## What is Hypersaw?
+**Scope:** Hardware-first MIDI sequencing; full audio editing is deferred
 
-Hypersaw is a **hardware-first MIDI sequencer** built in Rust, designed for musicians and producers who work with external MIDI gear. Unlike traditional DAWs that focus on audio production, Hypersaw prioritizes **sample-accurate MIDI timing**, **multi-port I/O**, and **professional MIDI editing tools** in a lightweight, cross-platform package.
+## System Overview
 
-**Think:** Ableton Live's MIDI workflow + hardware synthesizer integration + Rust performance
+Hypersaw is a native Rust desktop application built with egui/eframe. The application owns
+project and editor state on the UI thread and communicates with dedicated MIDI playback and
+recording threads through bounded Crossbeam channels.
 
----
-
-## Current Feature Status
-
-### ✅ Fully Implemented (Production-Ready)
-
-**MIDI Engine**
-- Sample-accurate playback (44.1kHz timing precision)
-- Multi-port MIDI I/O (connect multiple hardware devices)
-- Real-time recording with punch-in/out
-- Metronome with configurable output routing
-- Mute/Solo/Arm per track with real-time updates
-
-**Timeline / Arrangement**
-- Multi-track editing with drag-and-drop
-- Clip manipulation (move, resize, copy)
-- Track reordering
-- MIDI preview in timeline clips
-- Snap-to-grid (None, Bar, Beat, 1/8, 1/16, 1/32, Triplets)
-- Loop region support
-
-**Piano Roll Editor**
-- Note editing (add, delete, move, resize, velocity)
-- Multi-note selection with selection box
-- Copy/Paste/Duplicate (Ctrl+C/V/D)
-- Quantization with strength parameter
-- Automation lanes for all 128 MIDI CCs
-- Bezier/Linear/Step/Exponential curves
-- Searchable CC dropdown
-
-**Undo/Redo System**
-- Comprehensive command pattern
-- All MIDI edits undoable
-- Keyboard shortcuts (Ctrl+Z, Ctrl+Shift+Z)
-
-**Project Management**
-- Save/Load projects (.supersaw format)
-- MIDI file import
-- Organized asset structure (midi/, samples/ directories)
-
-### 🚧 Partially Implemented
-
-- **MIDI Recording:** Works but missing loop recording UI and take management
-- **Plugin System:** Architecture exists but disabled (focus on MIDI first)
-- **Keyboard Shortcuts:** Basic shortcuts work, customization UI missing
-
-### ❌ Planned but Not Implemented
-
-- Advanced MIDI editing (lasso selection, batch transformations)
-- MIDI effects chain (arpeggiator, chord generator, scale snap)
-- Step sequencer mode
-- Smart quantization (swing, groove templates)
-- MPE support
-- Automated testing
-
----
-
-## Recent Development Highlights
-
-### Last 20 Commits (Past Month)
-**Focus Areas:**
-- Automation system integration (5 commits)
-- Piano roll UX improvements (4 commits)
-- Timeline features (3 commits)
-- Bug fixes (8 commits)
-
-### Major Bug Fixes (All ✅ Completed)
-1. Fixed duplicate MIDI event scheduling (watermark system)
-2. Fixed UI/Engine time desync (engine is now source of truth)
-3. Optimized "All Notes Off" (2048 → 16 messages, 99.2% reduction)
-4. Fixed SetTempo spam (60fps → only on change)
-5. Fixed recording timestamps (BPM updates now propagate)
-6. Bounded channels prevent memory leaks
-7. Reduced lock contention via staged processing
-
----
-
-## Architecture Overview
-
-```
-┌─────────────────────────────────────┐
-│         UI Thread (egui)            │
-│  ┌──────────┐    ┌──────────────┐   │
-│  │ Timeline │    │  Piano Roll  │   │
-│  └────┬─────┘    └──────┬───────┘   │
-│       │                  │           │
-│       └──────────┬───────┘           │
-│              DawState                │
-│          (Command Pattern)           │
-└──────────────────┼──────────────────┘
-                   │
-       ┌───────────┴───────────┐
-       │                       │
-┌──────▼──────────┐   ┌────────▼────────┐
-│  MIDI Engine    │   │   Recording     │
-│    Thread       │   │  Coordinator    │
-│                 │   │     Thread      │
-│ • Scheduler     │   │ • MIDI Input    │
-│ • Port Manager  │   │ • Timestamping  │
-│ • Metronome     │   │ • Quantization  │
-│ • Mute/Solo     │   │                 │
-└─────────────────┘   └─────────────────┘
-         │                     │
-         └──────────┬──────────┘
-                    ▼
-              MIDI Hardware
+```text
+┌──────────────────────────────────────────────────────────┐
+│ UI thread                                                │
+│ SupersawApp                                              │
+│ ├── DawState: project, editor session, runtime handles   │
+│ ├── CommandManager: implemented undo/redo operations     │
+│ ├── Timeline                                             │
+│ └── PianoRoll                                            │
+└───────────────┬───────────────────────┬──────────────────┘
+                │ commands/messages     │ recording events
+        ┌───────▼────────┐      ┌───────▼────────────────┐
+        │ MIDI engine    │      │ Recording coordinator │
+        │ thread         │      │ thread                │
+        │ ├── transport  │      │ ├── armed tracks      │
+        │ ├── event heap │      │ ├── pre-roll buffer   │
+        │ ├── routing    │      │ └── committed batches │
+        │ └── metronome  │      └────────────────────────┘
+        └───────┬────────┘
+                │ midir
+        ┌───────▼────────┐
+        │ MIDI hardware  │
+        └────────────────┘
 ```
 
-**Key Patterns:**
-- **Command Pattern:** All actions undoable/redoable
-- **Multi-threaded:** Dedicated threads for MIDI I/O
-- **Bounded Channels:** Prevent unbounded memory growth
-- **Sample-accurate timing:** Not frame-based
+## Module Responsibilities
 
----
+### Application and UI
 
-## Technical Highlights
+- `src/ui/app.rs` owns the eframe lifecycle, menus, transport, dialogs, MIDI port polling,
+  recording-result integration, and playback lookahead scheduling.
+- `src/ui/timeline.rs` draws the arrangement, track headers, loop/punch regions, clips, takes,
+  routing controls, and the MIDI device panel.
+- `src/ui/piano_roll.rs` draws and edits notes, selections, velocity, and MIDI automation lanes.
 
-### Performance Optimizations
-- Sample-accurate MIDI scheduling (not millisecond-based)
-- Lock-free communication via bounded channels
-- Staged processing to reduce lock contention
-- Optimized MIDI message sending (CC 123 vs individual NoteOffs)
+The UI currently performs more orchestration than is desirable. Scheduling, recording-result
+conversion, and project dialog workflows should move into framework-neutral controllers before
+another UI framework is considered.
 
-### Code Quality
-- **Type safety:** Extensive use of Rust's type system
-- **Error handling:** Result<T, E> throughout
-- **Documentation:** Comprehensive TODO list, architecture docs
-- **No null pointers:** Option<T> for nullable values
+### Project and commands
 
-### Dependencies (Minimal)
+- `src/core/project.rs` defines serializable projects, tracks, clips, takes, editor views, and
+  project asset persistence.
+- `src/core/commands.rs` defines application commands and their execution behavior.
+- `src/core/command_manager.rs` tracks the implemented undo/redo subset and project dirty state.
+- `src/core/automation.rs` defines automation lanes, points, parameters, and interpolation.
+
+The command enum covers most actions, but undo is intentionally enabled only where enough
+original data is stored to restore state correctly. Note edits and track mute are covered;
+most track, clip, take, automation, routing, and tempo mutations still need undo data.
+
+### MIDI model and runtime
+
+- `src/core/midi.rs` owns MIDI events, notes, tempo-aware SMF import/export, and note editing.
+- `src/core/midi_engine.rs` owns the playback thread, sample-clock transport, scheduled-event
+  queue, hardware connections, routing, mute/solo filtering, and metronome output.
+- `src/core/midi_recording.rs` owns arming, monitoring, pre-roll, punch filtering, and the
+  one-stop/one-committed-batch recording contract.
+- `src/core/state.rs` currently constructs the runtime and combines persistent project state,
+  transient editor state, and runtime handles.
+
+## Time and Scheduling Model
+
+- Project clip positions and UI loop/punch positions are stored in seconds.
+- MIDI notes contain seconds plus PPQ tick data.
+- The engine transport operates in samples and reports positions in beats.
+- The app converts between seconds and beats using the project BPM and maintains a four-second
+  scheduling horizon.
+- Seeking and loop wrap send all-notes-off, clear queued events, reset the scheduling watermark,
+  and refill the lookahead range.
+
+Current limitations:
+
+- The engine and recorder are constructed with a hardcoded 44.1 kHz sample rate.
+- The application, rather than the engine, scans project clips and owns the scheduling horizon.
+- The project has one global BPM; imported clip tempo maps are used during MIDI conversion but
+  there is no editable project tempo map or meter lane.
+
+## Recording Model
+
+Each armed track has an input-port selector and optional channel filter in the recording
+runtime. The current command/UI path arms tracks with the wildcard `default` port and no channel
+filter, so the configuration is not yet persisted per track.
+
+The recorder:
+
+1. receives sample-timestamped MIDI input;
+2. rebases timestamps to the recording session;
+3. applies input, channel, and punch filters;
+4. buffers events until a committed stop; and
+5. delivers one coherent `EventsRecorded` batch to the UI.
+
+The UI pairs note-on/off messages, optionally quantizes them, writes a MIDI asset, creates a clip,
+and creates a take. Overdub, Replace, Punch, and loop-pass semantics still need a stricter session
+result contract and integration tests; see `TODOS.md`.
+
+## Persistence
+
+A project is stored as a directory:
+
+```text
+<project>/
+├── <project-name>.supersaw
+├── midi/
+│   └── <clip-id>.mid
+└── samples/
 ```
-egui/eframe    # Immediate-mode GUI
-midir          # Cross-platform MIDI I/O
-crossbeam      # Lock-free concurrency
-parking_lot    # High-performance mutexes
-serde/json     # Project serialization
-```
 
----
+MIDI asset paths serialized into the project are relative and stable. Loading resolves them
+against the project-file directory. Repeated saves reuse the clip ID rather than creating
+duplicate assets, and empty MIDI clips produce valid empty MIDI files.
 
-## Development Roadmap
+Remaining project-management work includes project naming, Save As, saving loaded projects back
+to their existing location, recent projects, and autosave/recovery.
 
-### High Priority (Next 3 Months)
-1. Complete undo/redo system (UI panel, undo grouping)
-2. Advanced MIDI editing (lasso selection, batch transformations)
-3. Keyboard shortcuts system (customizable, shortcuts editor)
-4. Loop recording enhancements (take stacking, visual indicators)
+## egui Interaction Rules
 
-### Medium Priority (3-6 Months)
-1. MIDI effects chain (arpeggiator, chord generator, etc.)
-2. Step sequencer mode
-3. VST3/CLAP plugin support (MIDI effects only)
-4. Project templates and clip library
+The custom arrangement and piano-roll canvases rely on explicit egui gesture state.
 
-### Lower Priority (6+ Months)
-1. MPE support
-2. Advanced MIDI routing
-3. MIDI analysis tools
-4. Tempo mapping and complex meters
+- `Response::drag_delta()` is treated according to egui 0.31's per-frame behavior.
+- Text input and inline rename own keyboard focus; global shortcuts yield while egui wants
+  keyboard input.
+- Escape is editor-local for cancellation/deselection. Cmd/Ctrl+1 returns to Arrangement.
+- Unsaved-project confirmation uses `egui::Modal` and suppresses background editor input.
+- Symbol-based transport controls reserve a fixed 28×28 point footprint.
+- Repaints are continuous only while required by playback, recording, routing, or status expiry.
 
-### Explicitly Deferred
-- Full audio DAW features (audio support is minimal by design)
+## Verification Baseline
 
----
+The repository currently has 23 unit tests covering selected MIDI conversions, scheduling queue
+behavior, recording batching, project asset persistence, recorded-note conversion, piano-roll
+gesture math, and timeline scroll limits.
 
-## Technical Debt & Risks
+Important gaps:
 
-### Critical
-- **No automated tests** - Critical for stability as codebase grows
-- **Large uncommitted changeset** (+1885 lines on feature branch) - Merge conflict risk
+- no CI configuration;
+- no command-level undo matrix;
+- no full recording-mode or loop-pass integration tests;
+- no fake MIDI-port disconnect/reconnect tests;
+- no project workflow or UI interaction tests; and
+- no cross-platform release/packaging matrix.
 
-### Moderate
-- **Move scheduling to engine** - UI currently scans timeline 60fps
-- **Optimize undo snapshots** - Currently clones entire DawState
-- **49 compiler warnings** - Mostly unused code and missing docs
+## Known Technical Debt
 
-### Minor
-- **Hardcoded sample rate** (44100) - Should be configurable
-- **String-based IDs** - Could use newtype pattern for type safety
+- `SupersawApp::update` remains a large orchestration boundary.
+- `DawState` combines project, session, and runtime responsibilities.
+- `midi_editing`, `undo_data`, and `keymap` are unused or prototype modules.
+- The compiler and Clippy report a substantial dead-code/style warning backlog.
+- `block 0.1.6`, pulled in transitively, has a future-Rust compatibility warning.
+- MIDI message I/O is incomplete for aftertouch, SysEx, and transport/clock messages, and live
+  pitch-bend conversion needs correction.
 
----
+## Implementation Order
 
-## Competitive Positioning
+1. Complete MIDI I/O correctness and Recording v1 semantics.
+2. Complete destructive-operation undo and project Save/Save As safety.
+3. Add CI and integration coverage around recording, scheduling, undo, and persistence.
+4. Extract framework-neutral transport, scheduling, recording, and project controllers.
+5. Add higher-level MIDI editing, effects, and step-sequencer workflows.
+6. Revisit a GPUI vertical-slice experiment only after the controller extraction.
 
-### Strengths
-- **Rust performance** - No Electron bloat, native performance
-- **Hardware-first** - Multi-port MIDI designed for external gear
-- **Sample-accurate** - Tight timing for hardware sync
-- **Open source** - Hackable, extensible architecture
-- **Cross-platform** - macOS, Linux, Windows support
-
-### Gaps vs. Commercial DAWs
-- No audio recording/editing (by design)
-- Limited plugin support (MIDI effects only, planned)
-- No collaboration features (planned for future)
-- Smaller ecosystem vs. Ableton/FL Studio
-
-### Target Users
-- Hardware synthesizer enthusiasts
-- MIDI composers (film scoring, game music)
-- Live performers with hardware setups
-- Electronic music producers using external gear
-- Developers needing embeddable MIDI sequencer
-
----
-
-## Recommendations
-
-### For Users (Getting Started)
-1. Focus on MIDI workflows (audio is minimal by design)
-2. Use hardware MIDI devices for best experience
-3. Expect active development (feature branch has major updates)
-4. Report bugs via GitHub issues
-
-### For Contributors
-1. **Read architecture docs** (docs/midi_engine_design.md)
-2. **Start with tests** - Add unit tests before expanding features
-3. **Follow command pattern** - All actions should be undoable
-4. **Check TODOS.md** - Prioritized feature list with details
-
-### For Maintainers
-1. **Merge feature/midi-recording branch** - Large diff needs integration
-2. **Add CI/CD** - Automated testing on commit
-3. **Write unit tests** - Critical paths need coverage
-4. **Resolve warnings** - Clean up 49 compiler warnings
-5. **Document API** - Public interfaces need rustdoc
-
----
-
-## Conclusion
-
-**Hypersaw** is a **well-architected, actively developed MIDI DAW** with a clear vision and strong technical foundation. The codebase demonstrates professional-grade engineering with:
-
-- **70% complete core features** (playback, recording, editing functional)
-- **20% complete advanced features** (automation working, effects missing)
-- **30% complete polish** (UI improving, shortcuts partial)
-
-The project is **production-ready for MIDI playback and editing**, with active development on recording and advanced features. Recent bug fixes demonstrate maturity and attention to quality.
-
-**Overall Grade:** B+ (Excellent foundation, needs automated tests and feature completion)
-
-**Best Use Case:** Hardware-focused MIDI composition and live performance
-
-**Next Milestone:** Merge feature branch, add tests, complete undo UI panel
-
----
-
-**Document Version:** 1.0
-**Analysis Date:** December 2, 2025
-**Full Analysis:** See docs/CODEBASE_ANALYSIS.md
+The detailed, checkbox-level roadmap lives in [`../TODOS.md`](../TODOS.md).

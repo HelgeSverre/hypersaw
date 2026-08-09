@@ -317,15 +317,12 @@ println!("Sending MIDI: {:?} at sample {}", event.message, event.time_in_samples
 
 ### Project Documentation
 - `/Users/helge/code/hypersaw/README.md` - Basic setup
-- `/Users/helge/code/hypersaw/docs/CODEBASE_ANALYSIS.md` - **Comprehensive analysis**
-- `/Users/helge/code/hypersaw/docs/EXECUTIVE_SUMMARY.md` - High-level overview
-- `/Users/helge/code/hypersaw/docs/midi_engine_design.md` - Engine architecture
+- `/Users/helge/code/hypersaw/docs/ARCHITECTURE.md` - Current architecture, limitations, and implementation order
+- `/Users/helge/code/hypersaw/docs/QUICK_REFERENCE.md` - Development reference
+- `/Users/helge/code/hypersaw/docs/changelog/` - Historical implementation notes
 
 ### Task Lists
-- `/Users/helge/code/hypersaw/TODOS.md` - Feature roadmap (302 lines)
-- `/Users/helge/code/hypersaw/CODE_REVIEW_FIXES.md` - Completed bug fixes
-- `/Users/helge/code/hypersaw/UNDO_IMPLEMENTATION.md` - Undo system details
-- `/Users/helge/code/hypersaw/KEYBOARD_SHORTCUTS.md` - Shortcut reference
+- `/Users/helge/code/hypersaw/TODOS.md` - Authoritative prioritized roadmap
 
 ### External Documentation
 - [egui documentation](https://docs.rs/egui)
@@ -479,10 +476,10 @@ Update TODOS.md to mark feature complete, add comments to code.
 - **Code questions:** Check architecture docs in `docs/`
 - **Feature priority:** See `TODOS.md`
 - **Bug reports:** File GitHub issue
-- **Architecture questions:** Review `docs/CODEBASE_ANALYSIS.md`
+- **Architecture questions:** Review `docs/ARCHITECTURE.md`
 
 ---
 
-**Last Updated:** December 2, 2025
+**Last Updated:** August 9, 2026
 **Maintainer:** HelgeSverre
 **Repository:** github.com/HelgeSverre/hypersaw
