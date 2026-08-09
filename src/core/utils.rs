@@ -10,11 +10,11 @@ pub fn hex_to_color32(hex: &str) -> Option<egui::Color32> {
     if hex.len() != 6 {
         return None;
     }
-    
+
     let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
     let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
     let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-    
+
     Some(egui::Color32::from_rgb(r, g, b))
 }
 
@@ -70,27 +70,27 @@ impl SnapHandler {
             threshold,
         }
     }
-    
+
     /// Reset the accumulator (call on drag start)
     pub fn reset(&mut self) {
         self.accumulator = 0.0;
     }
-    
+
     /// Add delta to accumulator
     pub fn add_delta(&mut self, delta: f32) {
         self.accumulator += delta;
     }
-    
+
     /// Get accumulated value
     pub fn get_accumulated(&self) -> f32 {
         self.accumulator
     }
-    
+
     /// Check if we should apply snapping based on threshold
     pub fn should_snap(&self) -> bool {
         self.accumulator.abs() > self.threshold
     }
-    
+
     /// Apply snapping to a time value with accumulator logic
     pub fn snap_time_accumulated(
         &self,
@@ -101,7 +101,7 @@ impl SnapHandler {
         snap_enabled: bool,
     ) -> f64 {
         let proposed_time = initial_time + delta_time;
-        
+
         if snap_enabled && self.should_snap() {
             TimeUtils::snap_time(proposed_time, bpm, snap_mode)
         } else {
@@ -169,8 +169,6 @@ impl NotePositioning {
         self.viewport.intersects(rect)
     }
 }
-
-
 
 pub struct ViewportPosition {
     /// Pixels per second for time axis

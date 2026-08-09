@@ -5,10 +5,10 @@ pub mod midi;
 pub mod midi_editing;
 pub mod midi_engine;
 pub mod midi_recording;
-pub mod undo_data;
 pub mod project;
 pub mod state;
 pub mod status;
+pub mod undo_data;
 pub mod utils;
 
 pub use automation::*;

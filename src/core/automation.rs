@@ -4,8 +4,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AutomationPoint {
     pub id: String,
-    pub time: f64,    // Time in seconds
-    pub value: f64,   // Normalized 0.0 to 1.0
+    pub time: f64,  // Time in seconds
+    pub value: f64, // Normalized 0.0 to 1.0
     pub curve_type: CurveType,
     #[serde(default)]
     pub tension: f32, // For bezier curves
@@ -36,7 +36,10 @@ pub struct AutomationLane {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AutomationParameter {
     // MIDI CC parameters
-    MidiCC { cc_number: u8, name: String },
+    MidiCC {
+        cc_number: u8,
+        name: String,
+    },
     // Note parameters
     Velocity,
     PitchBend,
@@ -44,7 +47,11 @@ pub enum AutomationParameter {
     Volume,
     Pan,
     // Plugin parameters (future)
-    PluginParam { plugin_id: String, param_id: String, name: String },
+    PluginParam {
+        plugin_id: String,
+        param_id: String,
+        name: String,
+    },
 }
 
 impl AutomationParameter {
@@ -152,23 +159,17 @@ impl AutomationLane {
         match (prev_point, next_point) {
             (None, Some(next)) => next.value,
             (Some(prev), None) => prev.value,
-            (Some(prev), Some(next)) => {
-                self.interpolate_value(prev, next, time)
-            }
+            (Some(prev), Some(next)) => self.interpolate_value(prev, next, time),
             (None, None) => self.default_value,
         }
     }
 
     fn interpolate_value(&self, prev: &AutomationPoint, next: &AutomationPoint, time: f64) -> f64 {
         let t = (time - prev.time) / (next.time - prev.time);
-        
+
         match prev.curve_type {
-            CurveType::Linear => {
-                prev.value + (next.value - prev.value) * t
-            }
-            CurveType::Step => {
-                prev.value
-            }
+            CurveType::Linear => prev.value + (next.value - prev.value) * t,
+            CurveType::Step => prev.value,
             CurveType::Bezier => {
                 // Simple bezier interpolation
                 let t2 = t * t;
@@ -176,30 +177,28 @@ impl AutomationLane {
                 let mt = 1.0 - t;
                 let mt2 = mt * mt;
                 let mt3 = mt2 * mt;
-                
+
                 // Using tension to control the curve
                 let p1 = prev.value;
                 let p2 = prev.value + (next.value - prev.value) * prev.tension as f64;
                 let p3 = next.value - (next.value - prev.value) * prev.tension as f64;
                 let p4 = next.value;
-                
+
                 mt3 * p1 + 3.0 * mt2 * t * p2 + 3.0 * mt * t2 * p3 + t3 * p4
             }
-            CurveType::Exponential => {
-                prev.value + (next.value - prev.value) * (t * t)
-            }
-            CurveType::Logarithmic => {
-                prev.value + (next.value - prev.value) * t.sqrt()
-            }
+            CurveType::Exponential => prev.value + (next.value - prev.value) * (t * t),
+            CurveType::Logarithmic => prev.value + (next.value - prev.value) * t.sqrt(),
         }
     }
 
     fn sort_points(&mut self) {
-        self.points.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
+        self.points
+            .sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
     }
 
     pub fn clear_range(&mut self, start_time: f64, end_time: f64) {
-        self.points.retain(|p| p.time < start_time || p.time > end_time);
+        self.points
+            .retain(|p| p.time < start_time || p.time > end_time);
     }
 
     pub fn get_points_in_range(&self, start_time: f64, end_time: f64) -> Vec<&AutomationPoint> {
